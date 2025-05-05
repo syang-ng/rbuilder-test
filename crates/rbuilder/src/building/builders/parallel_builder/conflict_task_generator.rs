@@ -395,6 +395,39 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
     tasks
 }
 
+
+pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec<ConflictTask> {
+    let mut tasks = vec![];
+
+    let created_at = Instant::now();
+    // Sort the orders by gas used
+    let new_group;
+
+    if group.orders.len() > 8 {
+        let mut orders: Vec<_> = group.orders.as_ref().clone();
+        orders.sort_by(|a, b| a.sim_value.gas_used.cmp(&b.sim_value.gas_used));
+        orders.truncate(8);
+        new_group = ConflictGroup {
+            id: group.id,
+            orders: Arc::new(orders),
+            conflicting_group_ids: group.conflicting_group_ids.clone(),
+        };
+    } else {
+        new_group = group.clone();
+    }
+
+    tasks.push(ConflictTask {
+        group_idx: group.id,
+        algorithm: Algorithm::AllPermutations,
+        priority,
+        group: new_group,
+        created_at,
+    });
+    
+    tasks
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

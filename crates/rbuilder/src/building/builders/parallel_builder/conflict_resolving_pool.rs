@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
 use super::{
-    conflict_resolvers::ResolverContext, conflict_task_generator::get_tasks_for_group,
+    conflict_resolvers::ResolverContext, conflict_task_generator::{get_default_tasks_for_group, get_tasks_for_group},
     simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
     ConflictTask, GroupId, ResolutionResult, TaskPriority,
 };
@@ -159,6 +159,33 @@ where
         let mut results = Vec::new();
         for new_group in new_groups {
             let tasks = get_tasks_for_group(&new_group, TaskPriority::High);
+            for task in tasks {
+                let simulation_cache = Arc::clone(&simulation_cache);
+                let result = Self::process_task(
+                    task,
+                    ctx,
+                    state.clone(),
+                    CancellationToken::new(),
+                    simulation_cache,
+                );
+                if let Ok(result) = result {
+                    results.push(result);
+                }
+            }
+        }
+        results
+    }
+
+    pub fn process_groups_default_backtest(
+        &mut self,
+        new_groups: Vec<ConflictGroup>,
+        ctx: &BlockBuildingContext,
+        state: Arc<dyn StateProvider>,
+        simulation_cache: Arc<SharedSimulationCache>,
+    ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
+        let mut results = Vec::new();
+        for new_group in new_groups {
+            let tasks = get_default_tasks_for_group(&new_group, TaskPriority::Low);
             for task in tasks {
                 let simulation_cache = Arc::clone(&simulation_cache);
                 let result = Self::process_task(

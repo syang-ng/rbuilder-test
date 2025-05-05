@@ -20,7 +20,7 @@ use crate::{
         builders::{
             ordering_builder::{OrderingBuilderConfig, OrderingBuildingAlgorithm},
             parallel_builder::{
-                parallel_build_backtest, ParallelBuilderConfig, ParallelBuildingAlgorithm,
+                default_parallel_build_backtest, parallel_build_backtest, ParallelBuilderConfig, ParallelBuildingAlgorithm,
             },
             BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
         },
@@ -84,6 +84,7 @@ pub const DEFAULT_MAX_CONCURRENT_SEALS: u64 = 1;
 pub enum SpecificBuilderConfig {
     ParallelBuilder(ParallelBuilderConfig),
     OrderingBuilder(OrderingBuilderConfig),
+    DefaultBuilder(ParallelBuilderConfig),
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -469,6 +470,9 @@ impl LiveBuilderConfig for Config {
             },
             SpecificBuilderConfig::ParallelBuilder(config) => {
                 parallel_build_backtest::<P>(input, config)
+            },
+            SpecificBuilderConfig::DefaultBuilder(config) => {
+                default_parallel_build_backtest::<P>(input, config)
             }
         }
     }
@@ -561,6 +565,14 @@ impl Default for Config {
                         coinbase_payment: false,
                     }),
                 },
+                BuilderConfig {
+                    name: String::from("default-parallel"),
+                    builder: SpecificBuilderConfig::DefaultBuilder(ParallelBuilderConfig {
+                        discard_txs: true,
+                        num_threads: 25,
+                        coinbase_payment: false,
+                    }),
+                },
             ],
             slot_delta_to_start_bidding_ms: None,
             subsidy: None,
@@ -648,6 +660,9 @@ where
             >::new(order_cfg, cfg.name)),
         },
         SpecificBuilderConfig::ParallelBuilder(parallel_cfg) => {
+            Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
+        },
+        SpecificBuilderConfig::DefaultBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
         }
     }
