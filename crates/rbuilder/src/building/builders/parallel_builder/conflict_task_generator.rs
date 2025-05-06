@@ -402,6 +402,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
     let created_at = Instant::now();
     // Sort the orders by gas used
     let new_group;
+    let left_orders ;
 
     if group.orders.len() > 8 {
         let mut orders: Vec<_> = group.orders.as_ref().clone();
@@ -415,6 +416,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
                 order.sim_value.coinbase_profit
             );
         }
+        left_orders = orders.split_off(8);
         orders.truncate(8);
         new_group = ConflictGroup {
             id: group.id,
@@ -432,6 +434,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
         }
     } else {
         new_group = group.clone();
+        left_orders = vec![];
     }
 
     tasks.push(ConflictTask {
@@ -441,6 +444,24 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
         group: new_group,
         created_at,
     });
+
+    if left_orders.len() > 0 {
+        let left_group = ConflictGroup {
+            id: group.id,
+            orders: Arc::new(left_orders),
+            conflicting_group_ids: group.conflicting_group_ids.clone(),
+        };
+        tasks.push(ConflictTask {
+            group_idx: group.id,
+            algorithm: Algorithm::Random {
+                seed: group.id as u64,
+                count: NUMBER_OF_RANDOM_TASKS,
+            },
+            priority,
+            group: left_group,
+            created_at,
+        });
+    }
     
     tasks
 }
