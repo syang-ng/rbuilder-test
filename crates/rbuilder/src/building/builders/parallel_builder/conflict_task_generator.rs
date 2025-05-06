@@ -406,7 +406,6 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
     if group.orders.len() > 8 {
         let mut orders: Vec<_> = group.orders.as_ref().clone();
         orders.sort_by(|a, b| a.sim_value.gas_used.cmp(&b.sim_value.gas_used));
-        println!("Sorted orders: {:?}", orders);
         for order in orders.iter() {
             println!(
                 "{:>74} gas: {:>8}",
