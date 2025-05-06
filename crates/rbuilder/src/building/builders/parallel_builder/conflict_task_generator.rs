@@ -451,8 +451,9 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
             orders: Arc::new(left_orders),
             conflicting_group_ids: group.conflicting_group_ids.clone(),
         };
+
         tasks.push(ConflictTask {
-            group_idx: group.id,
+            group_idx: usize::MAX - group.id,
             algorithm: Algorithm::Random {
                 seed: group.id as u64,
                 count: NUMBER_OF_RANDOM_TASKS,
