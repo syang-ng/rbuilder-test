@@ -447,7 +447,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 
     if left_orders.len() > 0 {
         let left_group = ConflictGroup {
-            id: group.id,
+            id: usize::MAX - group.id,
             orders: Arc::new(left_orders),
             conflicting_group_ids: group.conflicting_group_ids.clone(),
         };
