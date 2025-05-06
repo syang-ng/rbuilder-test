@@ -406,6 +406,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
     if group.orders.len() > 8 {
         let mut orders: Vec<_> = group.orders.as_ref().clone();
         orders.sort_by(|a, b| a.sim_value.gas_used.cmp(&b.sim_value.gas_used));
+        println!("Old group orders:");
         for order in orders.iter() {
             println!(
                 "{:>74} gas: {:>8}",
@@ -419,7 +420,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
             orders: Arc::new(orders),
             conflicting_group_ids: group.conflicting_group_ids.clone(),
         };
-        println!("New group orders: {:?}", new_group.orders);
+        println!("New group orders:");
         for order in new_group.orders.iter() {
             println!(
                 "{:>74} gas: {:>8}",
