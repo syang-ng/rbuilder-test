@@ -417,7 +417,6 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
             );
         }
         left_orders = orders.split_off(8);
-        orders.truncate(8);
         new_group = ConflictGroup {
             id: group.id,
             orders: Arc::new(orders),
@@ -425,6 +424,15 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
         };
         println!("New group orders:");
         for order in new_group.orders.iter() {
+            println!(
+                "{:>74} gas: {:>8} profit: {}",
+                order.order.id().to_string(),
+                order.sim_value.gas_used,
+                order.sim_value.coinbase_profit
+            );
+        }
+        println!("Left group orders:");
+        for order in left_orders.iter() {
             println!(
                 "{:>74} gas: {:>8} profit: {}",
                 order.order.id().to_string(),
