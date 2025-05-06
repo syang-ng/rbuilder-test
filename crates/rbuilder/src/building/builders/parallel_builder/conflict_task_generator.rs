@@ -407,13 +407,27 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
         let mut orders: Vec<_> = group.orders.as_ref().clone();
         orders.sort_by(|a, b| a.sim_value.gas_used.cmp(&b.sim_value.gas_used));
         println!("Sorted orders: {:?}", orders);
+        for order in orders.iter() {
+            println!(
+                "{:>74} gas: {:>8}",
+                order.order.id().to_string(),
+                order.sim_value.gas_used
+            );
+        }
         orders.truncate(8);
         new_group = ConflictGroup {
             id: group.id,
             orders: Arc::new(orders),
             conflicting_group_ids: group.conflicting_group_ids.clone(),
         };
-        println!("Truncated orders: {:?}", new_group.orders);
+        println!("New group orders: {:?}", new_group.orders);
+        for order in new_group.orders.iter() {
+            println!(
+                "{:>74} gas: {:>8}",
+                order.order.id().to_string(),
+                order.sim_value.gas_used
+            );
+        }
     } else {
         new_group = group.clone();
     }
