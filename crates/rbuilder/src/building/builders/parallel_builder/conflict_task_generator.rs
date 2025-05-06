@@ -409,9 +409,10 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
         println!("Old group orders:");
         for order in orders.iter() {
             println!(
-                "{:>74} gas: {:>8}",
+                "{:>74} gas: {:>8} profit: {}",
                 order.order.id().to_string(),
-                order.sim_value.gas_used
+                order.sim_value.gas_used,
+                order.sim_value.coinbase_profit
             );
         }
         orders.truncate(8);
@@ -423,9 +424,10 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
         println!("New group orders:");
         for order in new_group.orders.iter() {
             println!(
-                "{:>74} gas: {:>8}",
+                "{:>74} gas: {:>8} profit: {}",
                 order.order.id().to_string(),
-                order.sim_value.gas_used
+                order.sim_value.gas_used,
+                order.sim_value.coinbase_profit
             );
         }
     } else {
