@@ -470,6 +470,8 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
             group: left_group,
             created_at,
         });
+
+        println!("group id: {}, new group id: {}", group.id, usize::MAX - group.id);
     }
     
     tasks
