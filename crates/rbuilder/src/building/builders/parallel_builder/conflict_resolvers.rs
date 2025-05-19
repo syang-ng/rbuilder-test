@@ -3,15 +3,18 @@ use alloy_primitives::{Address, U256};
 use derivative::Derivative;
 use eyre::Result;
 use itertools::Itertools;
+use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
+use petgraph::Direction::{Incoming, Outgoing};
 use rand::{seq::SliceRandom, SeedableRng};
 use reth::providers::StateProvider;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
+
 use super::{
-    simulation_cache::{CachedSimulationState, SharedSimulationCache},
-    Algorithm, ConflictTask, ResolutionResult,
+    simulation_cache::{CachedSimulationState, SharedSimulationCache}, Algorithm, ConflictTask, ResolutionResult
 };
 
 use crate::{
@@ -324,6 +327,7 @@ fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize>> {
         Algorithm::Length => generate_length_based_sequence(task),
         Algorithm::AllPermutations => generate_all_permutations(task),
         Algorithm::Random { seed, count } => generate_random_permutations(task, seed, count),
+        Algorithm::PermutationsWithNonces => generate_all_permutations_with_nonces(task),
     }
 }
 
@@ -441,6 +445,156 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
     let length_based_sequence: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
 
     sequences_of_orders.push(length_based_sequence);
+    sequences_of_orders
+}
+
+
+
+fn find_permutations_recursive(
+    graph: &DiGraph<Arc<SimulatedOrder>, ()>,
+    current_permutation_indices: &mut Vec<NodeIndex>,
+    in_degrees: &mut HashMap<NodeIndex, usize>,
+    total_nodes: usize,
+    all_permutations_indices: &mut Vec<Vec<NodeIndex>>,
+) {
+    if current_permutation_indices.len() == total_nodes {
+        all_permutations_indices.push(current_permutation_indices.clone());
+        return;
+    }
+
+    let mut candidates: Vec<NodeIndex> = Vec::new();
+    for node_idx in graph.node_indices() {
+        if !current_permutation_indices.contains(&node_idx) &&
+           *in_degrees.get(&node_idx).unwrap_or(&0) == 0 { // only consider nodes with in-degree 0
+            candidates.push(node_idx);
+        }
+    }
+
+    candidates.sort_unstable(); // Sort by NodeIndex, which implements Ord
+
+    if candidates.is_empty() && current_permutation_indices.len() != total_nodes {
+        return;
+    }
+
+    for &candidate_node_idx in &candidates {
+        current_permutation_indices.push(candidate_node_idx);
+
+        let mut affected_neighbors: Vec<NodeIndex> = Vec::new();
+        for edge in graph.edges_directed(candidate_node_idx, Outgoing) {
+            let target_node_idx = edge.target();
+            if let Some(degree) = in_degrees.get_mut(&target_node_idx) {
+                *degree -= 1;
+                affected_neighbors.push(target_node_idx);
+            }
+        }
+
+        find_permutations_recursive(
+            graph,
+            current_permutation_indices,
+            in_degrees,
+            total_nodes,
+            all_permutations_indices,
+        );
+
+        for neighbor_idx in affected_neighbors {
+            if let Some(degree) = in_degrees.get_mut(&neighbor_idx) {
+                *degree += 1;
+            }
+        }
+        current_permutation_indices.pop();
+    }
+}
+
+
+fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>> {
+    let order_group = &task.group;
+    let mut graph = DiGraph::<Arc<SimulatedOrder>, ()>::new();
+    let mut node_indices: Vec<NodeIndex> = vec![];
+    let mut index_map: HashMap<NodeIndex, usize> = HashMap::default();
+
+    for (i, order_arc) in order_group.orders.iter().enumerate() {
+        let node_index = graph.add_node(order_arc.clone());
+        node_indices.push(node_index);
+        index_map.insert(node_index, i);
+    }
+
+    let mut nonce_to_node_map: HashMap<(Address, u64), NodeIndex> = HashMap::default();
+
+    for (original_order_idx, order_arc) in order_group.orders.iter().enumerate() {
+        let current_node_idx = node_indices[original_order_idx];
+        for nonce in order_arc.nonces() {
+            let key = (nonce.address, nonce.nonce);
+            nonce_to_node_map.insert(key, current_node_idx);
+        }
+    }
+
+    // Create edges based on nonce relationships
+    // For each order_i, find order_j such that nonce_j.address == nonce_i.address
+    // and nonce_j.nonce == nonce_i.nonce - 1
+    for (order_i_original_idx, order_i_arc) in order_group.orders.iter().enumerate() {
+        let node_i_idx = node_indices[order_i_original_idx]; // NodeIndex for order_i
+
+        for nonce_i in order_i_arc.nonces() {
+            // We are looking for an order_j with nonce_j such that:
+            // nonce_j.address == nonce_i.address
+            // nonce_j.nonce == nonce_i.nonce - 1
+            // This means an edge from order_j's node to order_i's node.
+
+            if nonce_i.nonce == 0 { // Or whatever your minimum nonce value is
+                // Cannot have a nonce that is `nonce_i.value - 1` if current is 0
+                continue;
+            }
+            let target_nonce_value_for_j = nonce_i.nonce - 1;
+            let lookup_key = (nonce_i.address, target_nonce_value_for_j);
+
+            if let Some(&node_j_idx) = nonce_to_node_map.get(&lookup_key) {
+                // We found an order_j (represented by node_j_idx) that has the preceding nonce.
+                // Add an edge from node_j (the one with nonce N-1) to node_i (the one with nonce N).
+                // Ensure it's not an edge to itself if an order could somehow contain (addr, N) and (addr, N-1).
+                // The problem implies distinct orders, which `node_j_idx != node_i_idx` would check.
+                // However, the map construction ensures `node_j_idx` is the node for the order *containing* that specific (addr, N-1) nonce.
+                // If order_i and order_j are different orders, their node indices will be different.
+                if node_j_idx != node_i_idx { // Avoid self-loops based on this specific logic
+                    graph.add_edge(node_j_idx, node_i_idx, ());
+                }
+            }
+        }
+    }
+
+    let mut all_permutations_indices: Vec<Vec<NodeIndex>> = Vec::new();
+    let mut current_permutation_indices: Vec<NodeIndex> = Vec::new();
+
+    let mut in_degrees: HashMap<NodeIndex, usize> = graph
+        .node_indices()
+        .map(|node_idx| (node_idx, graph.edges_directed(node_idx, Incoming).count()))
+        .collect();
+
+    let node_count = graph.node_count();
+
+    for node_idx in graph.node_indices() {
+        in_degrees.entry(node_idx).or_insert(0);
+    }
+
+
+    find_permutations_recursive(
+        &graph,
+        &mut current_permutation_indices,
+        &mut in_degrees,
+        node_count,
+        &mut all_permutations_indices,
+    );
+
+    let sequences_of_orders = all_permutations_indices
+        .into_iter()
+        .map(|node_idx_vec| {
+            node_idx_vec
+                .into_iter()
+                .map(|node_idx| index_map[&node_idx])
+                .collect()
+        })
+        .collect();
+    
+
     sequences_of_orders
 }
 

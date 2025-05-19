@@ -185,7 +185,7 @@ where
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut results = Vec::new();
         for new_group in new_groups {
-            let tasks = get_default_tasks_for_group(&new_group, TaskPriority::Low);
+            let tasks = get_default_tasks_for_group(&new_group, TaskPriority::High);
             for task in tasks {
                 let simulation_cache = Arc::clone(&simulation_cache);
                 let result = Self::process_task(

@@ -400,79 +400,87 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
     let mut tasks = vec![];
 
     let created_at = Instant::now();
-    // Sort the orders by gas used
-    let new_group;
-    let left_orders ;
-
-    if group.orders.len() > 8 {
-        let mut orders: Vec<_> = group.orders.as_ref().clone();
-        orders.sort_by(|a, b| a.sim_value.gas_used.cmp(&b.sim_value.gas_used));
-        println!("Old group orders:");
-        for order in orders.iter() {
-            println!(
-                "{:>74} gas: {:>8} profit: {}",
-                order.order.id().to_string(),
-                order.sim_value.gas_used,
-                order.sim_value.coinbase_profit
-            );
-        }
-        left_orders = orders.split_off(8);
-        new_group = ConflictGroup {
-            id: group.id,
-            orders: Arc::new(orders),
-            conflicting_group_ids: group.conflicting_group_ids.clone(),
-        };
-        println!("New group orders:");
-        for order in new_group.orders.iter() {
-            println!(
-                "{:>74} gas: {:>8} profit: {}",
-                order.order.id().to_string(),
-                order.sim_value.gas_used,
-                order.sim_value.coinbase_profit
-            );
-        }
-        println!("Left group orders:");
-        for order in left_orders.iter() {
-            println!(
-                "{:>74} gas: {:>8} profit: {}",
-                order.order.id().to_string(),
-                order.sim_value.gas_used,
-                order.sim_value.coinbase_profit
-            );
-        }
-    } else {
-        new_group = group.clone();
-        left_orders = vec![];
-    }
 
     tasks.push(ConflictTask {
         group_idx: group.id,
-        algorithm: Algorithm::AllPermutations,
+        algorithm: Algorithm::PermutationsWithNonces,
         priority,
-        group: new_group,
+        group: group.clone(),
         created_at,
     });
+    // // Sort the orders by gas used
+    // let new_group;
+    // let left_orders ;
 
-    if left_orders.len() > 0 {
-        let left_group = ConflictGroup {
-            id: usize::MAX - group.id,
-            orders: Arc::new(left_orders),
-            conflicting_group_ids: group.conflicting_group_ids.clone(),
-        };
+    // if group.orders.len() > 8 {
+    //     let mut orders: Vec<_> = group.orders.as_ref().clone();
+    //     orders.sort_by(|a, b| a.sim_value.gas_used.cmp(&b.sim_value.gas_used));
+    //     println!("Old group orders:");
+    //     for order in orders.iter() {
+    //         println!(
+    //             "{:>74} gas: {:>8} profit: {}",
+    //             order.order.id().to_string(),
+    //             order.sim_value.gas_used,
+    //             order.sim_value.coinbase_profit
+    //         );
+    //     }
+    //     left_orders = orders.split_off(8);
+    //     new_group = ConflictGroup {
+    //         id: group.id,
+    //         orders: Arc::new(orders),
+    //         conflicting_group_ids: group.conflicting_group_ids.clone(),
+    //     };
+    //     println!("New group orders:");
+    //     for order in new_group.orders.iter() {
+    //         println!(
+    //             "{:>74} gas: {:>8} profit: {}",
+    //             order.order.id().to_string(),
+    //             order.sim_value.gas_used,
+    //             order.sim_value.coinbase_profit
+    //         );
+    //     }
+    //     println!("Left group orders:");
+    //     for order in left_orders.iter() {
+    //         println!(
+    //             "{:>74} gas: {:>8} profit: {}",
+    //             order.order.id().to_string(),
+    //             order.sim_value.gas_used,
+    //             order.sim_value.coinbase_profit
+    //         );
+    //     }
+    // } else {
+    //     new_group = group.clone();
+    //     left_orders = vec![];
+    // }
 
-        tasks.push(ConflictTask {
-            group_idx: usize::MAX - group.id,
-            algorithm: Algorithm::Random {
-                seed: group.id as u64,
-                count: NUMBER_OF_RANDOM_TASKS,
-            },
-            priority,
-            group: left_group,
-            created_at,
-        });
+    // tasks.push(ConflictTask {
+    //     group_idx: group.id,
+    //     algorithm: Algorithm::AllPermutations,
+    //     priority,
+    //     group: new_group,
+    //     created_at,
+    // });
 
-        println!("group id: {}, new group id: {}", group.id, usize::MAX - group.id);
-    }
+    // if left_orders.len() > 0 {
+    //     let left_group = ConflictGroup {
+    //         id: usize::MAX - group.id,
+    //         orders: Arc::new(left_orders),
+    //         conflicting_group_ids: group.conflicting_group_ids.clone(),
+    //     };
+
+    //     tasks.push(ConflictTask {
+    //         group_idx: usize::MAX - group.id,
+    //         algorithm: Algorithm::Random {
+    //             seed: group.id as u64,
+    //             count: NUMBER_OF_RANDOM_TASKS,
+    //         },
+    //         priority,
+    //         group: left_group,
+    //         created_at,
+    //     });
+
+    //     println!("group id: {}, new group id: {}", group.id, usize::MAX - group.id);
+    // }
     
     tasks
 }
