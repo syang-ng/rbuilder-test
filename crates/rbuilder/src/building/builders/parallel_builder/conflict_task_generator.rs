@@ -402,8 +402,6 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 
     let created_at = Instant::now();
 
-    println!("Group id: {}, order ids: {}", group.id, group.orders.iter().map(|o| o.order.id()).join(", "));
-
     tasks.push(ConflictTask {
         group_idx: group.id,
         algorithm: Algorithm::PermutationsWithNonces,

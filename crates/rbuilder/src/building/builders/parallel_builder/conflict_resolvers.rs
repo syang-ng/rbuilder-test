@@ -584,7 +584,7 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
         &mut all_permutations_indices,
     );
 
-    let sequences_of_orders = all_permutations_indices
+    let sequences_of_orders: Vec<Vec<usize>> = all_permutations_indices
         .into_iter()
         .map(|node_idx_vec| {
             node_idx_vec
@@ -594,6 +594,7 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
         })
         .collect();
     
+    println!("length of sequences_of_orders: {}", sequences_of_orders.len());
 
     sequences_of_orders
 }
