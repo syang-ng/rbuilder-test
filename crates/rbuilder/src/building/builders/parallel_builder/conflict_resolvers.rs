@@ -594,7 +594,7 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
         })
         .collect();
     
-    println!("length of sequences_of_orders: {}", sequences_of_orders.len());
+    // println!("length of sequences_of_orders: {}", sequences_of_orders.len());
 
     sequences_of_orders
 }
