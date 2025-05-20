@@ -3,6 +3,7 @@ use ahash::{HashMap, HashSet};
 use alloy_primitives::{utils::format_ether, U256};
 use crossbeam_queue::SegQueue;
 use itertools::Itertools;
+use revm::bytecode::eof::printer::print;
 use std::{sync::Arc, time::Instant};
 use tracing::trace;
 
@@ -400,6 +401,8 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
     let mut tasks = vec![];
 
     let created_at = Instant::now();
+
+    println!("Group id: {}, order ids: {}", group.id, group.orders.iter().map(|o| o.order.id()).join(", "));
 
     tasks.push(ConflictTask {
         group_idx: group.id,
