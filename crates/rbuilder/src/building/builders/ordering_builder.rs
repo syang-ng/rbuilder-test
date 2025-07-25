@@ -57,6 +57,9 @@ pub struct OrderingBuilderConfig {
     /// Amount of time allocated for EVM execution while building block.
     #[serde(default)]
     pub build_duration_deadline_ms: Option<u64>,
+    #[serde(default)]
+    /// Use SimValue::non_mempool_profit_info instead of full_profit_info when comparing Orders.
+    pub ignore_mempool_profit_on_bundles: bool,
 }
 
 impl OrderingBuilderConfig {
@@ -250,6 +253,7 @@ impl OrderingBuilderContext {
             &mut self.local_ctx,
             self.builder_name.clone(),
             self.config.discard_txs,
+            block_orders.orders_statistics(),
             cancel_block,
         )?;
 
@@ -269,7 +273,7 @@ impl OrderingBuilderContext {
         while let Some(sim_order) = block_orders.pop_order() {
             // @Todo we drop such bundles instead of failing simulation for them
             // because share bundle merging depends on allowing no txs bundles into the block
-            if sim_order.sim_value.gas_used == 0 {
+            if sim_order.sim_value.gas_used() == 0 {
                 continue;
             }
 
@@ -403,88 +407,78 @@ fn simulation_too_low<OrderPriorityType: OrderPriority>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::building::order_priority::{OrderMaxProfitPriority, OrderMevGasPricePriority};
+    use crate::building::order_priority::{
+        FullProfitInfoGetter, OrderMaxProfitPriority, OrderMevGasPricePriority,
+    };
     use alloy_primitives::U256;
 
     #[test]
     fn test_simulation_too_low_max_profit() {
-        let sim_result = &SimValue {
-            coinbase_profit: U256::from(100),
-            mev_gas_price: U256::from(0),
-            ..Default::default()
-        };
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(94),
-            mev_gas_price: U256::from(0),
-            ..Default::default()
-        };
+        let sim_result = &SimValue::new_test_no_gas(U256::from(100), U256::from(0));
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(94), U256::from(0));
 
         // Lower than 95% of the original value
         assert!(
-            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_err()
+            simulation_too_low::<OrderMaxProfitPriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_err()
         );
 
         // Equal to original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(100),
-            mev_gas_price: U256::from(0),
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(100), U256::from(0));
         assert!(
-            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_ok()
+            simulation_too_low::<OrderMaxProfitPriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_ok()
         );
 
         // Higher than original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(105),
-            mev_gas_price: U256::from(0),
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(105), U256::from(0));
         assert!(
-            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_ok()
+            simulation_too_low::<OrderMaxProfitPriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_ok()
         );
     }
 
     #[test]
     fn test_simulation_too_low_mev_gas_price() {
-        let sim_result = &SimValue {
-            coinbase_profit: U256::from(0),
-            mev_gas_price: U256::from(100),
-            gas_used: 100,
-            ..Default::default()
-        };
-
+        let sim_result = &SimValue::new_test_no_gas(U256::from(0), U256::from(100));
         // Lower than 95% of the original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(0),
-            mev_gas_price: U256::from(94),
-            gas_used: 94,
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(0), U256::from(94));
+
         assert!(
-            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_err()
+            simulation_too_low::<OrderMevGasPricePriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_err()
         );
 
         // Equal to original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(0),
-            mev_gas_price: U256::from(100),
-            gas_used: 105,
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(0), U256::from(100));
         assert!(
-            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_ok()
+            simulation_too_low::<OrderMevGasPricePriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_ok()
         );
 
         // Higher than original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(0),
-            mev_gas_price: U256::from(105),
-            gas_used: 105,
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(0), U256::from(105));
         assert!(
-            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_ok()
+            simulation_too_low::<OrderMevGasPricePriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_ok()
         );
     }
 }

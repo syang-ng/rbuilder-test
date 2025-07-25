@@ -41,7 +41,16 @@ use reth::transaction_pool::{
 };
 use reth_chainspec::ChainSpec;
 use reth_primitives::{Recovered, TransactionSigned};
-use std::{cmp::min, fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cmp::min,
+    fmt::Debug,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -125,6 +134,7 @@ where
     pub sbundle_merger_selected_signers: Arc<Vec<Address>>,
 
     pub evm_caching_enable: bool,
+    pub faster_finalize: bool,
     pub simulation_use_random_coinbase: bool,
 }
 
@@ -141,7 +151,7 @@ where
         Self { builders, ..self }
     }
 
-    pub async fn run(self) -> eyre::Result<()> {
+    pub async fn run(self, ready_to_build: Arc<AtomicBool>) -> eyre::Result<()> {
         info!(
             "Builder initial block list size: {}",
             self.blocklist_provider.get_blocklist()?.len(),
@@ -208,6 +218,7 @@ where
             }
         };
 
+        ready_to_build.store(true, Ordering::Relaxed);
         while let Some(payload) = payload_events_channel.recv().await {
             reset_histogram_metrics();
 
@@ -300,6 +311,7 @@ where
                 root_hasher,
                 payload.payload_id,
                 self.evm_caching_enable,
+                self.faster_finalize,
             ) {
                 mark_building_started(block_ctx.timestamp());
                 builder_pool.start_block_building(

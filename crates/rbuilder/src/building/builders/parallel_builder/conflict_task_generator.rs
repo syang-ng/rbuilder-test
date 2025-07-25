@@ -23,6 +23,7 @@ pub struct ConflictTaskGenerator {
     existing_groups: HashMap<GroupId, ConflictGroup>,
     task_queue: TaskQueue,
     group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
+    safe_sorting_only: bool,
 }
 
 impl ConflictTaskGenerator {
@@ -33,10 +34,12 @@ impl ConflictTaskGenerator {
     /// * `task_queue` - The queue to store the generated tasks.
     /// * `group_result_sender` - The sender to send the results of the conflict resolution.
     pub fn new(
+        safe_sorting_only: bool,
         task_queue: TaskQueue,
         group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
     ) -> Self {
         Self {
+            safe_sorting_only,
             existing_groups: HashMap::default(),
             task_queue,
             group_result_sender,
@@ -66,7 +69,7 @@ impl ConflictTaskGenerator {
             self.add_processed_groups(&new_group, &mut processed_groups);
 
             // Remove all subset groups
-            if new_group.conflicting_group_ids.len() > 0 {
+            if !new_group.conflicting_group_ids.is_empty() {
                 self.remove_conflicting_subset_groups(&new_group);
             }
         }
@@ -181,8 +184,17 @@ impl ConflictTaskGenerator {
     /// * `group` - The `ConflictGroup` to process.
     fn process_single_order_group(&mut self, group_id: GroupId, group: &ConflictGroup) {
         let sequence_of_orders = ResolutionResult {
-            total_profit: group.orders[0].sim_value.coinbase_profit,
-            sequence_of_orders: vec![(0, group.orders[0].sim_value.coinbase_profit)],
+            total_profit: group.orders[0]
+                .sim_value
+                .full_profit_info()
+                .coinbase_profit(),
+            sequence_of_orders: vec![(
+                0,
+                group.orders[0]
+                    .sim_value
+                    .full_profit_info()
+                    .coinbase_profit(),
+            )],
         };
         // We ignore the error since it means "receiver disconnected" and we expect the caller will detect the cancellation and stop calling us.
         let _ = self
@@ -272,7 +284,7 @@ impl ConflictTaskGenerator {
     fn sum_top_n_profits(&self, orders: &[Arc<SimulatedOrder>], n: usize) -> U256 {
         orders
             .iter()
-            .map(|o| o.sim_value.coinbase_profit)
+            .map(|o| o.sim_value.full_profit_info().coinbase_profit())
             .sorted_by(|a, b| b.cmp(a))
             .take(n)
             .sum()
@@ -325,7 +337,7 @@ impl ConflictTaskGenerator {
     /// * `new_group` - The `ConflictGroup` to create tasks for.
     /// * `priority` - The priority to assign to the tasks.
     fn create_new_tasks(&mut self, new_group: &ConflictGroup, priority: TaskPriority) {
-        let tasks = get_tasks_for_group(new_group, priority);
+        let tasks = get_tasks_for_group(new_group, priority, self.safe_sorting_only);
         for task in tasks {
             self.task_queue.push(task);
         }
@@ -338,11 +350,16 @@ impl ConflictTaskGenerator {
 ///
 /// * `group` - The `ConflictGroup` to create tasks for.
 /// * `priority` - The priority to assign to the tasks.
+/// * `safe_sorting_only` - See [ParallelBuilderConfig::safe_sorting_only]
 ///
 /// # Returns
 ///
 /// A vector of `ConflictTask`s for the given group.
-pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec<ConflictTask> {
+pub fn get_tasks_for_group(
+    group: &ConflictGroup,
+    priority: TaskPriority,
+    safe_sorting_only: bool,
+) -> Vec<ConflictTask> {
     let mut tasks = vec![];
 
     let created_at = Instant::now();
@@ -356,7 +373,7 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
     });
 
     // Then, we can push lower priority tasks that have a low chance, but a chance, of finding a better result
-    if group.orders.len() <= MAX_LENGTH_FOR_ALL_PERMUTATIONS {
+    if group.orders.len() <= MAX_LENGTH_FOR_ALL_PERMUTATIONS && !safe_sorting_only {
         // AllPermutations
         tasks.push(ConflictTask {
             group_idx: group.id,
@@ -366,17 +383,19 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
             created_at,
         });
     } else {
-        // Random
-        tasks.push(ConflictTask {
-            group_idx: group.id,
-            algorithm: Algorithm::Random {
-                seed: group.id as u64,
-                count: NUMBER_OF_RANDOM_TASKS,
-            },
-            priority: TaskPriority::Low,
-            group: group.clone(),
-            created_at,
-        });
+        if !safe_sorting_only {
+            // Random
+            tasks.push(ConflictTask {
+                group_idx: group.id,
+                algorithm: Algorithm::Random {
+                    seed: group.id as u64,
+                    count: NUMBER_OF_RANDOM_TASKS,
+                },
+                priority: TaskPriority::Low,
+                group: group.clone(),
+                created_at,
+            });
+        }
         tasks.push(ConflictTask {
             group_idx: group.id,
             algorithm: Algorithm::Length,
@@ -384,13 +403,15 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
             group: group.clone(),
             created_at,
         });
-        tasks.push(ConflictTask {
-            group_idx: group.id,
-            algorithm: Algorithm::ReverseGreedy,
-            priority: TaskPriority::Low,
-            group: group.clone(),
-            created_at,
-        });
+        if !safe_sorting_only {
+            tasks.push(ConflictTask {
+                group_idx: group.id,
+                algorithm: Algorithm::ReverseGreedy,
+                priority: TaskPriority::Low,
+                group: group.clone(),
+                created_at,
+            });
+        }
     }
 
     tasks
@@ -529,7 +550,7 @@ mod tests {
 
         pub fn create_tx(&mut self) -> Recovered<TransactionSigned> {
             Recovered::new_unchecked(
-                TransactionSigned::new(
+                TransactionSigned::new_unchecked(
                     Transaction::Legacy(TxLegacy::default()),
                     alloy_primitives::Signature::test_signature(),
                     self.create_hash(),
@@ -556,10 +577,7 @@ mod tests {
                     .insert(write.clone(), self.create_b256());
             }
 
-            let sim_value = SimValue {
-                coinbase_profit,
-                ..Default::default()
-            };
+            let sim_value = SimValue::new_test_no_gas(coinbase_profit, U256::ZERO);
 
             Arc::new(SimulatedOrder {
                 order: Order::Tx(MempoolTx {
@@ -593,7 +611,7 @@ mod tests {
 
     fn create_task_generator() -> ConflictTaskGenerator {
         let (sender, _receiver) = mpsc::channel();
-        ConflictTaskGenerator::new(create_task_queue(), sender)
+        ConflictTaskGenerator::new(false, create_task_queue(), sender)
     }
 
     #[test]

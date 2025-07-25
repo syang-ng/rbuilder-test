@@ -6,10 +6,7 @@ use crate::{
         submission::{BidMetadata, BidValueMetadata, SubmitBlockRequestWithMetadata},
         BLSBlockSigner, RelayError, SubmitBlockErr,
     },
-    primitives::{
-        mev_boost::{MevBoostRelayBidSubmitter, MevBoostRelayID},
-        Order,
-    },
+    primitives::mev_boost::{MevBoostRelayBidSubmitter, MevBoostRelayID},
     telemetry::{
         add_relay_submit_time, add_subsidy_value, inc_conn_relay_errors,
         inc_failed_block_simulations, inc_initiated_submissions, inc_other_relay_errors,
@@ -104,8 +101,6 @@ pub struct SubmissionConfig {
 
     pub optimistic_config: Option<OptimisticConfig>,
     pub bid_observer: Box<dyn BidObserver + Send + Sync>,
-    /// Bids above this value will only go to fast relays.
-    pub fast_bid_threshold: U256,
 }
 
 /// Configuration for optimistic block submission to relays.
@@ -242,10 +237,13 @@ async fn run_submit_to_relays_job(
         );
         info!(
             parent: &submission_span,
+            available_orders_statistics = ?block.trace.available_orders_statistics,
+            considered_orders_statistics = ?block.trace.considered_orders_statistics,
+            failed_orders_statistics = ?block.trace.failed_orders_statistics,
             "Submitting bid",
         );
-        let send_to_slow_relays = can_send_to_slow_relay(&block, config.fast_bid_threshold);
-        inc_initiated_submissions(optimistic_config.is_some(), send_to_slow_relays);
+        inc_initiated_submissions(optimistic_config.is_some());
+        let relay_filter = get_relay_filter(&block);
 
         let (normal_signed_submission, optimistic_signed_submission) = {
             let normal_signed_submission = match sign_block_for_relay(
@@ -302,7 +300,7 @@ async fn run_submit_to_relays_job(
         submit_block_to_relays(
             &normal_relays,
             &normal_signed_submission,
-            send_to_slow_relays,
+            &relay_filter,
             false,
             &submission_span,
             &cancel,
@@ -312,7 +310,7 @@ async fn run_submit_to_relays_job(
             submit_block_to_relays(
                 &optimistic_relays,
                 optimistic_signed_submission,
-                send_to_slow_relays,
+                &relay_filter,
                 true,
                 &submission_span,
                 &cancel,
@@ -322,7 +320,7 @@ async fn run_submit_to_relays_job(
             submit_block_to_relays(
                 &optimistic_relays,
                 &normal_signed_submission,
-                send_to_slow_relays,
+                &relay_filter,
                 false,
                 &submission_span,
                 &cancel,
@@ -332,9 +330,10 @@ async fn run_submit_to_relays_job(
         submission_span.in_scope(|| {
             // NOTE: we only notify normal submission here because they have the same contents but different pubkeys
             config.bid_observer.block_submitted(
-                block.sealed_block,
-                normal_signed_submission.submission,
-                block.trace,
+                &slot_data,
+                &block.sealed_block,
+                &normal_signed_submission.submission,
+                &block.trace,
                 builder_name,
                 bid_metadata.value.top_competitor_bid.unwrap_or_default(),
             );
@@ -345,13 +344,13 @@ async fn run_submit_to_relays_job(
 fn submit_block_to_relays(
     relays: &Vec<MevBoostRelayBidSubmitter>,
     submission: &SubmitBlockRequestWithMetadata,
-    send_to_slow_relays: bool,
+    relay_filter: &impl Fn(&MevBoostRelayBidSubmitter) -> bool,
     optimistic: bool,
     submission_span: &Span,
     cancel: &CancellationToken,
 ) {
     for relay in relays {
-        if relay.is_fast() || send_to_slow_relays {
+        if relay_filter(relay) {
             let span = info_span!(parent: submission_span, "relay_submit", relay = &relay.id(), optimistic);
             let relay = relay.clone();
             let cancel = cancel.clone();
@@ -366,20 +365,14 @@ fn submit_block_to_relays(
     }
 }
 
-/// can send only cheap blocks with no bundle replacement data.
-fn can_send_to_slow_relay(block: &Block, fast_bid_threshold: U256) -> bool {
-    let has_replacement_uuid = block
-        .trace
-        .included_orders
-        .iter()
-        .flat_map(|exec_res| exec_res.order.original_orders())
-        .any(|o| match o {
-            Order::Bundle(bundle) => bundle.replacement_data.is_some(),
-            Order::Tx(_) => false,
-            Order::ShareBundle(_) => false,
-        });
-    let is_expensive_block = block.trace.bid_value > fast_bid_threshold;
-    !has_replacement_uuid && !is_expensive_block
+/// Creates a Fn to decide if the block should go to a relay.
+/// It's a Fn because the code changes a lot (used to be more complex).
+/// Blocks go only to relays that have a max bid >= bid_value (or no max bid).
+fn get_relay_filter(block: &Block) -> impl Fn(&MevBoostRelayBidSubmitter) -> bool {
+    let bid_value = block.trace.bid_value;
+    move |relay: &MevBoostRelayBidSubmitter| {
+        relay.max_bid().is_none_or(|max_bid| bid_value <= max_bid)
+    }
 }
 
 pub async fn run_submit_to_relays_job_and_metrics(

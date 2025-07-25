@@ -97,6 +97,9 @@ where
         .iter()
         .map(|order| order.order.clone())
         .collect::<Vec<_>>();
+    for order in &orders {
+        ctx.mempool_tx_detector.add_tx(order);
+    }
 
     let (sim_orders, sim_errors) =
         simulate_all_orders_with_sim_tree(provider, &ctx, &orders, false)?;
@@ -184,13 +187,13 @@ where
         let mut count = 0;
         let mut amount = U256::ZERO;
         for sim in &sim_orders {
-            if sim.sim_value.paid_kickbacks.is_empty() {
+            if sim.sim_value.paid_kickbacks().is_empty() {
                 continue;
             }
             count += 1;
             amount += sim
                 .sim_value
-                .paid_kickbacks
+                .paid_kickbacks()
                 .iter()
                 .map(|(_, v)| v)
                 .sum::<U256>();
@@ -198,7 +201,7 @@ where
         (count, amount)
     };
 
-    let simulated_total_gas = sim_orders.iter().map(|o| o.sim_value.gas_used).sum();
+    let simulated_total_gas = sim_orders.iter().map(|o| o.sim_value.gas_used()).sum();
     let mut builder_outputs = Vec::new();
 
     for building_algorithm_name in builders_names {

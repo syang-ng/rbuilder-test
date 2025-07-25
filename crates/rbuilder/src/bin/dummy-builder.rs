@@ -3,7 +3,12 @@
 //! It does not sends blocks to any relay, it just logs the generated blocks.
 //! The algorithm is really dummy, it just adds some txs it receives and generates a single block.
 //! This is NOT intended to be run in production so it has no nice configuration, poor error checking and some hardcoded values.
-use std::{path::PathBuf, sync::Arc, thread::sleep, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{atomic::AtomicBool, Arc},
+    thread::sleep,
+    time::Duration,
+};
 
 use jsonrpsee::RpcModule;
 use rbuilder::{
@@ -34,7 +39,9 @@ use rbuilder::{
         LiveBuilder,
     },
     mev_boost::RelayClient,
-    primitives::{mev_boost::MevBoostRelaySlotInfoProvider, SimulatedOrder},
+    primitives::{
+        mev_boost::MevBoostRelaySlotInfoProvider, order_statistics::OrderStatistics, SimulatedOrder,
+    },
     provider::StateProviderFactory,
     utils::{ProviderFactoryReopener, Signer},
 };
@@ -63,7 +70,8 @@ async fn main() -> eyre::Result<()> {
     let cancel = CancellationToken::new();
 
     let flashbots_relay_url = "https://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@boost-relay.flashbots.net";
-    let relay_client = RelayClient::from_url(flashbots_relay_url.parse()?, None, None, None);
+    let relay_client =
+        RelayClient::from_url(flashbots_relay_url.parse()?, None, None, None, false, false);
     let relay = MevBoostRelaySlotInfoProvider::new(relay_client, "flashbots".to_string());
     let blocklist_provider = Arc::new(NullBlockListProvider::new());
     let payload_event = MevBoostSlotDataGenerator::new(
@@ -115,6 +123,7 @@ async fn main() -> eyre::Result<()> {
         sbundle_merger_selected_signers: Default::default(),
         evm_caching_enable: false,
         simulation_use_random_coinbase: true,
+        faster_finalize: false,
     };
 
     let ctrlc = tokio::spawn(async move {
@@ -122,7 +131,7 @@ async fn main() -> eyre::Result<()> {
         cancel.cancel()
     });
 
-    builder.run().await?;
+    builder.run(Arc::new(AtomicBool::new(false))).await?;
     ctrlc.await.unwrap_or_default();
     Ok(())
 }
@@ -212,13 +221,17 @@ impl DummyBuildingAlgorithm {
         let block_state = provider
             .history_by_block_hash(ctx.attributes.parent)?
             .into();
-
+        let mut order_statistics = OrderStatistics::new();
+        for sim_order in &orders {
+            order_statistics.add(&sim_order.order);
+        }
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             block_state,
             ctx.clone(),
             &mut local_ctx,
             BUILDER_NAME.to_string(),
             false,
+            order_statistics,
             CancellationToken::new(),
         )?;
 

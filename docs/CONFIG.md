@@ -63,6 +63,8 @@ Every field has a default if omitted.
 |RelayConfig.use_gzip_for_submit|optional bool||false|
 |RelayConfig.optimistic|optional bool||false|
 |RelayConfig.interval_between_submissions_ms|optional int| Caps the submission rate to the relay|None|
+|RelayConfig.is_fast|optional bool| If the block bid > ignore_fast_bid_threshold_eth, critical blocks (the ones containing orders with replacement id) will go only to fast relays.|true|
+|RelayConfig.is_independent|optional bool| Big blocks (bid value > independent_bid_threshold_eth) will go only to independent relays.|true|
 |enabled_relays| vec["string"]| Extra hardcoded relays to add (see DEFAULT_RELAYS in [config.rs](../crates/rbuilder/src/live_builder/config.rs))|[]|
 |relay_secret_key|optional env/string|Secret key that will be used to sign normal submissions to the relay.|None|
 |optimistic_relay_secret_key|optional env/string|Secret key that will be used to sign optimistic submissions to the relay.|None|
@@ -70,7 +72,8 @@ Every field has a default if omitted.
 |optimistic_max_bid_value_eth|string| Bids above this value will always be submitted in non-optimistic mode.|"0.0"|
 |cl_node_url|vec[env/stirng]| Array if urls to CL clients to get the new payload events|["http://127.0.0.1:3500"]
 |genesis_fork_version|optional string|Genesis fork version for the chain. If not provided it will be fetched from the beacon client.|None|
-
+|independent_bid_threshold_eth|optional string|Bids above this value will only go to independent relays.| "0"|
+|ignore_fast_bid_threshold_eth|optional string|For bids below this value we ignore RelayConfig::is_fast (it's like is_fast is true for all relays)| "1000"|
 ## Building algorithms
 rbuilder can multiple building algorithms and each algorithm can be instantiated multiple times with it's own set of parameters each time.
 Each instantiated algorithm starts with:
@@ -88,6 +91,7 @@ Each instantiated algorithm starts with:
 |drop_failed_orders|mandatory bool| if a tx fails in a block building iteration it's dropped so next iterations will not use it.||
 |coinbase_payment|optional bool | Start the first iteration of block building using direct pay to fee_recipient (validator)<br>This mode saves gas on the payout tx from builder to validator but disables mev-share and profit taking.|false|
 |build_duration_deadline_ms|optional int| Amount of time allocated for EVM execution while building block. If None it only stops when it tried all orders.| None|
+|ignore_mempool_profit_on_bundles|bool|When computing profit to prioritize orders on s/bundles any profit from a mempool tx will be ignored.|false|
 
 ### Fields for algo="parallel-builder"
 

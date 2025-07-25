@@ -3,13 +3,8 @@ use std::{iter, time::Instant};
 use ahash::{HashMap, HashSet};
 use alloy_eips::BlockNumHash;
 use alloy_primitives::Address;
-use eth_sparse_mpt::{
-    prefetch_tries_for_accounts,
-    reth_sparse_trie::{trie_fetcher::FetchNodeError, SparseTrieError, SparseTrieSharedCache},
-    ChangedAccountData,
-};
+use eth_sparse_mpt::*;
 use reth::providers::providers::ConsistentDbView;
-use reth_errors::ProviderError;
 use reth_provider::{BlockReader, DatabaseProviderFactory, StateCommitmentProvider};
 use tokio::sync::broadcast::{
     self,
@@ -18,7 +13,10 @@ use tokio::sync::broadcast::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, trace, warn};
 
-use crate::{building::evm_inspector::SlotKey, live_builder::simulation::SimulatedOrderCommand};
+use crate::{
+    building::evm_inspector::SlotKey, live_builder::simulation::SimulatedOrderCommand,
+    telemetry::inc_root_hash_prefetch_count, utils::elapsed_ms,
+};
 
 const CONSUME_SIM_ORDERS_BATCH: usize = 128;
 
@@ -27,6 +25,7 @@ const CONSUME_SIM_ORDERS_BATCH: usize = 128;
 pub fn run_trie_prefetcher<P>(
     parent_num_hash: BlockNumHash,
     shared_sparse_mpt_cache: SparseTrieSharedCache,
+    version: ETHSpareMPTVersion,
     provider: P,
     mut simulated_orders: broadcast::Receiver<SimulatedOrderCommand>,
     cancel: CancellationToken,
@@ -145,25 +144,22 @@ pub fn run_trie_prefetcher<P>(
         let start = Instant::now();
         match prefetch_tries_for_accounts(
             consistent_db_view.clone(),
-            shared_sparse_mpt_cache.clone(),
+            &shared_sparse_mpt_cache,
             fetch_request.values(),
+            version,
         ) {
-            Ok(()) => {}
-            Err(SparseTrieError::FetchNode(FetchNodeError::Provider(
-                ProviderError::ConsistentView(_),
-            ))) => {
-                return;
+            Ok(metrics) => {
+                inc_root_hash_prefetch_count(metrics.fetched_nodes);
+                trace!(
+                    time_ms = elapsed_ms(start),
+                    ?metrics,
+                    "Prefetched trie nodes"
+                );
             }
+            Err(SparseTrieError::WrongDatabaseTrieError) => {}
             Err(err) => {
-                if !err.is_db_consistency_error() {
-                    error!(?err, "Error while prefetching trie nodes");
-                }
+                error!(?err, "Error while prefetching trie nodes");
             }
-        }
-        trace!(
-            time_ms = start.elapsed().as_millis(),
-            accounts = fetch_request.len(),
-            "Prefetched trie nodes"
-        );
+        };
     }
 }

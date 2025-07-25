@@ -1,4 +1,3 @@
-mod cli;
 mod redistribution_algo;
 
 use crate::{
@@ -22,7 +21,6 @@ use crate::{
 };
 use ahash::{HashMap, HashSet};
 use alloy_primitives::{utils::format_ether, Address, B256, I256, U256};
-pub use cli::run_backtest_redistribute;
 use itertools::Itertools;
 use rayon::prelude::*;
 use reth_chainspec::ChainSpec;
@@ -1180,6 +1178,10 @@ fn order_redistribution_address(
     order: &Order,
     protect_signers: &[Address],
 ) -> Option<(Address, bool)> {
+    if let Some(refund_identity) = order.metadata().refund_identity {
+        return Some((refund_identity, false));
+    }
+
     let signer = match order.signer() {
         Some(signer) => signer,
         None => {

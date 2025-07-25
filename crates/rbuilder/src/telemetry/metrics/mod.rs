@@ -12,6 +12,7 @@ use crate::{
     primitives::mev_boost::MevBoostRelayID,
     utils::{build_info::Version, duration_ms},
 };
+use alloy_consensus::constants::GWEI_TO_WEI;
 use alloy_primitives::{utils::Unit, U256};
 use bigdecimal::num_traits::Pow;
 use ctor::ctor;
@@ -19,8 +20,8 @@ use lazy_static::lazy_static;
 use metrics_macros::register_metrics;
 use parking_lot::Mutex;
 use prometheus::{
-    Counter, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry,
+    Counter, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry,
 };
 use std::{
     sync::Arc,
@@ -29,10 +30,9 @@ use std::{
 use time::OffsetDateTime;
 use tracing::error;
 
+pub mod scope_meter;
 mod tracing_metrics;
-
 pub use tracing_metrics::*;
-
 const SUBSIDY_ATTEMPT: &str = "attempt";
 const SUBSIDY_LANDED: &str = "landed";
 
@@ -42,6 +42,9 @@ const RELAY_ERROR_OTHER: &str = "other";
 
 const SIM_STATUS_OK: &str = "sim_success";
 const SIM_STATUS_FAIL: &str = "sim_fail";
+
+const ROOT_HASH_PREFETCH_STEP: &str = "prefetcher";
+const ROOT_HASH_FINALIZE_STEP: &str = "finalize";
 
 /// We record timestamps only for blocks built within interval of the block timestamp
 const BLOCK_METRICS_TIMESTAMP_LOWER_DELTA: time::Duration = time::Duration::seconds(3);
@@ -100,6 +103,16 @@ register_metrics! {
     .unwrap();
 
 
+    pub static ROOT_HASH_FETCHES: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "rbuilder_sparse_mpt_root_hash_fetches",
+            "Number of nodes fetched in a finalize or prefetch step"
+        ),
+        &["step"],
+    )
+    .unwrap();
+
+
 
     pub static CURRENT_BLOCK: IntGauge =
         IntGauge::new("current_block", "Current Block").unwrap();
@@ -113,6 +126,11 @@ register_metrics! {
         &["kind"]
     )
     .unwrap();
+
+    pub static ORDER_INPUT_RPC_ERROR: IntCounterVec = IntCounterVec::new(
+    Opts::new("rbuilder_order_input_rpc_errors", "counter of errors when receiving orders on RPC"),
+    &["kind"],
+    ).unwrap();
 
     pub static RELAY_ERRORS: IntCounterVec = IntCounterVec::new(
         Opts::new("relay_errors", "counter of relay errors"),
@@ -134,7 +152,7 @@ register_metrics! {
             "initiated_submissions",
             "Number of initiated submissions to the relays"
         ),
-        &["optimistic","sent_to_slow"],
+        &["optimistic"],
     )
     .unwrap();
 
@@ -144,6 +162,14 @@ register_metrics! {
         &["relay"],
     )
     .unwrap();
+
+    pub static RPC_PROCESSING_TIME: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("rpc_processing_time", "Time spend in RPC handlers (us)")
+            .buckets(exponential_buckets_range(10.0, 50000.0, 100)),
+        &["api","size"],
+    )
+    .unwrap();
+
     pub static VERSION: IntGaugeVec = IntGaugeVec::new(
         Opts::new("version", "Version of the builder"),
         &["git", "git_ref", "build_time_utc"]
@@ -206,6 +232,8 @@ register_metrics! {
      /////////////////////////////////
      // SUBSIDY
      /////////////////////////////////
+
+    pub static BUILDER_BALANCE: Gauge = Gauge::new("rbuilder_coinbase_balance", "balance of builder coinbase").unwrap();
 
     /// We decide this at the end of the submission to relays
     pub static SUBSIDIZED_BLOCK_COUNT: IntCounterVec = IntCounterVec::new(
@@ -404,6 +432,10 @@ pub fn set_ordepool_count(txs: usize, bundles: usize) {
     ORDERPOOL_BUNDLES.set(bundles as i64);
 }
 
+pub fn inc_order_input_rpc_errors(method: &str) {
+    ORDER_INPUT_RPC_ERROR.with_label_values(&[method]).inc();
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn add_finalized_block_metrics(
     built_block_trace: &BuiltBlockTrace,
@@ -469,9 +501,9 @@ pub fn inc_active_slots() {
     ACTIVE_SLOTS.inc();
 }
 
-pub fn inc_initiated_submissions(optimistic: bool, sent_to_slow_relays: bool) {
+pub fn inc_initiated_submissions(optimistic: bool) {
     INITIATED_SUBMISSIONS
-        .with_label_values(&[&optimistic.to_string(), &sent_to_slow_relays.to_string()])
+        .with_label_values(&[&optimistic.to_string()])
         .inc();
 }
 
@@ -479,6 +511,22 @@ pub fn add_relay_submit_time(relay: &MevBoostRelayID, duration: Duration) {
     RELAY_SUBMIT_TIME
         .with_label_values(&[relay.as_str()])
         .observe(duration_ms(duration));
+}
+
+const BIG_RPC_DATA_THRESHOLD: usize = 50000;
+const BIG_RPC_DATA_TEXT: &str = ">50K";
+const SMALL_RPC_DATA_TEXT: &str = "<=50K";
+pub fn add_rpc_processing_time(api: &str, duration: Duration, data_len: usize) {
+    RPC_PROCESSING_TIME
+        .with_label_values(&[
+            api,
+            if data_len > BIG_RPC_DATA_THRESHOLD {
+                BIG_RPC_DATA_TEXT
+            } else {
+                SMALL_RPC_DATA_TEXT
+            },
+        ])
+        .observe(duration.as_micros() as f64);
 }
 
 pub fn inc_relay_accepted_submissions(relay: &MevBoostRelayID, optimistic: bool) {
@@ -549,6 +597,13 @@ pub fn add_subsidy_value(value: U256, landed: bool) {
     }
 }
 
+pub fn set_builder_balance(balance: U256) {
+    let gwei_balance = balance / U256::from(GWEI_TO_WEI);
+    let u64_gwei_balance: u64 = gwei_balance.try_into().unwrap_or(0);
+    let f64_eth_balance = u64_gwei_balance as f64 / 1_000_000_000.0;
+    BUILDER_BALANCE.set(f64_eth_balance);
+}
+
 fn sim_status(success: bool) -> &'static str {
     if success {
         SIM_STATUS_OK
@@ -570,6 +625,24 @@ pub fn mark_submission_start_time(block_sealed_at: OffsetDateTime) {
     BLOCK_SEAL_END_SUBMIT_START_TIME
         .with_label_values(&[])
         .observe(value);
+}
+
+pub fn inc_root_hash_prefetch_count(fetched_nodes: usize) {
+    if fetched_nodes == 0 {
+        return;
+    }
+    ROOT_HASH_FETCHES
+        .with_label_values(&[ROOT_HASH_PREFETCH_STEP])
+        .inc_by(fetched_nodes.try_into().unwrap_or_default());
+}
+
+pub fn inc_root_hash_finalize_count(fetched_nodes: usize) {
+    if fetched_nodes == 0 {
+        return;
+    }
+    ROOT_HASH_FETCHES
+        .with_label_values(&[ROOT_HASH_FINALIZE_STEP])
+        .inc_by(fetched_nodes.try_into().unwrap_or_default());
 }
 
 pub fn gather_prometheus_metrics(registry: &Registry) -> String {

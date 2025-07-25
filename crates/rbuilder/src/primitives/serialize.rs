@@ -526,7 +526,7 @@ pub struct RawShareBundleMetadatada {
 
 #[derive(Error, Debug)]
 pub enum RawShareBundleConvertError {
-    #[error("Failed to decode transaction, idx: {0}, error: {0}")]
+    #[error("Failed to decode transaction, idx: {0}, error: {1}")]
     FailedToDecodeTransaction(usize, TxWithBlobsCreateError),
     #[error("Bundle too deep")]
     BundleTooDeep,
@@ -544,7 +544,8 @@ pub enum RawShareBundleConvertError {
     CancelError,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub struct CancelShareBundle {
     pub block: u64,
     pub key: ShareBundleReplacementKey,

@@ -11,6 +11,7 @@ use alloy_primitives::{
     U256,
 };
 use alloy_rpc_types_beacon::events::{PayloadAttributesData, PayloadAttributesEvent};
+use eth_sparse_mpt::ETHSpareMPTVersion::V2;
 use lazy_static::lazy_static;
 use reth::{
     primitives::{Account, BlockBody, Bytecode},
@@ -19,6 +20,7 @@ use reth::{
 };
 use reth_chainspec::{ChainSpec, EthereumHardfork, MAINNET};
 use reth_db::{cursor::DbCursorRW, tables, transaction::DbTxMut};
+use reth_errors::ProviderResult;
 use reth_primitives::{Recovered, TransactionSigned};
 use reth_primitives_traits::Block as _;
 use reth_provider::test_utils::{create_test_provider_factory, MockNodeTypesWithDB};
@@ -209,7 +211,7 @@ impl TestChainState {
         let root_hasher = Arc::from(RootHasherImpl::new(
             genesis_header.num_hash(),
             None,
-            RootHashContext::new(true, false, None),
+            RootHashContext::new(true, false, None, V2),
             provider_factory.clone(),
             provider_factory.clone(),
         ));
@@ -292,6 +294,28 @@ impl TestChainState {
 
     pub fn provider_factory(&self) -> &ProviderFactory<MockNodeTypesWithDB> {
         &self.provider_factory
+    }
+
+    pub fn upsert_contract(&self, address: Address, bytecode: Bytecode) -> ProviderResult<()> {
+        let code_hash = bytecode.hash_slow();
+        let provider = self.provider_factory.provider_rw()?;
+        provider
+            .tx_ref()
+            .cursor_write::<tables::PlainAccountState>()?
+            .upsert(
+                address,
+                &Account {
+                    nonce: 1,
+                    balance: U256::ZERO,
+                    bytecode_hash: Some(code_hash),
+                },
+            )?;
+        provider
+            .tx_ref()
+            .cursor_write::<tables::Bytecodes>()?
+            .upsert(code_hash, &bytecode)?;
+        provider.commit()?;
+        Ok(())
     }
 }
 
@@ -396,6 +420,7 @@ impl TestBlockContextBuilder {
             Some(SpecId::SHANGHAI),
             self.root_hasher,
             0,
+            true,
             true,
         )
         .unwrap();

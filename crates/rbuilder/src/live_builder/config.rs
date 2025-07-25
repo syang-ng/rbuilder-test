@@ -25,8 +25,9 @@ use crate::{
             BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
         },
         order_priority::{
-            OrderLengthThreeMaxProfitPriority, OrderLengthThreeMevGasPricePriority,
-            OrderMaxProfitPriority, OrderMevGasPricePriority, OrderTypePriority,
+            FullProfitInfoGetter, NonMempoolProfitInfoGetter, OrderLengthThreeMaxProfitPriority,
+            OrderLengthThreeMevGasPricePriority, OrderMaxProfitPriority, OrderMevGasPricePriority,
+            OrderTypePriority, ProfitInfoGetter,
         },
         Sorting,
     },
@@ -115,6 +116,8 @@ pub struct Config {
 }
 
 const DEFAULT_SLOT_DELTA_TO_START_BIDDING_MS: i64 = -8000;
+const DEFAULT_ASK_FOR_FILTERING_VALIDATORS: bool = false;
+const DEFAULT_CAN_IGNORE_GAS_LIMIT: bool = false;
 
 #[serde_as]
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -140,9 +143,6 @@ pub struct L1Config {
 
     /// Genesis fork version for the chain. If not provided it will be fetched from the beacon client.
     pub genesis_fork_version: Option<String>,
-
-    /// Bids above this value will only go to fast relays.
-    pub fast_bid_threshold_eth: String,
 }
 
 impl Default for L1Config {
@@ -156,7 +156,6 @@ impl Default for L1Config {
             optimistic_max_bid_value_eth: "0.0".to_string(),
             cl_node_url: vec![EnvOrValue::from("http://127.0.0.1:3500")],
             genesis_fork_version: None,
-            fast_bid_threshold_eth: "0".to_owned(),
         }
     }
 }
@@ -197,8 +196,7 @@ impl L1Config {
                     relay_config.name.clone(),
                     submit_config,
                     relay_config.mode == RelayMode::Test,
-                    relay_config.is_fast(),
-                ));
+                )?);
             } else {
                 eyre::bail!(
                     "Relay {} in mode {:?} has no submit config",
@@ -251,6 +249,12 @@ impl L1Config {
                         relay_config.authorization_header.clone(),
                         relay_config.builder_id_header.clone(),
                         relay_config.api_token_header.clone(),
+                        relay_config
+                            .ask_for_filtering_validators
+                            .unwrap_or(DEFAULT_ASK_FOR_FILTERING_VALIDATORS),
+                        relay_config
+                            .can_ignore_gas_limit
+                            .unwrap_or(DEFAULT_CAN_IGNORE_GAS_LIMIT),
                     );
                     Self::create_relay_sub_objects(
                         relay_config,
@@ -315,7 +319,6 @@ impl L1Config {
             signer,
             optimistic_config,
             bid_observer,
-            fast_bid_threshold: parse_ether(&self.fast_bid_threshold_eth)?,
         })
     }
 
@@ -436,44 +439,62 @@ impl LiveBuilderConfig for Config {
     {
         let builder_cfg = self.builder(building_algorithm_name)?;
         match builder_cfg.builder {
-            SpecificBuilderConfig::OrderingBuilder(config) => match config.sorting {
-                Sorting::MevGasPrice => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderMevGasPricePriority,
-                    >(config, input)
+            SpecificBuilderConfig::OrderingBuilder(config) => {
+                if config.ignore_mempool_profit_on_bundles {
+                    build_backtest_block_ordering_builder::<P, NonMempoolProfitInfoGetter>(
+                        config, input,
+                    )
+                } else {
+                    build_backtest_block_ordering_builder::<P, FullProfitInfoGetter>(config, input)
                 }
-                Sorting::MaxProfit => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderMaxProfitPriority,
-                    >(config, input)
-                }
-                Sorting::TypeMaxProfit => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderTypePriority,
-                    >(config, input)
-                }
-                Sorting::LengthThreeMaxProfit => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderLengthThreeMaxProfitPriority,
-                    >(config, input)
-                }
-                Sorting::LengthThreeMevGasPrice => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderLengthThreeMevGasPricePriority,
-                    >(config, input)
-                }
-            },
+            }
             SpecificBuilderConfig::ParallelBuilder(config) => {
                 parallel_build_backtest::<P>(input, config)
             },
             SpecificBuilderConfig::DefaultBuilder(config) => {
                 default_parallel_build_backtest::<P>(input, config)
             }
+        }
+    }
+}
+
+pub fn build_backtest_block_ordering_builder<P, ProfitInfoGetterType: ProfitInfoGetter + 'static>(
+    config: OrderingBuilderConfig,
+    input: BacktestSimulateBlockInput<'_, P>,
+) -> eyre::Result<Block>
+where
+    P: StateProviderFactory + Clone + 'static,
+{
+    match config.sorting {
+        Sorting::MevGasPrice => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderMevGasPricePriority<ProfitInfoGetterType>,
+            >(config, input)
+        }
+        Sorting::MaxProfit => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderMaxProfitPriority<ProfitInfoGetterType>,
+            >(config, input)
+        }
+        Sorting::TypeMaxProfit => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderTypePriority<ProfitInfoGetterType>,
+            >(config, input)
+        }
+        Sorting::LengthThreeMaxProfit => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderLengthThreeMaxProfitPriority<ProfitInfoGetterType>,
+            >(config, input)
+        }
+        Sorting::LengthThreeMevGasPrice => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderLengthThreeMevGasPricePriority<ProfitInfoGetterType>,
+            >(config, input)
         }
     }
 }
@@ -511,6 +532,7 @@ impl Default for Config {
                         drop_failed_orders: true,
                         coinbase_payment: false,
                         build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
                     }),
                 },
                 BuilderConfig {
@@ -522,6 +544,7 @@ impl Default for Config {
                         drop_failed_orders: true,
                         coinbase_payment: false,
                         build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
                     }),
                 },
                 BuilderConfig {
@@ -533,6 +556,7 @@ impl Default for Config {
                         drop_failed_orders: true,
                         coinbase_payment: false,
                         build_duration_deadline_ms: Some(30),
+                        ignore_mempool_profit_on_bundles: false,
                     }),
                 },
                 BuilderConfig {
@@ -544,6 +568,7 @@ impl Default for Config {
                         drop_failed_orders: true,
                         coinbase_payment: true,
                         build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
                     }),
                 },
                 BuilderConfig {
@@ -555,6 +580,7 @@ impl Default for Config {
                         drop_failed_orders: false,
                         coinbase_payment: false,
                         build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
                     }),
                 },
                 BuilderConfig {
@@ -563,6 +589,7 @@ impl Default for Config {
                         discard_txs: true,
                         num_threads: 25,
                         coinbase_payment: false,
+                        safe_sorting_only: true,
                     }),
                 },
                 BuilderConfig {
@@ -571,6 +598,7 @@ impl Default for Config {
                         discard_txs: true,
                         num_threads: 25,
                         coinbase_payment: false,
+                        safe_sorting_only: true,
                     }),
                 },
             ],
@@ -642,29 +670,45 @@ where
     P: StateProviderFactory + Clone + 'static,
 {
     match cfg.builder {
-        SpecificBuilderConfig::OrderingBuilder(order_cfg) => match order_cfg.sorting {
-            Sorting::MevGasPrice => Arc::new(
-                OrderingBuildingAlgorithm::<OrderMevGasPricePriority>::new(order_cfg, cfg.name),
-            ),
-            Sorting::MaxProfit => Arc::new(
-                OrderingBuildingAlgorithm::<OrderMaxProfitPriority>::new(order_cfg, cfg.name),
-            ),
-            Sorting::TypeMaxProfit => Arc::new(
-                OrderingBuildingAlgorithm::<OrderTypePriority>::new(order_cfg, cfg.name),
-            ),
-            Sorting::LengthThreeMaxProfit => Arc::new(OrderingBuildingAlgorithm::<
-                OrderLengthThreeMaxProfitPriority,
-            >::new(order_cfg, cfg.name)),
-            Sorting::LengthThreeMevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
-                OrderLengthThreeMevGasPricePriority,
-            >::new(order_cfg, cfg.name)),
-        },
+        SpecificBuilderConfig::OrderingBuilder(order_cfg) => {
+            if order_cfg.ignore_mempool_profit_on_bundles {
+                create_ordering_builder::<P, NonMempoolProfitInfoGetter>(order_cfg, cfg.name)
+            } else {
+                create_ordering_builder::<P, FullProfitInfoGetter>(order_cfg, cfg.name)
+            }
+        }
         SpecificBuilderConfig::ParallelBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
         },
         SpecificBuilderConfig::DefaultBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
         }
+    }
+}
+
+fn create_ordering_builder<P, ProfitInfoGetterType: ProfitInfoGetter + 'static>(
+    cfg: OrderingBuilderConfig,
+    name: String,
+) -> Arc<dyn BlockBuildingAlgorithm<P>>
+where
+    P: StateProviderFactory + Clone + 'static,
+{
+    match cfg.sorting {
+        Sorting::MevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
+            OrderMevGasPricePriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::MaxProfit => Arc::new(OrderingBuildingAlgorithm::<
+            OrderMaxProfitPriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::TypeMaxProfit => Arc::new(OrderingBuildingAlgorithm::<
+            OrderTypePriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::LengthThreeMaxProfit => Arc::new(OrderingBuildingAlgorithm::<
+            OrderLengthThreeMaxProfitPriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::LengthThreeMevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
+            OrderLengthThreeMevGasPricePriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
     }
 }
 
@@ -728,12 +772,14 @@ lazy_static! {
                     use_gzip_for_submit: false,
                     optimistic: false,
                     interval_between_submissions_ms: Some(250),
+                    max_bid_eth: None,
                 }),
                 priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
-                is_fast: None,
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map.insert(
@@ -747,12 +793,14 @@ lazy_static! {
                     use_gzip_for_submit: true,
                     optimistic: true,
                     interval_between_submissions_ms: None,
+                    max_bid_eth: None,
                 }),
                 priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
-                is_fast: None,
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map.insert(
@@ -766,12 +814,14 @@ lazy_static! {
                     use_gzip_for_submit: true,
                     optimistic: true,
                     interval_between_submissions_ms: None,
+                    max_bid_eth: None,
                 }),
                 priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
-                is_fast: None,
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map.insert(
@@ -785,11 +835,13 @@ lazy_static! {
                     use_gzip_for_submit: true,
                     optimistic: true,
                     interval_between_submissions_ms: None,
+                    max_bid_eth: None,
                 }),                priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
-                is_fast: None,
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map.insert(
@@ -803,12 +855,14 @@ lazy_static! {
                     use_gzip_for_submit: false,
                     optimistic: false,
                     interval_between_submissions_ms: None,
+                    max_bid_eth: None,
                 }),
                 priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
-                is_fast: None,
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map
