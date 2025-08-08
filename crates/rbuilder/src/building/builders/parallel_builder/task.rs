@@ -71,6 +71,8 @@ pub enum Algorithm {
     Random { seed: u64, count: usize },
     /// `PermutationsWithNonces` checks all possible permutations of the group with nonces.
     PermutationsWithNonces,
+    /// `BestOfN` checks N bundles and picks the best one.
+    BestOfN,
 }
 
 #[cfg(test)]

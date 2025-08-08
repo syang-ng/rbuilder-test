@@ -328,6 +328,7 @@ fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize>> {
         Algorithm::AllPermutations => generate_all_permutations(task),
         Algorithm::Random { seed, count } => generate_random_permutations(task, seed, count),
         Algorithm::PermutationsWithNonces => generate_all_permutations_with_nonces(task),
+        Algorithm::BestOfN => analyze_group_conflicts_and_find_best(task), // BestOfN implementation
     }
 }
 
@@ -503,6 +504,57 @@ fn find_permutations_recursive(
         }
         current_permutation_indices.pop();
     }
+}
+
+// optimal solution: each group contains exlsuivity 
+fn analyze_group_conflicts_and_find_best(task: &ConflictTask) -> Vec<Vec<usize>> {
+    let order_group = &task.group;
+    let orders = &order_group.orders;
+
+    // Collect the nonce sets for each order (assuming Vec<u64> or similar)
+    let order_nonces: Vec<Vec<u64>> = orders
+        .iter()
+        .map(|order_arc| order_arc.order.nonces())
+        .collect();
+
+    // Define a function to compute the "value" of an order, here using coinbase_profit()
+    // You can replace it with other metrics if needed
+    fn order_value(order: &SimulatedOrder) -> U256 {
+        order.sim_value.full_profit_info().coinbase_profit()
+    }
+
+    // Create index and value pairs for sorting
+    let mut idx_and_value: Vec<(usize, U256)> = orders
+        .iter()
+        .enumerate()
+        .map(|(idx, order_arc)| (idx, order_value(order_arc)))
+        .collect();
+
+    // Sort orders by value in descending order, prioritizing higher-value orders
+    idx_and_value.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut selected = Vec::new();
+    let mut used_nonces = std::collections::HashSet::new();
+
+    for (idx, _) in idx_and_value {
+        let nonces = &order_nonces[idx];
+
+        // Check if there is any nonce conflict with already selected orders
+        let conflict = nonces.iter().any(|nonce| used_nonces.contains(nonce));
+
+        if !conflict {
+            // No conflict, select this order
+            selected.push(idx);
+            for nonce in nonces {
+                used_nonces.insert(*nonce);
+            }
+        }
+        // Skip orders with nonce conflicts
+    }
+
+    // Return a vector containing one group of selected order indices
+    // Modify as needed if you want multiple groups or different solutions
+    vec![selected]
 }
 
 
