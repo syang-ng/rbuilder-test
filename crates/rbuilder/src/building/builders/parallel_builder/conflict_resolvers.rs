@@ -512,7 +512,7 @@ fn analyze_group_conflicts_and_find_best(task: &ConflictTask) -> Vec<Vec<usize>>
     let orders = &order_group.orders;
 
     // Collect the nonce sets for each order (assuming Vec<u64> or similar)
-    let order_nonces: Vec<Vec<u64>> = orders
+    let order_nonces: Vec<_> = orders
         .iter()
         .map(|order_arc| order_arc.order.nonces())
         .collect();
@@ -546,7 +546,7 @@ fn analyze_group_conflicts_and_find_best(task: &ConflictTask) -> Vec<Vec<usize>>
             // No conflict, select this order
             selected.push(idx);
             for nonce in nonces {
-                used_nonces.insert(*nonce);
+                used_nonces.insert(nonce.clone());
             }
         }
         // Skip orders with nonce conflicts

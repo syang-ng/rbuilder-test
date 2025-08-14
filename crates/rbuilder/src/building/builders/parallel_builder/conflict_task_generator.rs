@@ -423,13 +423,25 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 
     let created_at = Instant::now();
 
-    tasks.push(ConflictTask {
-        group_idx: group.id,
-        algorithm: Algorithm::PermutationsWithNonces,
-        priority,
-        group: group.clone(),
-        created_at,
-    });
+    if group.orders.len() > 8 {
+        tasks.push(ConflictTask {
+            group_idx: group.id,
+            algorithm: Algorithm::BestOfN,
+            priority,
+            group: group.clone(),
+            created_at,
+        });
+    } else {
+        tasks.push(ConflictTask {
+            group_idx: group.id,
+            algorithm: Algorithm::PermutationsWithNonces,
+            priority,
+            group: group.clone(),
+            created_at,
+        });
+    }
+
+
     // // Sort the orders by gas used
     // let new_group;
     // let left_orders ;

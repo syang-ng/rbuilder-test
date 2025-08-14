@@ -666,8 +666,11 @@ impl std::fmt::Debug for TransactionSignedEcRecoveredWithBlobs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "TransactionSignedEcRecoveredWithBlobs {{ hash: {} }}",
+            "TransactionSignedEcRecoveredWithBlobs {{ hash: {}, signer: {}, to: {:?}, nonce: {}}}",
             self.hash(),
+            self.signer(),
+            self.to(),
+            self.nonce()
         )
     }
 }

@@ -144,22 +144,22 @@ impl ConflictFinder {
                     all_groups_in_conflict.extend_from_slice(group);
                 }
             }
-            // writing balance other order is reading
-            for write_balance_key in used_state
-                .received_amount
-                .keys()
-                .chain(used_state.sent_amount.keys())
-            {
-                if let Some(group) = self.group_balance_reads.get(write_balance_key) {
-                    all_groups_in_conflict.extend_from_slice(group);
-                }
-            }
-            // reading balance other order is writing
-            for read_balance_key in used_state.read_balances.keys() {
-                if let Some(group) = self.group_balance_writes.get(read_balance_key) {
-                    all_groups_in_conflict.extend_from_slice(group);
-                }
-            }
+            // // writing balance other order is reading
+            // for write_balance_key in used_state
+            //     .received_amount
+            //     .keys()
+            //     .chain(used_state.sent_amount.keys())
+            // {
+            //     if let Some(group) = self.group_balance_reads.get(write_balance_key) {
+            //         all_groups_in_conflict.extend_from_slice(group);
+            //     }
+            // }
+            // // reading balance other order is writing
+            // for read_balance_key in used_state.read_balances.keys() {
+            //     if let Some(group) = self.group_balance_writes.get(read_balance_key) {
+            //         all_groups_in_conflict.extend_from_slice(group);
+            //     }
+            // }
             for contract_addr in used_state
                 .destructed_contracts
                 .iter()

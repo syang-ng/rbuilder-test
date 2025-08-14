@@ -15,15 +15,17 @@ use crate::{
 };
 use alloy_primitives::{Bytes, B256, U64};
 use async_trait::async_trait;
+use csv::Reader;
 use eyre::WrapErr;
 
 use serde::{Deserialize, Deserializer};
 use std::{
-    collections::HashSet, fs::{create_dir_all, File}, os::unix::raw, path::{Path, PathBuf}, str::FromStr
+    collections::HashSet, fs::{create_dir_all, File}, path::{Path, PathBuf}, str::FromStr
 };
 use time::{macros::format_description, Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::trace;
 use uuid::Uuid;
+use zip::ZipArchive;
 
 
 
@@ -101,7 +103,7 @@ struct ShareBundleRecord {
 
 /// Constructs the path to the CSV file containing private transactions for a specific day.
 fn path_bundles(data_dir: &Path, day: &str) -> PathBuf {
-    data_dir.join(format!("bundles/{}.csv", day))
+    data_dir.join(format!("bundles/{}.csv.zip", day))
 }
 
 fn path_sbundles(data_dir: &Path, day: &str) -> PathBuf {
@@ -116,7 +118,14 @@ fn read_filtered_bundles(path: &Path, block: u64) -> eyre::Result<Vec<BundleReco
     }
 
     let file = File::open(path)?;
-    let mut rdr = csv::Reader::from_reader(file);
+    let mut archive = ZipArchive::new(file)?;
+
+    if archive.len() == 0 {
+        return Err(eyre::eyre!("ZIP archive is empty: {}", path.display()));
+    }
+
+    let csv_file = archive.by_index(0)?;
+    let mut rdr = Reader::from_reader(csv_file);    
 
     let mut bundles = Vec::new();
 
@@ -163,16 +172,16 @@ fn get_bundles_from_file(
     block: u64,
 ) -> eyre::Result<Vec<BundleRecord>> {
     let mut bundles = Vec::new();
-    let date_format = format_description!("[year]-[month]-[day]");
+    let date_format = format_description!("[year]-[month]-[day]-[hour]");
 
     let mut current_date = from;
     // Loop through each day in the range (inclusive).
-    while current_date.date() <= to.date() {
+    while current_date <= to {
         let date_str = current_date.format(&date_format)?;
         let path = path_bundles(data_dir, &date_str);
-
+        println!("Reading bundles from file: {}", path.display());
         bundles.extend(read_filtered_bundles(&path, block)?);
-        current_date += Duration::days(1);
+        current_date += Duration::hours(1);
     }
     
     if bundles.is_empty() {
@@ -304,12 +313,13 @@ fn get_sbundles_from_file(
         current_date += Duration::days(1);
     }
 
-    if sbundles.is_empty() {
-        return Err(eyre::eyre!(
-            "No share bundles found for block {} in the specified range",
-            block
-        ));
-    }
+    // skip sbundle absence error for now
+    // if sbundles.is_empty() {
+    //     return Err(eyre::eyre!(
+    //         "No share bundles found for block {} in the specified range",
+    //         block
+    //     ));
+    // }
     
     // Sort all collected share bundles by their insertion timestamp.
     sbundles.sort_by_key(|r| r.received_at);
@@ -445,29 +455,29 @@ impl DataSource for PrivateTransactionsDatasource {
             bundles.len()
         );
 
-        let sbundles = get_sbundles(
-            self.path.as_path(),
-            from,
-            to,
-            block.block_number
-        )
-        .wrap_err_with(|| {
-            format!(
-                "Failed to get share bundles for block {} at timestamp {}",
-                block.block_number, block.block_timestamp
-            )
-        })?;
+        // let sbundles = get_sbundles(
+        //     self.path.as_path(),
+        //     from,
+        //     to,
+        //     block.block_number
+        // )
+        // .wrap_err_with(|| {
+        //     format!(
+        //         "Failed to get share bundles for block {} at timestamp {}",
+        //         block.block_number, block.block_timestamp
+        //     )
+        // })?;
 
-        trace!(
-            "Fetched unfiltered share bundles, count: {}",
-            sbundles.len()
-        );
+        // trace!(
+        //     "Fetched unfiltered share bundles, count: {}",
+        //     sbundles.len()
+        // );
     
         Ok(DatasourceData {
-            orders: bundles
-                .into_iter()
-                .chain(sbundles.into_iter())
-                .collect(),
+            orders: bundles.into_iter().collect(),
+                // .into_iter()
+                // .chain(sbundles.into_iter())
+                // .collect(),
             built_block_data: None,
         })
     }
