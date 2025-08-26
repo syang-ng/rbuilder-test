@@ -1,3 +1,4 @@
+pub mod adjustment;
 mod error;
 pub mod fake_mev_boost_relay;
 pub mod rpc;
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use ssz::Encode;
 use std::{io::Write, str::FromStr};
-use submission::{SubmitBlockRequest, SubmitBlockRequestNoBlobs, SubmitBlockRequestWithMetadata};
+use submission::{SubmitBlockRequestNoBlobs, SubmitBlockRequestWithMetadata};
 use url::Url;
 
 pub use error::*;
@@ -27,6 +28,8 @@ pub use sign_payload::*;
 const TOTAL_PAYMENT_HEADER: &str = "Total-Payment";
 const BUNDLE_HASHES_HEADER: &str = "Bundle-Hashes";
 const TOP_BID_HEADER: &str = "Top-Bid";
+const BLOXROUTE_SHARE_HEADER: &str = "share";
+const BLOXROUTE_BUILDER_VALUE_HEADER: &str = "builder-value";
 
 const JSON_CONTENT_TYPE: &str = "application/json";
 const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
@@ -73,9 +76,10 @@ pub enum KnownRelay {
     Agnostic,
     Aestus,
     Wenmerge,
+    Titan,
 }
 
-pub const RELAYS: [KnownRelay; 9] = [
+pub const RELAYS: [KnownRelay; 10] = [
     KnownRelay::Flashbots,
     KnownRelay::BloxrouteMaxProfit,
     KnownRelay::BloxrouteRegulated,
@@ -85,6 +89,7 @@ pub const RELAYS: [KnownRelay; 9] = [
     KnownRelay::Agnostic,
     KnownRelay::Aestus,
     KnownRelay::Wenmerge,
+    KnownRelay::Titan,
 ];
 
 impl KnownRelay {
@@ -100,6 +105,7 @@ impl KnownRelay {
             KnownRelay::Agnostic => "https://0xa7ab7a996c8584251c8f925da3170bdfd6ebc75d50f5ddc4050a6fdc77f2a3b5fce2cc750d0865e05d7228af97d69561@agnostic-relay.net",
             KnownRelay::Aestus => "https://0xa15b52576bcbf1072f4a011c0f99f9fb6c66f3e1ff321f11f461d15e31b1cb359caa092c71bbded0bae5b5ea401aab7e@aestus.live",
             KnownRelay::Wenmerge => "https://0x8c7d33605ecef85403f8b7289c8058f440cbb6bf72b055dfe2f3e2c6695b6a1ea5a9cd0eb3a7982927a463feb4c3dae2@relay.wenmerge.com",
+            KnownRelay::Titan => "https://0x8c4ed5e24fe5c6ae21018437bde147693f68cda427cd1122cf20819c30eda7ed74f72dece09bb313f2a1855595ab677d@titanrelay.xyz",
         }).unwrap()
     }
 
@@ -115,8 +121,16 @@ impl KnownRelay {
             KnownRelay::Agnostic => "agnostic",
             KnownRelay::Aestus => "aestus",
             KnownRelay::Wenmerge => "wenmerge",
+            KnownRelay::Titan => "titan",
         }
         .to_string()
+    }
+
+    pub fn is_bloxroute(&self) -> bool {
+        matches!(
+            self,
+            Self::BloxrouteMaxProfit | Self::BloxrouteEthical | Self::BloxrouteRegulated
+        )
     }
 }
 
@@ -135,6 +149,7 @@ impl FromStr for KnownRelay {
             "agnostic" => Ok(KnownRelay::Agnostic),
             "aestus" => Ok(KnownRelay::Aestus),
             "wenmerge" => Ok(KnownRelay::Wenmerge),
+            "titan" => Ok(KnownRelay::Titan),
             _ => Err(()),
         }
     }
@@ -150,6 +165,8 @@ pub struct RelayClient {
     authorization_header: Option<String>,
     builder_id_header: Option<String>,
     api_token_header: Option<String>,
+    /// Flag indicating whether this is the bloxroute relay.
+    is_bloxroute: bool,
     /// Adds "filtering=true" as query
     ask_for_filtering_validators: bool,
     /// If we submit a block with a different gas than the one the validator registered with in this relay the relay does not mind.
@@ -162,6 +179,7 @@ impl RelayClient {
         authorization_header: Option<String>,
         builder_id_header: Option<String>,
         api_token_header: Option<String>,
+        is_bloxroute: bool,
         ask_for_filtering_validators: bool,
         can_ignore_gas_limit: bool,
     ) -> Self {
@@ -171,13 +189,22 @@ impl RelayClient {
             authorization_header,
             builder_id_header,
             api_token_header,
+            is_bloxroute,
             ask_for_filtering_validators,
             can_ignore_gas_limit,
         }
     }
 
     pub fn from_known_relay(relay: KnownRelay) -> Self {
-        Self::from_url(relay.url(), None, None, None, false, false)
+        Self::from_url(
+            relay.url(),
+            None,
+            None,
+            None,
+            relay.is_bloxroute(),
+            false,
+            false,
+        )
     }
 
     pub fn can_ignore_gas_limit(&self) -> bool {
@@ -500,11 +527,7 @@ impl RelayClient {
         // SSZ vs JSON
         let (mut body_data, content_type) = if ssz {
             (
-                match &submission_with_metadata.submission {
-                    SubmitBlockRequest::Capella(data) => data.0.as_ssz_bytes(),
-                    SubmitBlockRequest::Deneb(data) => data.0.as_ssz_bytes(),
-                    SubmitBlockRequest::Electra(data) => data.0.as_ssz_bytes(),
-                },
+                submission_with_metadata.submission.as_ssz_bytes(),
                 SSZ_CONTENT_TYPE,
             )
         } else {
@@ -539,6 +562,21 @@ impl RelayClient {
             body_data = encoder
                 .finish()
                 .map_err(|e| SubmitBlockErr::RPCSerializationError(e.to_string()))?;
+        }
+
+        // Set bloxroute specific headers.
+        if self.is_bloxroute {
+            headers.insert(BLOXROUTE_SHARE_HEADER, HeaderValue::from_static("na"));
+            headers.insert(
+                BLOXROUTE_BUILDER_VALUE_HEADER,
+                submission_with_metadata
+                    .metadata
+                    .value
+                    .coinbase_reward
+                    .to_string()
+                    .parse()
+                    .map_err(|_| RelayError::InvalidHeader)?,
+            );
         }
 
         builder = builder.headers(headers).body(Body::from(body_data));
@@ -694,7 +732,9 @@ mod tests {
     use submission::{BidMetadata, BidValueMetadata};
 
     use super::{rpc::TestDataGenerator, *};
-    use crate::mev_boost::fake_mev_boost_relay::FakeMevBoostRelay;
+    use crate::mev_boost::{
+        fake_mev_boost_relay::FakeMevBoostRelay, submission::SubmitBlockRequest,
+    };
 
     use std::str::FromStr;
 
@@ -839,7 +879,7 @@ mod tests {
         let mut generator = TestDataGenerator::default();
 
         let relay_url = Url::from_str(&srv.endpoint()).unwrap();
-        let relay = RelayClient::from_url(relay_url, None, None, None, false, false);
+        let relay = RelayClient::from_url(relay_url, None, None, None, false, false, false);
         let submission = SubmitBlockRequest::Deneb(generator.create_deneb_submit_block_request());
         let sub_relay = SubmitBlockRequestWithMetadata {
             submission,

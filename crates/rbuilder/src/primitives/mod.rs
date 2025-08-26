@@ -965,6 +965,14 @@ impl Order {
         }
     }
 
+    pub fn to_addresses(&self) -> Vec<Option<Address>> {
+        match self {
+            Order::Bundle(bundle) => bundle.list_txs().iter().map(|(tx, _)| tx.to()).collect(),
+            Order::Tx(tx) => vec![tx.tx_with_blobs.to()],
+            Order::ShareBundle(bundle) => bundle.list_txs().iter().map(|(tx, _)| tx.to()).collect(),
+        }
+    }
+
     pub fn id(&self) -> OrderId {
         match self {
             Order::Bundle(bundle) => OrderId::Bundle(bundle.uuid),

@@ -13,3 +13,5 @@ genesis.json
 .code
 .idea
 .vscode
+outputs/*
+old-outpout*/*

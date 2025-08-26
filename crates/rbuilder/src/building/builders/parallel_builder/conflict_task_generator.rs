@@ -11,6 +11,8 @@ use super::{
     task::ConflictTask, Algorithm, ConflictGroup, ConflictResolutionResultPerGroup, GroupId,
     ResolutionResult, TaskPriority, TaskQueue,
 };
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 use std::sync::mpsc as std_mpsc;
 
 const THRESHOLD_FOR_SIGNIFICANT_CHANGE: u64 = 20;
@@ -424,13 +426,139 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
     let created_at = Instant::now();
 
     if group.orders.len() > 8 {
+        let orders = &group.orders;
+        let order_nonces: Vec<_> = orders
+            .iter()
+            .map(|order_arc| order_arc.order.nonces())
+            .collect();
+        
+
+        // Define a function to compute the "value" of an order, here using coinbase_profit()
+        // You can replace it with other metrics if needed
+        fn order_value(order: &SimulatedOrder) -> U256 {
+            order.sim_value.full_profit_info().coinbase_profit()
+        }
+
+        // Create index and value pairs for sorting
+        let mut idx_and_value: Vec<(usize, U256)> = orders
+            .iter()
+            .enumerate()
+            .map(|(idx, order_arc)| (idx, order_value(order_arc)))
+            .collect();
+
+        // Sort orders by value in descending order, prioritizing higher-value orders
+        idx_and_value.sort_by(|a, b| b.1.cmp(&a.1));
+
+
+        let mut used_nonces = std::collections::HashSet::new();
+        let mut selected = vec![];
+
+        for (idx, _) in idx_and_value {
+            let nonces = &order_nonces[idx];
+
+            // Check if there is any nonce conflict with already selected orders
+            let conflict = nonces.iter().any(|nonce| used_nonces.contains(nonce));
+
+            if !conflict {
+                // No conflict, select this order
+                selected.push(idx);
+                for nonce in nonces {
+                    used_nonces.insert(nonce.clone());
+                }
+            }
+            // Skip orders with nonce conflicts
+        }
+        let selected_orders: Vec<_> = selected.iter().map(|&idx| orders[idx].clone()).collect();
+        println!("prev orders: {} selected orders: {}", orders.len(), selected_orders.len());
+
+
+        // let overlap_rate_of_nonces = order_nonces.iter().flatten().counts_by(|nonce| nonce.clone());
+
+        // println!("group id: {}, order count: {}, unique nonces: {}, max overlap: {:?}", group.id, orders.len(), overlap_rate_of_nonces.len(), overlap_rate_of_nonces);
+
+        // let max_overlap = overlap_rate_of_nonces.values().max().cloned().unwrap_or(0);
+        // let denominator = order_nonces.len();
+        // let percentage = if denominator > 0 {
+        //     (max_overlap as f64) / (denominator as f64) * 100.0
+        // } else {
+        //     0.0
+        // };
+
+        // if percentage >= 20.0 {
+        //     println!("generating best of N for group");
+        //     tasks.push(ConflictTask {
+        //         group_idx: group.id,
+        //         algorithm: Algorithm::BestOfN,
+        //         priority,
+        //         group: group.clone(),
+        //         created_at,
+        //     });
+        //     return tasks;
+        // }
+
+        let target_contracts: Vec<_> = selected_orders
+            .iter()
+            .flat_map(|order_arc| order_arc.order.to_addresses())
+            .collect();
+        let overlap_rate_of_target_contracts = target_contracts.iter().counts_by(|addr| addr.clone());
+        let max_overlap_contracts = overlap_rate_of_target_contracts.values().max().cloned().unwrap_or(0);
+        let denominator_contracts = target_contracts.len();
+        let percentage_contracts = if denominator_contracts > 0 {
+            (max_overlap_contracts as f64) / (denominator_contracts as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        if percentage_contracts >= 20.0 {
+            println!("generating random tasks for group");
+            let random_order_group = ConflictGroup {
+                id: group.id,
+                orders: Arc::new(selected_orders.clone()),
+                conflicting_group_ids: group.conflicting_group_ids.clone(),
+            };
+
+
+            tasks.push(ConflictTask {
+                group_idx: group.id,
+                algorithm: Algorithm::Random {
+                    seed: group.id as u64,
+                    count: NUMBER_OF_RANDOM_TASKS,
+                },
+                priority,
+                group: random_order_group,
+                created_at,
+            });
+
+            // return tasks;
+        }
+
+        // println!("generating random sample for group {} {}", percentage, percentage_contracts);
+        let new_group = match selected_orders.len() {
+            len if len < 8 => ConflictGroup {
+                id: group.id,
+                orders: Arc::new(selected_orders),
+                conflicting_group_ids: group.conflicting_group_ids.clone(),
+            },
+            _ => {
+                // Randomly sample 8 orders from selected_orders
+                let mut rng = thread_rng();
+                let sample: Vec<_> = selected_orders.choose_multiple(&mut rng, 7).cloned().collect();
+                ConflictGroup {
+                    id: group.id,
+                    orders: Arc::new(sample),
+                    conflicting_group_ids: group.conflicting_group_ids.clone(),
+                }
+            }
+        };
+
         tasks.push(ConflictTask {
             group_idx: group.id,
-            algorithm: Algorithm::BestOfN,
+            algorithm: Algorithm::AllPermutations,
             priority,
-            group: group.clone(),
+            group: new_group,
             created_at,
         });
+
     } else {
         tasks.push(ConflictTask {
             group_idx: group.id,

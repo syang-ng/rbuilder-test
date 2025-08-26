@@ -534,27 +534,31 @@ fn analyze_group_conflicts_and_find_best(task: &ConflictTask) -> Vec<Vec<usize>>
     idx_and_value.sort_by(|a, b| b.1.cmp(&a.1));
 
     let mut selected = Vec::new();
-    let mut used_nonces = std::collections::HashSet::new();
-
-    for (idx, _) in idx_and_value {
-        let nonces = &order_nonces[idx];
-
-        // Check if there is any nonce conflict with already selected orders
-        let conflict = nonces.iter().any(|nonce| used_nonces.contains(nonce));
-
-        if !conflict {
-            // No conflict, select this order
-            selected.push(idx);
-            for nonce in nonces {
-                used_nonces.insert(nonce.clone());
-            }
-        }
-        // Skip orders with nonce conflicts
-    }
-
-    // Return a vector containing one group of selected order indices
-    // Modify as needed if you want multiple groups or different solutions
+    let best_order_idx = idx_and_value[0].0;
+    selected.push(best_order_idx);
     vec![selected]
+
+    // let mut used_nonces = std::collections::HashSet::new();
+
+    // for (idx, _) in idx_and_value {
+    //     let nonces = &order_nonces[idx];
+
+    //     // Check if there is any nonce conflict with already selected orders
+    //     let conflict = nonces.iter().any(|nonce| used_nonces.contains(nonce));
+
+    //     if !conflict {
+    //         // No conflict, select this order
+    //         selected.push(idx);
+    //         for nonce in nonces {
+    //             used_nonces.insert(nonce.clone());
+    //         }
+    //     }
+    //     // Skip orders with nonce conflicts
+    // }
+
+    // // Return a vector containing one group of selected order indices
+    // // Modify as needed if you want multiple groups or different solutions
+    // vec![selected]
 }
 
 

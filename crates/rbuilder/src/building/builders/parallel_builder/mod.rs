@@ -335,6 +335,12 @@ where
     // Group processing
     let processing_start = Instant::now();
     let groups = conflict_finder.get_order_groups();
+
+    println!("Old Processing {} groups", groups.len());
+    for group in &groups {
+        println!("Old Group ID: {}, Orders: {}", group.id, group.orders.len());
+    }
+
     let results = conflict_resolving_pool.process_groups_backtest(
         groups,
         &input.ctx,
@@ -421,7 +427,7 @@ where
         orders
     };
 
-    conflict_finder.add_orders(sorted_orders);
+    conflict_finder.add_orders_without_balances(sorted_orders);
     let simulation_cache = Arc::new(SharedSimulationCache::new());
     let init_duration = init_start.elapsed();
 
@@ -450,9 +456,9 @@ where
     let processing_start = Instant::now();
     let groups = conflict_finder.get_order_groups();
 
-    println!("Processing {} groups", groups.len());
+    println!("New Processing {} groups", groups.len());
     for group in &groups {
-        println!("Group ID: {}, Orders: {}", group.id, group.orders.len());
+        println!("New Group ID: {}, Orders: {}", group.id, group.orders.len());
 
         if group.orders.len() > 8 {
             // show details of the orders in the group

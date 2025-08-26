@@ -144,6 +144,159 @@ impl ConflictFinder {
                     all_groups_in_conflict.extend_from_slice(group);
                 }
             }
+            // writing balance other order is reading
+            for write_balance_key in used_state
+                .received_amount
+                .keys()
+                .chain(used_state.sent_amount.keys())
+            {
+                if let Some(group) = self.group_balance_reads.get(write_balance_key) {
+                    all_groups_in_conflict.extend_from_slice(group);
+                }
+            }
+            // reading balance other order is writing
+            for read_balance_key in used_state.read_balances.keys() {
+                if let Some(group) = self.group_balance_writes.get(read_balance_key) {
+                    all_groups_in_conflict.extend_from_slice(group);
+                }
+            }
+            for contract_addr in used_state
+                .destructed_contracts
+                .iter()
+                .chain(used_state.created_contracts.iter())
+            {
+                // trying to create / destroy a contract on the same addr as other order
+                if let Some(group) = self.group_code_writes.get(contract_addr) {
+                    all_groups_in_conflict.extend_from_slice(group);
+                }
+                // trying to create / destroy a contract other order is trying to read from
+                if let Some(inner_mapping) = self.group_reads.get(contract_addr) {
+                    let inner_groups = inner_mapping.values().flatten();
+                    all_groups_in_conflict.extend(inner_groups);
+                }
+                // trying to create / destroy a contract other order is trying to write to
+                if let Some(inner_mapping) = self.group_writes.get(contract_addr) {
+                    let inner_groups = inner_mapping.values().flatten();
+                    all_groups_in_conflict.extend(inner_groups);
+                }
+            }
+            all_groups_in_conflict.sort();
+            all_groups_in_conflict.dedup();
+
+            // create new group with only the new order in it
+            let new_order_group: GroupData = {
+                let mut balance_writes: Vec<Address> = used_state
+                    .sent_amount
+                    .into_keys()
+                    .chain(used_state.received_amount.into_keys())
+                    .collect();
+                balance_writes.sort_unstable();
+                balance_writes.dedup();
+
+                let mut code_writes: Vec<Address> = used_state
+                    .created_contracts
+                    .into_iter()
+                    .chain(used_state.destructed_contracts.into_iter())
+                    .collect();
+                code_writes.sort_unstable();
+                code_writes.dedup();
+
+                GroupData {
+                    orders: vec![order],
+                    reads: used_state.read_slot_values.into_keys().collect(),
+                    writes: used_state.written_slot_values.into_keys().collect(),
+                    balance_reads: used_state.read_balances.into_keys().collect(),
+                    balance_writes,
+                    code_writes,
+                    conflicting_group_ids: HashSet::default(),
+                }
+            };
+
+            match all_groups_in_conflict.len() {
+                0 => {
+                    // add `new_order_group` to index and `groups` under a new `group_id`
+                    let group_id = self.group_counter;
+                    self.group_counter += 1;
+                    self.add_group_to_index(group_id, true, &new_order_group);
+                    self.groups.insert(group_id, new_order_group);
+                }
+                1 => {
+                    // combine `new_order_group` with the conflicting group under the conflicting group's `group_id`
+                    let group_id = all_groups_in_conflict[0];
+                    let other_group = self.groups.remove(&group_id).expect("group not found");
+                    let combined_group = combine_groups(vec![new_order_group, other_group], vec![]);
+                    self.add_group_to_index(group_id, false, &combined_group);
+                    self.groups.insert(group_id, combined_group);
+                }
+                _ => {
+                    // combine `new_order_group` with multiple conflicting groups under a new `group_id`
+                    let conflicting_groups = all_groups_in_conflict
+                        .into_iter()
+                        .map(|group_id| (group_id, self.groups.remove(&group_id).unwrap()))
+                        .collect::<Vec<_>>();
+
+                    for (group_id, group_data) in &conflicting_groups {
+                        self.remove_group_from_index(*group_id, group_data);
+                    }
+
+                    let group_id = self.group_counter;
+                    self.group_counter += 1;
+
+                    let removed_group_ids = conflicting_groups.iter().map(|(id, _)| *id).collect();
+                    let conflicting_groups = conflicting_groups
+                        .into_iter()
+                        .map(|(_, group)| group)
+                        .chain(std::iter::once(new_order_group))
+                        .collect();
+                    let combined_group = combine_groups(conflicting_groups, removed_group_ids);
+
+                    self.add_group_to_index(group_id, true, &combined_group);
+                    self.groups.insert(group_id, combined_group);
+                }
+            }
+        }
+    }
+
+    pub fn add_orders_without_balances(&mut self, orders: Vec<Arc<SimulatedOrder>>) {
+        for order in orders {
+            if self.orders.contains(&order.id()) {
+                continue;
+            }
+            self.orders.insert(order.id());
+
+            let used_state = if let Some(used_state) = &order.used_state_trace {
+                used_state.clone()
+            } else {
+                continue;
+            };
+
+            let mut all_groups_in_conflict = Vec::new();
+
+            // check for all possible conflict types
+            for read_key in used_state.read_slot_values.keys() {
+                // reading from slot to which other order is writing to
+                if let Some(inner_mapping) = self.group_writes.get(&read_key.address) {
+                    if let Some(groups) = inner_mapping.get(&read_key.key) {
+                        all_groups_in_conflict.extend_from_slice(groups);
+                    }
+                }
+                // reading from slot on contract that other order is creating / destroying
+                if let Some(group) = self.group_code_writes.get(&read_key.address) {
+                    all_groups_in_conflict.extend_from_slice(group);
+                }
+            }
+            for write_key in used_state.written_slot_values.keys() {
+                // writing to slot other order is reading from
+                if let Some(inner_mapping) = self.group_reads.get(&write_key.address) {
+                    if let Some(groups) = inner_mapping.get(&write_key.key) {
+                        all_groups_in_conflict.extend_from_slice(groups);
+                    }
+                }
+                // writing to slot on contract that other order is creating / destroying
+                if let Some(group) = self.group_code_writes.get(&write_key.address) {
+                    all_groups_in_conflict.extend_from_slice(group);
+                }
+            }
             // // writing balance other order is reading
             // for write_balance_key in used_state
             //     .received_amount
