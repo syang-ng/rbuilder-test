@@ -611,7 +611,7 @@ impl Default for Config {
                     name: String::from("default-parallel"),
                     builder: SpecificBuilderConfig::DefaultBuilder(ParallelBuilderConfig {
                         discard_txs: true,
-                        num_threads: 25,
+                        num_threads: 250,
                         coinbase_payment: false,
                         safe_sorting_only: true,
                     }),

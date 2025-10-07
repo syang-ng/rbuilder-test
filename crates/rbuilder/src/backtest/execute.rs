@@ -162,6 +162,8 @@ where
     P: StateProviderFactory + Clone + 'static,
     ConfigType: LiveBuilderConfig,
 {
+
+    let start_time = std::time::Instant::now();
     let BacktestBlockInput {
         sim_orders,
         sim_errors,
@@ -203,6 +205,8 @@ where
 
     let simulated_total_gas = sim_orders.iter().map(|o| o.sim_value.gas_used()).sum();
     let mut builder_outputs = Vec::new();
+    let elapsed = start_time.elapsed();
+    println!("Total simulation ({}) (took {:?})", ctx.block(), elapsed);
 
     for building_algorithm_name in builders_names {
         let input = BacktestSimulateBlockInput {

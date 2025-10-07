@@ -9,6 +9,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
 use super::{
     conflict_resolvers::ResolverContext, conflict_task_generator::{get_default_tasks_for_group, get_tasks_for_group},
@@ -59,6 +61,11 @@ where
     }
 
     pub fn start(&self) -> eyre::Result<()> {
+        let inner_threads = 25;
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(inner_threads)
+            .build_global();
+    
         for _ in 0..self.num_threads {
             let task_queue = self.task_queue.clone();
             let cancellation_token = self.cancellation_token.clone();

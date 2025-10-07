@@ -11,7 +11,7 @@ use reth::providers::StateProvider;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
-
+use rayon::prelude::*;
 
 use super::{
     simulation_cache::{CachedSimulationState, SharedSimulationCache}, Algorithm, ConflictTask, ResolutionResult
@@ -79,16 +79,51 @@ impl ResolverContext {
 
         let sequence_to_try = generate_sequences_of_orders_to_try(&task);
 
+        // let mut best_resolution_result = ResolutionResult {
+        //     total_profit: U256::ZERO,
+        //     sequence_of_orders: vec![],
+        // };
+
+        // for sequence_of_orders in sequence_to_try {
+        //     let (resolution_result, _state) =
+        //         self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone())?;
+        //     self.update_best_result(resolution_result, &mut best_resolution_result);
+        // }
+        // Move required data out of self for parallel processing
+        let state = self.state.clone();
+        let ctx = self.ctx.clone();
+        let cancellation_token = self.cancellation_token.clone();
+        let simulation_cache = self.simulation_cache.clone();
+
+        let best = sequence_to_try
+            .into_par_iter()
+            .map(|sequence_of_orders| {
+                // Create a new ResolverContext for each parallel task
+                let mut resolver_ctx = ResolverContext {
+                    state: state.clone(),
+                    ctx: ctx.clone(),
+                    cancellation_token: cancellation_token.clone(),
+                    simulation_cache: simulation_cache.clone(),
+                };
+                resolver_ctx
+                    .process_sequence_of_orders(sequence_of_orders, &task, resolver_ctx.state.clone())
+                    .map(|(res, _state)| res)
+            })
+            .try_reduce_with(|a: ResolutionResult, b: ResolutionResult| {
+                Ok(if a.total_profit >= b.total_profit { a } else { b })
+            })
+            .ok_or_else(|| eyre::eyre!("No resolution result found"))?
+            .unwrap_or(ResolutionResult {
+                total_profit: U256::ZERO,
+                sequence_of_orders: vec![],
+            });
+
         let mut best_resolution_result = ResolutionResult {
             total_profit: U256::ZERO,
             sequence_of_orders: vec![],
         };
-
-        for sequence_of_orders in sequence_to_try {
-            let (resolution_result, _state) =
-                self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone())?;
-            self.update_best_result(resolution_result, &mut best_resolution_result);
-        }
+        self.update_best_result(best, &mut best_resolution_result);
+                
 
         trace!(
             "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",

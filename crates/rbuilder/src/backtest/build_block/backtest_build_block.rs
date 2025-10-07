@@ -110,6 +110,7 @@ where
             .builders
             .iter()
             .filter_map(|builder_name: &String| {
+                let start_time = std::time::Instant::now();
                 let input = BacktestSimulateBlockInput {
                     ctx: ctx.clone(),
                     builder_name: builder_name.clone(),
@@ -117,15 +118,17 @@ where
                     provider: provider_factory.clone(),
                 };
                 let build_res = config.build_backtest_block(builder_name, input);
+                let elapsed = start_time.elapsed();
                 if let Err(err) = &build_res {
                     println!("Error building block: {:?}", err);
                     return None;
                 }
                 let block = build_res.ok()?;
                 println!(
-                    "Built block {} with builder: {:?}",
+                    "Built block {} with builder: {:?} (took {:?})",
                     ctx.block(),
-                    builder_name
+                    builder_name,
+                    elapsed
                 );
                 println!("Builder profit: {}", format_ether(block.trace.bid_value));
                 println!(
