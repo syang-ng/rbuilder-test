@@ -66,10 +66,14 @@ impl HistoricalDataFetcher {
     }
 
     pub fn with_default_datasource(mut self, mempool_datadir: PathBuf) -> eyre::Result<Self> {
-        let mempool = Box::new(mempool::MempoolDumpsterDatasource::new(mempool_datadir.clone())?);
+        let mempool = Box::new(mempool::MempoolDumpsterDatasource::new(
+            mempool_datadir.clone(),
+        )?);
         self.data_sources.push(mempool);
         // Add private mempool datasource
-        let private_mempool = Box::new(private_mempool::PrivateTransactionsDatasource::new(mempool_datadir)?);
+        let private_mempool = Box::new(private_mempool::PrivateTransactionsDatasource::new(
+            mempool_datadir,
+        )?);
         self.data_sources.push(private_mempool);
         Ok(self)
     }

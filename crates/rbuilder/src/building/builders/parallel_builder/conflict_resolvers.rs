@@ -1,4 +1,4 @@
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use alloy_primitives::{Address, U256};
 use derivative::Derivative;
 use eyre::Result;
@@ -7,23 +7,81 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction::{Incoming, Outgoing};
 use rand::{seq::SliceRandom, SeedableRng};
+use rayon::{prelude::*, ThreadPool};
 use reth::providers::StateProvider;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
-use rayon::prelude::*;
 
 use super::{
-    simulation_cache::{CachedSimulationState, SharedSimulationCache}, Algorithm, ConflictTask, ResolutionResult
+    simulation_cache::{CachedSimulationState, SharedSimulationCache},
+    Algorithm, ConflictTask, ResolutionResult,
 };
 
 use crate::{
     building::{
-        BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock,
-        ThreadBlockBuildingContext,
+        evm_inspector::UsedStateTrace, BlockBuildingContext, BlockState, ExecutionError,
+        ExecutionResult, PartialBlock, ThreadBlockBuildingContext,
     },
     primitives::{OrderId, SimulatedOrder},
 };
+
+const MAX_ORIENTATION_SEARCH_NODES: usize = 16;
+const MIN_SEQUENCES_FOR_PARALLEL_EVAL: usize = 16;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ConflictGraphStats {
+    pub edge_count: usize,
+    pub density: f64,
+    pub max_degree: usize,
+    pub has_missing_traces: bool,
+}
+
+#[derive(Debug, Clone)]
+struct OrientationProblem {
+    hard_precedence: Vec<u32>,
+    soft_conflicts: Vec<(usize, usize)>,
+}
+
+pub(crate) fn analyze_conflict_graph(orders: &[Arc<SimulatedOrder>]) -> ConflictGraphStats {
+    let n = orders.len();
+    if n < 2 {
+        return ConflictGraphStats::default();
+    }
+
+    if orders.iter().any(|order| order.used_state_trace.is_none()) {
+        return ConflictGraphStats {
+            has_missing_traces: true,
+            ..Default::default()
+        };
+    }
+
+    let mut edge_count = 0;
+    let mut degrees = vec![0usize; n];
+    for left in 0..n {
+        for right in (left + 1)..n {
+            if orders_conflict(&orders[left], &orders[right]) {
+                edge_count += 1;
+                degrees[left] += 1;
+                degrees[right] += 1;
+            }
+        }
+    }
+
+    let complete_graph_edges = n * (n - 1) / 2;
+    let density = if complete_graph_edges == 0 {
+        0.0
+    } else {
+        edge_count as f64 / complete_graph_edges as f64
+    };
+
+    ConflictGraphStats {
+        edge_count,
+        density,
+        max_degree: degrees.into_iter().max().unwrap_or(0),
+        has_missing_traces: false,
+    }
+}
 
 /// Context for resolving conflicts in merging tasks.
 
@@ -35,6 +93,8 @@ pub struct ResolverContext {
     pub ctx: BlockBuildingContext,
     pub cancellation_token: CancellationToken,
     pub simulation_cache: Arc<SharedSimulationCache>,
+    pub sequence_thread_pool: Arc<ThreadPool>,
+    pub max_group_parallelism: usize,
 }
 
 impl ResolverContext {
@@ -52,12 +112,16 @@ impl ResolverContext {
         ctx: BlockBuildingContext,
         cancellation_token: CancellationToken,
         simulation_cache: Arc<SharedSimulationCache>,
+        sequence_thread_pool: Arc<ThreadPool>,
+        max_group_parallelism: usize,
     ) -> Self {
         ResolverContext {
             state,
             ctx,
             cancellation_token,
             simulation_cache,
+            sequence_thread_pool,
+            max_group_parallelism,
         }
     }
 
@@ -78,52 +142,13 @@ impl ResolverContext {
         );
 
         let sequence_to_try = generate_sequences_of_orders_to_try(&task);
-
-        // let mut best_resolution_result = ResolutionResult {
-        //     total_profit: U256::ZERO,
-        //     sequence_of_orders: vec![],
-        // };
-
-        // for sequence_of_orders in sequence_to_try {
-        //     let (resolution_result, _state) =
-        //         self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone())?;
-        //     self.update_best_result(resolution_result, &mut best_resolution_result);
-        // }
-        // Move required data out of self for parallel processing
-        let state = self.state.clone();
-        let ctx = self.ctx.clone();
-        let cancellation_token = self.cancellation_token.clone();
-        let simulation_cache = self.simulation_cache.clone();
-
-        let best = sequence_to_try
-            .into_par_iter()
-            .map(|sequence_of_orders| {
-                // Create a new ResolverContext for each parallel task
-                let mut resolver_ctx = ResolverContext {
-                    state: state.clone(),
-                    ctx: ctx.clone(),
-                    cancellation_token: cancellation_token.clone(),
-                    simulation_cache: simulation_cache.clone(),
-                };
-                resolver_ctx
-                    .process_sequence_of_orders(sequence_of_orders, &task, resolver_ctx.state.clone())
-                    .map(|(res, _state)| res)
-            })
-            .try_reduce_with(|a: ResolutionResult, b: ResolutionResult| {
-                Ok(if a.total_profit >= b.total_profit { a } else { b })
-            })
-            .ok_or_else(|| eyre::eyre!("No resolution result found"))?
-            .unwrap_or(ResolutionResult {
-                total_profit: U256::ZERO,
-                sequence_of_orders: vec![],
-            });
+        let best = self.evaluate_sequences(sequence_to_try, &task)?;
 
         let mut best_resolution_result = ResolutionResult {
             total_profit: U256::ZERO,
             sequence_of_orders: vec![],
         };
         self.update_best_result(best, &mut best_resolution_result);
-                
 
         trace!(
             "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
@@ -132,6 +157,77 @@ impl ResolverContext {
             task.algorithm
         );
         Ok(best_resolution_result)
+    }
+
+    fn evaluate_sequences(
+        &self,
+        sequence_to_try: Vec<Vec<usize>>,
+        task: &ConflictTask,
+    ) -> Result<ResolutionResult> {
+        if sequence_to_try.is_empty() {
+            return Ok(ResolutionResult {
+                total_profit: U256::ZERO,
+                sequence_of_orders: vec![],
+            });
+        }
+
+        let desired_parallelism =
+            sequence_parallelism_budget(sequence_to_try.len(), self.max_group_parallelism);
+        if desired_parallelism <= 1 {
+            let mut resolver_ctx = self.clone_for_parallel_batch();
+            return resolver_ctx.process_sequence_batch(sequence_to_try, task);
+        }
+
+        let batch_size = sequence_to_try.len().div_ceil(desired_parallelism);
+        let batches: Vec<Vec<Vec<usize>>> = sequence_to_try
+            .chunks(batch_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let state = self.state.clone();
+        let ctx = self.ctx.clone();
+        let cancellation_token = self.cancellation_token.clone();
+        let simulation_cache = self.simulation_cache.clone();
+        let sequence_thread_pool = Arc::clone(&self.sequence_thread_pool);
+        let max_group_parallelism = self.max_group_parallelism;
+
+        let best = self.sequence_thread_pool.install(|| {
+            batches
+                .into_par_iter()
+                .map(|batch| {
+                    let mut resolver_ctx = ResolverContext {
+                        state: state.clone(),
+                        ctx: ctx.clone(),
+                        cancellation_token: cancellation_token.clone(),
+                        simulation_cache: simulation_cache.clone(),
+                        sequence_thread_pool: Arc::clone(&sequence_thread_pool),
+                        max_group_parallelism,
+                    };
+                    resolver_ctx.process_sequence_batch(batch, task)
+                })
+                .try_reduce_with(|a: ResolutionResult, b: ResolutionResult| {
+                    Ok(if a.total_profit >= b.total_profit {
+                        a
+                    } else {
+                        b
+                    })
+                })
+        });
+
+        Ok(best.transpose()?.unwrap_or(ResolutionResult {
+            total_profit: U256::ZERO,
+            sequence_of_orders: vec![],
+        }))
+    }
+
+    fn clone_for_parallel_batch(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            ctx: self.ctx.clone(),
+            cancellation_token: self.cancellation_token.clone(),
+            simulation_cache: self.simulation_cache.clone(),
+            sequence_thread_pool: Arc::clone(&self.sequence_thread_pool),
+            max_group_parallelism: self.max_group_parallelism,
+        }
     }
 
     /// Updates the best result if a better one is found.
@@ -149,6 +245,25 @@ impl ResolverContext {
             best_result.total_profit = new_result.total_profit;
             best_result.sequence_of_orders = new_result.sequence_of_orders;
         }
+    }
+
+    fn process_sequence_batch(
+        &mut self,
+        sequences: Vec<Vec<usize>>,
+        task: &ConflictTask,
+    ) -> Result<ResolutionResult> {
+        let mut best_resolution_result = ResolutionResult {
+            total_profit: U256::ZERO,
+            sequence_of_orders: vec![],
+        };
+
+        for sequence_of_orders in sequences {
+            let (resolution_result, _state) =
+                self.process_sequence_of_orders(sequence_of_orders, task, self.state.clone())?;
+            self.update_best_result(resolution_result, &mut best_resolution_result);
+        }
+
+        Ok(best_resolution_result)
     }
 
     /// Processes a single sequence of orders, utilizing the simulation cache.
@@ -363,6 +478,7 @@ fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize>> {
         Algorithm::AllPermutations => generate_all_permutations(task),
         Algorithm::Random { seed, count } => generate_random_permutations(task, seed, count),
         Algorithm::PermutationsWithNonces => generate_all_permutations_with_nonces(task),
+        Algorithm::OrientationSearch => generate_orientation_search_sequences(task),
         Algorithm::BestOfN => analyze_group_conflicts_and_find_best(task), // BestOfN implementation
     }
 }
@@ -408,6 +524,37 @@ fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
         .into_iter()
         .permutations(order_group.orders.len())
         .collect()
+}
+
+fn generate_orientation_search_sequences(task: &ConflictTask) -> Vec<Vec<usize>> {
+    let order_group = &task.group;
+    if order_group.orders.len() <= 1 {
+        return vec![(0..order_group.orders.len()).collect()];
+    }
+
+    let Some(problem) = build_orientation_problem(order_group.orders.as_ref()) else {
+        return generate_all_permutations_with_nonces(task);
+    };
+
+    let n = order_group.orders.len();
+    let mut reach = problem.hard_precedence;
+    let mut sequences = Vec::new();
+    let mut seen = HashSet::default();
+
+    enumerate_orientations(
+        n,
+        &problem.soft_conflicts,
+        0,
+        &mut reach,
+        &mut seen,
+        &mut sequences,
+    );
+
+    if sequences.is_empty() {
+        generate_all_permutations_with_nonces(task)
+    } else {
+        sequences
+    }
 }
 
 /// Generates static sequences of order indices based on gas price and coinbase profit.
@@ -484,8 +631,6 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
     sequences_of_orders
 }
 
-
-
 fn find_permutations_recursive(
     graph: &DiGraph<Arc<SimulatedOrder>, ()>,
     current_permutation_indices: &mut Vec<NodeIndex>,
@@ -500,8 +645,10 @@ fn find_permutations_recursive(
 
     let mut candidates: Vec<NodeIndex> = Vec::new();
     for node_idx in graph.node_indices() {
-        if !current_permutation_indices.contains(&node_idx) &&
-           *in_degrees.get(&node_idx).unwrap_or(&0) == 0 { // only consider nodes with in-degree 0
+        if !current_permutation_indices.contains(&node_idx)
+            && *in_degrees.get(&node_idx).unwrap_or(&0) == 0
+        {
+            // only consider nodes with in-degree 0
             candidates.push(node_idx);
         }
     }
@@ -541,13 +688,13 @@ fn find_permutations_recursive(
     }
 }
 
-// optimal solution: each group contains exlsuivity 
+// optimal solution: each group contains exlsuivity
 fn analyze_group_conflicts_and_find_best(task: &ConflictTask) -> Vec<Vec<usize>> {
     let order_group = &task.group;
     let orders = &order_group.orders;
 
     // Collect the nonce sets for each order (assuming Vec<u64> or similar)
-    let order_nonces: Vec<_> = orders
+    let _order_nonces: Vec<_> = orders
         .iter()
         .map(|order_arc| order_arc.order.nonces())
         .collect();
@@ -596,7 +743,6 @@ fn analyze_group_conflicts_and_find_best(task: &ConflictTask) -> Vec<Vec<usize>>
     // vec![selected]
 }
 
-
 fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>> {
     let order_group = &task.group;
     let mut graph = DiGraph::<Arc<SimulatedOrder>, ()>::new();
@@ -631,7 +777,8 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
             // nonce_j.nonce == nonce_i.nonce - 1
             // This means an edge from order_j's node to order_i's node.
 
-            if nonce_i.nonce == 0 { // Or whatever your minimum nonce value is
+            if nonce_i.nonce == 0 {
+                // Or whatever your minimum nonce value is
                 // Cannot have a nonce that is `nonce_i.value - 1` if current is 0
                 continue;
             }
@@ -645,7 +792,8 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
                 // The problem implies distinct orders, which `node_j_idx != node_i_idx` would check.
                 // However, the map construction ensures `node_j_idx` is the node for the order *containing* that specific (addr, N-1) nonce.
                 // If order_i and order_j are different orders, their node indices will be different.
-                if node_j_idx != node_i_idx { // Avoid self-loops based on this specific logic
+                if node_j_idx != node_i_idx {
+                    // Avoid self-loops based on this specific logic
                     graph.add_edge(node_j_idx, node_i_idx, ());
                 }
             }
@@ -666,7 +814,6 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
         in_degrees.entry(node_idx).or_insert(0);
     }
 
-
     find_permutations_recursive(
         &graph,
         &mut current_permutation_indices,
@@ -684,10 +831,309 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
                 .collect()
         })
         .collect();
-    
+
     // println!("length of sequences_of_orders: {}", sequences_of_orders.len());
 
     sequences_of_orders
+}
+
+fn build_orientation_problem(orders: &[Arc<SimulatedOrder>]) -> Option<OrientationProblem> {
+    if orders.is_empty() || orders.len() > MAX_ORIENTATION_SEARCH_NODES {
+        return None;
+    }
+
+    if orders.iter().any(|order| order.used_state_trace.is_none()) {
+        return None;
+    }
+
+    let n = orders.len();
+    let mut hard_precedence = vec![0u32; n];
+    let mut nonce_to_order: HashMap<(Address, u64), usize> = HashMap::default();
+
+    for (idx, order) in orders.iter().enumerate() {
+        for nonce in order.order.nonces() {
+            nonce_to_order.insert((nonce.address, nonce.nonce), idx);
+        }
+    }
+
+    for (idx, order) in orders.iter().enumerate() {
+        for nonce in order.order.nonces() {
+            if nonce.nonce == 0 {
+                continue;
+            }
+
+            if let Some(&prev_idx) = nonce_to_order.get(&(nonce.address, nonce.nonce - 1)) {
+                if prev_idx != idx {
+                    hard_precedence[prev_idx] |= bit(idx);
+                }
+            }
+        }
+    }
+
+    if !close_transitive_closure(&mut hard_precedence, n) {
+        return None;
+    }
+
+    let mut soft_conflicts = Vec::new();
+    for left in 0..n {
+        for right in (left + 1)..n {
+            if !orders_conflict(&orders[left], &orders[right]) {
+                continue;
+            }
+
+            if hard_precedence[left] & bit(right) != 0 || hard_precedence[right] & bit(left) != 0 {
+                continue;
+            }
+
+            soft_conflicts.push((left, right));
+        }
+    }
+
+    Some(OrientationProblem {
+        hard_precedence,
+        soft_conflicts,
+    })
+}
+
+fn enumerate_orientations(
+    node_count: usize,
+    soft_conflicts: &[(usize, usize)],
+    edge_idx: usize,
+    reach: &mut [u32],
+    seen: &mut HashSet<Vec<usize>>,
+    sequences: &mut Vec<Vec<usize>>,
+) {
+    if edge_idx == soft_conflicts.len() {
+        if let Some(sequence) = canonical_topological_order(reach, node_count) {
+            if seen.insert(sequence.clone()) {
+                sequences.push(sequence);
+            }
+        }
+        return;
+    }
+
+    let (left, right) = soft_conflicts[edge_idx];
+    let left_before_right = reach[left] & bit(right) != 0;
+    let right_before_left = reach[right] & bit(left) != 0;
+
+    if left_before_right && right_before_left {
+        return;
+    }
+    if left_before_right {
+        enumerate_orientations(
+            node_count,
+            soft_conflicts,
+            edge_idx + 1,
+            reach,
+            seen,
+            sequences,
+        );
+        return;
+    }
+    if right_before_left {
+        enumerate_orientations(
+            node_count,
+            soft_conflicts,
+            edge_idx + 1,
+            reach,
+            seen,
+            sequences,
+        );
+        return;
+    }
+
+    let snapshot = reach.to_vec();
+    if add_precedence_edge(reach, left, right, node_count) {
+        enumerate_orientations(
+            node_count,
+            soft_conflicts,
+            edge_idx + 1,
+            reach,
+            seen,
+            sequences,
+        );
+    }
+
+    reach.copy_from_slice(&snapshot);
+    if add_precedence_edge(reach, right, left, node_count) {
+        enumerate_orientations(
+            node_count,
+            soft_conflicts,
+            edge_idx + 1,
+            reach,
+            seen,
+            sequences,
+        );
+    }
+    reach.copy_from_slice(&snapshot);
+}
+
+fn add_precedence_edge(reach: &mut [u32], from: usize, to: usize, node_count: usize) -> bool {
+    if from == to || reach[to] & bit(from) != 0 {
+        return false;
+    }
+
+    let mut predecessors_mask = bit(from);
+    for idx in 0..node_count {
+        if reach[idx] & bit(from) != 0 {
+            predecessors_mask |= bit(idx);
+        }
+    }
+
+    let successors_mask = reach[to] | bit(to);
+    for idx in 0..node_count {
+        if predecessors_mask & bit(idx) != 0 {
+            reach[idx] |= successors_mask;
+            if reach[idx] & bit(idx) != 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn close_transitive_closure(reach: &mut [u32], node_count: usize) -> bool {
+    for pivot in 0..node_count {
+        let pivot_bit = bit(pivot);
+        let pivot_reach = reach[pivot];
+        for node in 0..node_count {
+            if reach[node] & pivot_bit != 0 {
+                reach[node] |= pivot_reach;
+            }
+        }
+    }
+
+    (0..node_count).all(|idx| reach[idx] & bit(idx) == 0)
+}
+
+fn canonical_topological_order(reach: &[u32], node_count: usize) -> Option<Vec<usize>> {
+    let mut remaining = if node_count == 32 {
+        u32::MAX
+    } else {
+        (1u32 << node_count) - 1
+    };
+    let mut sequence = Vec::with_capacity(node_count);
+
+    while remaining != 0 {
+        let mut next_node = None;
+        for node in 0..node_count {
+            let node_bit = bit(node);
+            if remaining & node_bit == 0 {
+                continue;
+            }
+
+            let mut has_incoming = false;
+            for other in 0..node_count {
+                if other == node || remaining & bit(other) == 0 {
+                    continue;
+                }
+                if reach[other] & node_bit != 0 {
+                    has_incoming = true;
+                    break;
+                }
+            }
+
+            if !has_incoming {
+                next_node = Some(node);
+                break;
+            }
+        }
+
+        let Some(node) = next_node else {
+            return None;
+        };
+        sequence.push(node);
+        remaining &= !bit(node);
+    }
+
+    Some(sequence)
+}
+
+fn bit(idx: usize) -> u32 {
+    1u32 << idx
+}
+
+fn sequence_parallelism_budget(sequence_count: usize, max_group_parallelism: usize) -> usize {
+    if max_group_parallelism <= 1 || sequence_count < MIN_SEQUENCES_FOR_PARALLEL_EVAL {
+        return 1;
+    }
+
+    if sequence_count < 64 {
+        max_group_parallelism.min(2)
+    } else if sequence_count < 256 {
+        max_group_parallelism.min(4)
+    } else {
+        max_group_parallelism.min(8)
+    }
+}
+
+fn orders_conflict(left: &SimulatedOrder, right: &SimulatedOrder) -> bool {
+    match (&left.used_state_trace, &right.used_state_trace) {
+        (Some(left_trace), Some(right_trace)) => traces_conflict(left_trace, right_trace),
+        _ => true,
+    }
+}
+
+fn traces_conflict(left: &UsedStateTrace, right: &UsedStateTrace) -> bool {
+    left.read_slot_values
+        .keys()
+        .any(|key| right.written_slot_values.contains_key(key))
+        || right
+            .read_slot_values
+            .keys()
+            .any(|key| left.written_slot_values.contains_key(key))
+        || left
+            .read_slot_values
+            .keys()
+            .any(|key| code_write_contains(right, key.address))
+        || right
+            .read_slot_values
+            .keys()
+            .any(|key| code_write_contains(left, key.address))
+        || left
+            .written_slot_values
+            .keys()
+            .any(|key| code_write_contains(right, key.address))
+        || right
+            .written_slot_values
+            .keys()
+            .any(|key| code_write_contains(left, key.address))
+        || left
+            .created_contracts
+            .iter()
+            .chain(left.destructed_contracts.iter())
+            .any(|address| code_write_contains(right, *address))
+        || left
+            .created_contracts
+            .iter()
+            .chain(left.destructed_contracts.iter())
+            .any(|address| {
+                right
+                    .read_slot_values
+                    .keys()
+                    .any(|key| key.address == *address)
+                    || right
+                        .written_slot_values
+                        .keys()
+                        .any(|key| key.address == *address)
+            })
+        || right
+            .created_contracts
+            .iter()
+            .chain(right.destructed_contracts.iter())
+            .any(|address| {
+                left.read_slot_values
+                    .keys()
+                    .any(|key| key.address == *address)
+                    || left
+                        .written_slot_values
+                        .keys()
+                        .any(|key| key.address == *address)
+            })
+}
+
+fn code_write_contains(trace: &UsedStateTrace, address: Address) -> bool {
+    trace.created_contracts.contains(&address) || trace.destructed_contracts.contains(&address)
 }
 
 #[cfg(test)]
@@ -703,7 +1149,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        building::builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority},
+        building::{
+            builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority},
+            evm_inspector::{SlotKey, UsedStateTrace},
+        },
         primitives::{
             Bundle, Metadata, Order, SimValue, SimulatedOrder,
             TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
@@ -780,6 +1229,33 @@ mod tests {
             Arc::new(SimulatedOrder {
                 order: Order::Bundle(bundle),
                 used_state_trace: None,
+                sim_value,
+            })
+        }
+
+        pub fn create_order_with_trace(
+            &mut self,
+            read: Option<SlotKey>,
+            write: Option<SlotKey>,
+            coinbase_profit: U256,
+        ) -> Arc<SimulatedOrder> {
+            let mut trace = UsedStateTrace::default();
+            if let Some(read) = read {
+                trace
+                    .read_slot_values
+                    .insert(read, self.create_hash().into());
+            }
+            if let Some(write) = write {
+                trace
+                    .written_slot_values
+                    .insert(write, self.create_hash().into());
+            }
+
+            let sim_value = SimValue::new_test_no_gas(coinbase_profit, U256::ZERO);
+            let tx = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(self.create_tx()).unwrap();
+            Arc::new(SimulatedOrder {
+                order: Order::Tx(crate::primitives::MempoolTx { tx_with_blobs: tx }),
+                used_state_trace: Some(trace),
                 sim_value,
             })
         }
@@ -931,5 +1407,47 @@ mod tests {
         assert_eq!(sequences[0], vec![0, 2, 1, 3]);
         // MEV gas price is the second
         assert_eq!(sequences[1], vec![3, 1, 2, 0]);
+    }
+
+    #[test]
+    fn test_orientation_search_reduces_independent_swaps() {
+        let mut data_generator = DataGenerator::new();
+        let slot_a = SlotKey {
+            address: Address::repeat_byte(0x11),
+            key: B256::from(U256::from(1)),
+        };
+        let slot_b = SlotKey {
+            address: Address::repeat_byte(0x22),
+            key: B256::from(U256::from(2)),
+        };
+
+        let group = create_mock_order_group(
+            1,
+            vec![
+                data_generator.create_order_with_trace(Some(slot_a.clone()), None, U256::from(100)),
+                data_generator.create_order_with_trace(
+                    Some(slot_b.clone()),
+                    Some(slot_a),
+                    U256::from(200),
+                ),
+                data_generator.create_order_with_trace(None, Some(slot_b), U256::from(150)),
+            ],
+            HashSet::default(),
+        );
+
+        let task = create_mock_task(
+            0,
+            group,
+            Algorithm::OrientationSearch,
+            TaskPriority::Low,
+            Instant::now(),
+        );
+
+        let sequences = generate_sequences_of_orders_to_try(&task);
+        assert_eq!(sequences.len(), 4);
+        assert!(sequences.contains(&vec![0, 1, 2]));
+        assert!(sequences.contains(&vec![0, 2, 1]));
+        assert!(sequences.contains(&vec![1, 0, 2]));
+        assert!(sequences.contains(&vec![2, 1, 0]));
     }
 }

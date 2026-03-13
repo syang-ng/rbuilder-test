@@ -1,6 +1,7 @@
 use alloy_primitives::utils::format_ether;
 use crossbeam_queue::SegQueue;
 use eyre::Result;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use reth_provider::StateProvider;
 use std::{
     sync::{mpsc as std_mpsc, Arc},
@@ -9,13 +10,13 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
-use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
 
 use super::{
-    conflict_resolvers::ResolverContext, conflict_task_generator::{get_default_tasks_for_group, get_tasks_for_group},
-    simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
-    ConflictTask, GroupId, ResolutionResult, TaskPriority,
+    conflict_resolvers::ResolverContext,
+    conflict_task_generator::{get_default_tasks_for_group, get_tasks_for_group},
+    simulation_cache::SharedSimulationCache,
+    ConflictGroup, ConflictResolutionResultPerGroup, ConflictTask, GroupId, ResolutionResult,
+    TaskPriority,
 };
 use crate::provider::StateProviderFactory;
 use crate::{building::BlockBuildingContext, utils::elapsed_ms};
@@ -29,7 +30,9 @@ pub struct ConflictResolvingPool<P> {
     ctx: BlockBuildingContext,
     provider: P,
     simulation_cache: Arc<SharedSimulationCache>,
-    num_threads: usize,
+    worker_threads: usize,
+    sequence_thread_pool: Arc<ThreadPool>,
+    max_group_parallelism: usize,
     safe_sorting_only: bool,
 }
 
@@ -48,6 +51,19 @@ where
         provider: P,
         simulation_cache: Arc<SharedSimulationCache>,
     ) -> Self {
+        let available_threads = thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1);
+        let max_outer_threads = (available_threads / 2).max(1);
+        let worker_threads = num_threads.max(1).min(max_outer_threads);
+        let sequence_threads = available_threads.saturating_sub(worker_threads).max(1);
+        let sequence_thread_pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(sequence_threads)
+                .build()
+                .expect("failed to build sequence thread pool"),
+        );
+
         Self {
             task_queue,
             group_result_sender,
@@ -56,22 +72,21 @@ where
             ctx,
             provider,
             simulation_cache,
-            num_threads,
+            worker_threads,
+            sequence_thread_pool,
+            max_group_parallelism: sequence_threads.min(8),
         }
     }
 
     pub fn start(&self) -> eyre::Result<()> {
-        let inner_threads = 25;
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(inner_threads)
-            .build_global();
-    
-        for _ in 0..self.num_threads {
+        for _ in 0..self.worker_threads {
             let task_queue = self.task_queue.clone();
             let cancellation_token = self.cancellation_token.clone();
             let group_result_sender = self.group_result_sender.clone();
             let simulation_cache = self.simulation_cache.clone();
             let ctx = self.ctx.clone();
+            let sequence_thread_pool = Arc::clone(&self.sequence_thread_pool);
+            let max_group_parallelism = self.max_group_parallelism;
 
             let block_state: Arc<dyn StateProvider> = self
                 .provider
@@ -90,6 +105,8 @@ where
                             block_state.clone(),
                             cancellation_token.clone(),
                             Arc::clone(&simulation_cache),
+                            Arc::clone(&sequence_thread_pool),
+                            max_group_parallelism,
                         ) {
                             match group_result_sender.send((task_id, result)) {
                                 Ok(_) => {
@@ -123,12 +140,16 @@ where
         state: Arc<dyn StateProvider>,
         cancellation_token: CancellationToken,
         simulation_cache: Arc<SharedSimulationCache>,
+        sequence_thread_pool: Arc<ThreadPool>,
+        max_group_parallelism: usize,
     ) -> Result<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut merging_context = ResolverContext::new(
             state,
             ctx.clone(),
             cancellation_token.clone(),
             simulation_cache,
+            sequence_thread_pool,
+            max_group_parallelism,
         );
         let task_id = task.group_idx;
         let task_group = task.group.clone();
@@ -178,6 +199,8 @@ where
                     state.clone(),
                     CancellationToken::new(),
                     simulation_cache,
+                    Arc::clone(&self.sequence_thread_pool),
+                    self.max_group_parallelism,
                 );
                 if let Ok(result) = result {
                     results.push(result);
@@ -205,6 +228,8 @@ where
                     state.clone(),
                     CancellationToken::new(),
                     simulation_cache,
+                    Arc::clone(&self.sequence_thread_pool),
+                    self.max_group_parallelism,
                 );
                 if let Ok(result) = result {
                     results.push(result);

@@ -19,7 +19,8 @@ use crate::{
         builders::{
             ordering_builder::{OrderingBuilderConfig, OrderingBuildingAlgorithm},
             parallel_builder::{
-                default_parallel_build_backtest, parallel_build_backtest, ParallelBuilderConfig, ParallelBuildingAlgorithm,
+                default_parallel_build_backtest, parallel_build_backtest, ParallelBuilderConfig,
+                ParallelBuildingAlgorithm,
             },
             BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
             UnfinishedBlockBuildingSinkFactory,
@@ -465,7 +466,7 @@ impl LiveBuilderConfig for Config {
             }
             SpecificBuilderConfig::ParallelBuilder(config) => {
                 parallel_build_backtest::<P>(input, config)
-            },
+            }
             SpecificBuilderConfig::DefaultBuilder(config) => {
                 default_parallel_build_backtest::<P>(input, config)
             }
@@ -611,7 +612,7 @@ impl Default for Config {
                     name: String::from("default-parallel"),
                     builder: SpecificBuilderConfig::DefaultBuilder(ParallelBuilderConfig {
                         discard_txs: true,
-                        num_threads: 250,
+                        num_threads: 25,
                         coinbase_payment: false,
                         safe_sorting_only: true,
                     }),
@@ -694,7 +695,7 @@ where
         }
         SpecificBuilderConfig::ParallelBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
-        },
+        }
         SpecificBuilderConfig::DefaultBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
         }

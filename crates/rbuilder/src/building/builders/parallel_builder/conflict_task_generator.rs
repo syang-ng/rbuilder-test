@@ -3,13 +3,12 @@ use ahash::{HashMap, HashSet};
 use alloy_primitives::{utils::format_ether, U256};
 use crossbeam_queue::SegQueue;
 use itertools::Itertools;
-use revm::bytecode::eof::printer::print;
 use std::{sync::Arc, time::Instant};
 use tracing::trace;
 
 use super::{
-    task::ConflictTask, Algorithm, ConflictGroup, ConflictResolutionResultPerGroup, GroupId,
-    ResolutionResult, TaskPriority, TaskQueue,
+    conflict_resolvers::analyze_conflict_graph, task::ConflictTask, Algorithm, ConflictGroup,
+    ConflictResolutionResultPerGroup, GroupId, ResolutionResult, TaskPriority, TaskQueue,
 };
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -19,6 +18,11 @@ const THRESHOLD_FOR_SIGNIFICANT_CHANGE: u64 = 20;
 const NUMBER_OF_TOP_ORDERS_TO_CONSIDER_FOR_SIGNIFICANT_CHANGE: usize = 10;
 const MAX_LENGTH_FOR_ALL_PERMUTATIONS: usize = 3;
 const NUMBER_OF_RANDOM_TASKS: usize = 50;
+const MIN_LENGTH_FOR_ORIENTATION_SEARCH: usize = 8;
+const MAX_LENGTH_FOR_ORIENTATION_SEARCH: usize = 14;
+const MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH: usize = 15;
+const MAX_DENSITY_FOR_ORIENTATION_SEARCH: f64 = 0.40;
+const MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH: usize = 16;
 
 /// Manages conflicts and updates for conflict groups, coordinating with a worker pool to process tasks.
 pub struct ConflictTaskGenerator {
@@ -419,8 +423,10 @@ pub fn get_tasks_for_group(
     tasks
 }
 
-
-pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec<ConflictTask> {
+pub fn get_default_tasks_for_group(
+    group: &ConflictGroup,
+    priority: TaskPriority,
+) -> Vec<ConflictTask> {
     let mut tasks = vec![];
 
     let created_at = Instant::now();
@@ -431,7 +437,6 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
             .iter()
             .map(|order_arc| order_arc.order.nonces())
             .collect();
-        
 
         // Define a function to compute the "value" of an order, here using coinbase_profit()
         // You can replace it with other metrics if needed
@@ -448,7 +453,6 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 
         // Sort orders by value in descending order, prioritizing higher-value orders
         idx_and_value.sort_by(|a, b| b.1.cmp(&a.1));
-
 
         let mut used_nonces = std::collections::HashSet::new();
         let mut selected = vec![];
@@ -469,8 +473,11 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
             // Skip orders with nonce conflicts
         }
         let selected_orders: Vec<_> = selected.iter().map(|&idx| orders[idx].clone()).collect();
-        println!("prev orders: {} selected orders: {}", orders.len(), selected_orders.len());
-
+        println!(
+            "prev orders: {} selected orders: {}",
+            orders.len(),
+            selected_orders.len()
+        );
 
         // let overlap_rate_of_nonces = order_nonces.iter().flatten().counts_by(|nonce| nonce.clone());
 
@@ -500,8 +507,13 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
             .iter()
             .flat_map(|order_arc| order_arc.order.to_addresses())
             .collect();
-        let overlap_rate_of_target_contracts = target_contracts.iter().counts_by(|addr| addr.clone());
-        let max_overlap_contracts = overlap_rate_of_target_contracts.values().max().cloned().unwrap_or(0);
+        let overlap_rate_of_target_contracts =
+            target_contracts.iter().counts_by(|addr| addr.clone());
+        let max_overlap_contracts = overlap_rate_of_target_contracts
+            .values()
+            .max()
+            .cloned()
+            .unwrap_or(0);
         let denominator_contracts = target_contracts.len();
         let percentage_contracts = if denominator_contracts > 0 {
             (max_overlap_contracts as f64) / (denominator_contracts as f64) * 100.0
@@ -516,7 +528,6 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
                 orders: Arc::new(selected_orders.clone()),
                 conflicting_group_ids: group.conflicting_group_ids.clone(),
             };
-
 
             tasks.push(ConflictTask {
                 group_idx: group.id,
@@ -533,42 +544,61 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
         }
 
         // println!("generating random sample for group {} {}", percentage, percentage_contracts);
-        let new_group = match selected_orders.len() {
-            len if len <= 8 => ConflictGroup {
-                id: group.id,
-                orders: Arc::new(selected_orders),
-                conflicting_group_ids: group.conflicting_group_ids.clone(),
-            },
-            _ => {
-                // Randomly sample 8 orders from selected_orders
-                let mut rng = thread_rng();
-                let sample: Vec<_> = selected_orders.choose_multiple(&mut rng, 8).cloned().collect();
-                ConflictGroup {
+        if should_use_orientation_search(&selected_orders) {
+            tasks.push(ConflictTask {
+                group_idx: group.id,
+                algorithm: Algorithm::OrientationSearch,
+                priority,
+                group: ConflictGroup {
                     id: group.id,
-                    orders: Arc::new(sample),
+                    orders: Arc::new(selected_orders),
                     conflicting_group_ids: group.conflicting_group_ids.clone(),
+                },
+                created_at,
+            });
+        } else {
+            let new_group = match selected_orders.len() {
+                len if len <= 8 => ConflictGroup {
+                    id: group.id,
+                    orders: Arc::new(selected_orders),
+                    conflicting_group_ids: group.conflicting_group_ids.clone(),
+                },
+                _ => {
+                    // Randomly sample 8 orders from selected_orders
+                    let mut rng = thread_rng();
+                    let sample: Vec<_> = selected_orders
+                        .choose_multiple(&mut rng, 8)
+                        .cloned()
+                        .collect();
+                    ConflictGroup {
+                        id: group.id,
+                        orders: Arc::new(sample),
+                        conflicting_group_ids: group.conflicting_group_ids.clone(),
+                    }
                 }
-            }
-        };
+            };
 
-        tasks.push(ConflictTask {
-            group_idx: group.id,
-            algorithm: Algorithm::AllPermutations,
-            priority,
-            group: new_group,
-            created_at,
-        });
-
+            tasks.push(ConflictTask {
+                group_idx: group.id,
+                algorithm: Algorithm::AllPermutations,
+                priority,
+                group: new_group,
+                created_at,
+            });
+        }
     } else {
         tasks.push(ConflictTask {
             group_idx: group.id,
-            algorithm: Algorithm::PermutationsWithNonces,
+            algorithm: if should_use_orientation_search(group.orders.as_ref()) {
+                Algorithm::OrientationSearch
+            } else {
+                Algorithm::PermutationsWithNonces
+            },
             priority,
             group: group.clone(),
             created_at,
         });
     }
-
 
     // // Sort the orders by gas used
     // let new_group;
@@ -643,10 +673,32 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 
     //     println!("group id: {}, new group id: {}", group.id, usize::MAX - group.id);
     // }
-    
+
     tasks
 }
 
+fn should_use_orientation_search(orders: &[Arc<SimulatedOrder>]) -> bool {
+    let n = orders.len();
+    if n < MIN_LENGTH_FOR_ORIENTATION_SEARCH {
+        return false;
+    }
+
+    let stats = analyze_conflict_graph(orders);
+    if stats.has_missing_traces {
+        return false;
+    }
+
+    if n <= MAX_LENGTH_FOR_ORIENTATION_SEARCH
+        && stats.edge_count <= MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH
+        && stats.density <= MAX_DENSITY_FOR_ORIENTATION_SEARCH
+    {
+        return true;
+    }
+
+    n <= MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH
+        && stats.edge_count <= n + 2
+        && stats.max_degree <= 2
+}
 
 #[cfg(test)]
 mod tests {
@@ -964,5 +1016,34 @@ mod tests {
 
         // Should not create new tasks
         assert_eq!(conflict_manager.task_queue.len(), 0);
+    }
+
+    #[test]
+    fn test_default_tasks_use_orientation_search_for_sparse_graphs() {
+        let mut data_generator = DataGenerator::new();
+        let slots: Vec<_> = (0..7)
+            .map(|idx| SlotKey {
+                address: Address::repeat_byte((idx + 1) as u8),
+                key: data_generator.create_b256(),
+            })
+            .collect();
+
+        let mut orders = Vec::new();
+        orders.push(data_generator.create_order(Some(&slots[0]), None, U256::from(10)));
+        for idx in 1..7 {
+            orders.push(data_generator.create_order(
+                Some(&slots[idx]),
+                Some(&slots[idx - 1]),
+                U256::from((idx + 1) as u64 * 10),
+            ));
+        }
+        orders.push(data_generator.create_order(None, Some(&slots[6]), U256::from(90)));
+
+        let group = create_conflict_group(1, orders, HashSet::default());
+        let tasks = get_default_tasks_for_group(&group, TaskPriority::High);
+
+        assert!(tasks
+            .iter()
+            .any(|task| matches!(task.algorithm, Algorithm::OrientationSearch)));
     }
 }

@@ -403,7 +403,6 @@ where
     Ok(finalize_block_result.block)
 }
 
-
 pub fn default_parallel_build_backtest<P>(
     input: BacktestSimulateBlockInput<'_, P>,
     config: ParallelBuilderConfig,
@@ -463,11 +462,7 @@ where
         if group.orders.len() > 8 {
             // show details of the orders in the group
             for order in group.orders.iter() {
-                println!(
-                    "Order ID: {}, {:?}",
-                    order.order.id(),
-                    order.order,
-                )
+                println!("Order ID: {}, {:?}", order.order.id(), order.order,)
             }
         }
     }
@@ -533,7 +528,6 @@ where
 
     Ok(finalize_block_result.block)
 }
-
 
 #[derive(Debug)]
 pub struct ParallelBuildingAlgorithm {

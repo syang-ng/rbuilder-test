@@ -162,7 +162,6 @@ where
     P: StateProviderFactory + Clone + 'static,
     ConfigType: LiveBuilderConfig,
 {
-
     let start_time = std::time::Instant::now();
     let BacktestBlockInput {
         sim_orders,

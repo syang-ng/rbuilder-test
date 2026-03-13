@@ -20,14 +20,17 @@ use eyre::WrapErr;
 
 use serde::{Deserialize, Deserializer};
 use std::{
-    collections::HashSet, fs::{create_dir_all, File}, path::{Path, PathBuf}, str::FromStr
+    collections::HashSet,
+    fs::{create_dir_all, File},
+    path::{Path, PathBuf},
+    str::FromStr,
 };
-use time::{macros::format_description, Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{
+    format_description::well_known::Rfc3339, macros::format_description, Duration, OffsetDateTime,
+};
 use tracing::trace;
 use uuid::Uuid;
 use zip::ZipArchive;
-
-
 
 fn parse_with_utc<'de, D>(deserializer: D) -> Result<OffsetDateTime, D::Error>
 where
@@ -35,8 +38,7 @@ where
 {
     let s = String::deserialize(deserializer)?;
     let rfc3339_string = format!("{}Z", s.replace(' ', "T"));
-    OffsetDateTime::parse(&rfc3339_string, &Rfc3339)
-        .map_err(serde::de::Error::custom)
+    OffsetDateTime::parse(&rfc3339_string, &Rfc3339).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_flexible_integer<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
@@ -61,7 +63,6 @@ where
         None => Ok(None),
     }
 }
-
 
 fn deserialize_hex_to_bytes32<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
 where
@@ -125,7 +126,7 @@ fn read_filtered_bundles(path: &Path, block: u64) -> eyre::Result<Vec<BundleReco
     }
 
     let csv_file = archive.by_index(0)?;
-    let mut rdr = Reader::from_reader(csv_file);    
+    let mut rdr = Reader::from_reader(csv_file);
 
     let mut bundles = Vec::new();
 
@@ -141,7 +142,11 @@ fn read_filtered_bundles(path: &Path, block: u64) -> eyre::Result<Vec<BundleReco
     Ok(bundles)
 }
 
-fn read_filtered_sbundles(path: &Path, from: OffsetDateTime, to: OffsetDateTime) -> eyre::Result<Vec<ShareBundleRecord>> {
+fn read_filtered_sbundles(
+    path: &Path,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+) -> eyre::Result<Vec<ShareBundleRecord>> {
     if !path.exists() {
         return Err(eyre::eyre!("File not found: {}", path.display()));
     }
@@ -183,7 +188,7 @@ fn get_bundles_from_file(
         bundles.extend(read_filtered_bundles(&path, block)?);
         current_date += Duration::hours(1);
     }
-    
+
     if bundles.is_empty() {
         return Err(eyre::eyre!(
             "No bundles found for block {} in the specified range",
@@ -194,7 +199,6 @@ fn get_bundles_from_file(
     bundles.sort_by_key(|r| r.inserted_at);
     Ok(bundles)
 }
-
 
 /// Gets all the OrdersWithTimestamp in the given interval.
 /// Simulation info is set to None.
@@ -209,89 +213,87 @@ pub fn get_bundles(
         .wrap_err_with(|| format!("Failed to get private transactions for block {}", block))?;
 
     let bundle_result = bundles
-            .into_iter()
-            .map(
-                | BundleRecord {
-                    inserted_at,
-                    bundle_hash,
-                    param_block_number,
-                    param_signed_txs,
-                    param_reverting_tx_hashes,
-                    signing_address,
-                    replacement_uuid,
-                    param_timestamp,
-                }| -> eyre::Result<OrdersWithTimestamp> {
-                    let txs = param_signed_txs
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(Bytes::from_str)
-                        .collect::<Result<Vec<_>, _>>()
-                        .wrap_err_with(|| {
-                            format!("Failed to parse txs for bundle {}", bundle_hash)
-                        })?;
-                    let reverting_tx_hashes = param_reverting_tx_hashes
-                        .split(',')
-                        .filter(|s| !s.is_empty())
-                        .map(B256::from_str)
-                        .collect::<Result<_, _>>()
-                        .wrap_err_with(|| {
-                            format!(
-                                "Failed to parse reverting tx hashes for bundle {}",
-                                bundle_hash
-                            )
-                        })?;
+        .into_iter()
+        .map(
+            |BundleRecord {
+                 inserted_at,
+                 bundle_hash,
+                 param_block_number,
+                 param_signed_txs,
+                 param_reverting_tx_hashes,
+                 signing_address,
+                 replacement_uuid,
+                 param_timestamp,
+             }|
+             -> eyre::Result<OrdersWithTimestamp> {
+                let txs = param_signed_txs
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(Bytes::from_str)
+                    .collect::<Result<Vec<_>, _>>()
+                    .wrap_err_with(|| format!("Failed to parse txs for bundle {}", bundle_hash))?;
+                let reverting_tx_hashes = param_reverting_tx_hashes
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(B256::from_str)
+                    .collect::<Result<_, _>>()
+                    .wrap_err_with(|| {
+                        format!(
+                            "Failed to parse reverting tx hashes for bundle {}",
+                            bundle_hash
+                        )
+                    })?;
 
-                    if txs.is_empty() {
-                        return Err(eyre::eyre!("Bundle {} has no txs", bundle_hash));
-                    }
-
-                    let signing_address = Some(signing_address.parse().wrap_err_with(|| {
-                        format!("Failed to parse signing address for bundle {}", bundle_hash)
-                    })?);
-
-                    let raw_bundle = RawBundle {
-                        block_number: Some(U64::from(block)),
-                        txs,
-                        reverting_tx_hashes,
-                        dropping_tx_hashes: Default::default(),
-                        replacement_uuid,
-                        uuid: replacement_uuid,
-                        signing_address: signing_address,
-                        min_timestamp: param_timestamp.map(|ts| ts.try_into().unwrap_or_default()),
-                        max_timestamp: None,
-                        replacement_nonce: replacement_uuid.and(Some(0)),
-                        refund_percent: None,
-                        refund_recipient: None,
-                        refund_tx_hashes: None,
-                        first_seen_at: None,
-                        version: Some(BUNDLE_VERSION_V1.to_owned()),
-                    };
-
-                    let order = RawOrder::Bundle(raw_bundle)
-                        .decode(TxEncoding::NoBlobData)
-                        .wrap_err_with(|| format!("Failed to parse bundle {}", bundle_hash))?;
-
-                    Ok(OrdersWithTimestamp {
-                        timestamp_ms: (inserted_at.unix_timestamp_nanos() / 1_000_000)
-                            .try_into()?,
-                        order,
-                    })
-                },
-            )
-            .collect::<Vec<_>>();
-
-        let bundles = bundle_result
-            .into_iter()
-            .filter_map(|res| match res {
-                Ok(bundle) => Some(bundle),
-                Err(err) => {
-                    tracing::warn!(err = ?err, "Failed to parse bundle");
-                    None
+                if txs.is_empty() {
+                    return Err(eyre::eyre!("Bundle {} has no txs", bundle_hash));
                 }
-            })
-            .collect();
 
-        Ok(bundles)
+                let signing_address = Some(signing_address.parse().wrap_err_with(|| {
+                    format!("Failed to parse signing address for bundle {}", bundle_hash)
+                })?);
+
+                let raw_bundle = RawBundle {
+                    block_number: Some(U64::from(block)),
+                    txs,
+                    reverting_tx_hashes,
+                    dropping_tx_hashes: Default::default(),
+                    replacement_uuid,
+                    uuid: replacement_uuid,
+                    signing_address: signing_address,
+                    min_timestamp: param_timestamp.map(|ts| ts.try_into().unwrap_or_default()),
+                    max_timestamp: None,
+                    replacement_nonce: replacement_uuid.and(Some(0)),
+                    refund_percent: None,
+                    refund_recipient: None,
+                    refund_tx_hashes: None,
+                    first_seen_at: None,
+                    version: Some(BUNDLE_VERSION_V1.to_owned()),
+                };
+
+                let order = RawOrder::Bundle(raw_bundle)
+                    .decode(TxEncoding::NoBlobData)
+                    .wrap_err_with(|| format!("Failed to parse bundle {}", bundle_hash))?;
+
+                Ok(OrdersWithTimestamp {
+                    timestamp_ms: (inserted_at.unix_timestamp_nanos() / 1_000_000).try_into()?,
+                    order,
+                })
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let bundles = bundle_result
+        .into_iter()
+        .filter_map(|res| match res {
+            Ok(bundle) => Some(bundle),
+            Err(err) => {
+                tracing::warn!(err = ?err, "Failed to parse bundle");
+                None
+            }
+        })
+        .collect();
+
+    Ok(bundles)
 }
 
 fn get_sbundles_from_file(
@@ -320,7 +322,7 @@ fn get_sbundles_from_file(
     //         block
     //     ));
     // }
-    
+
     // Sort all collected share bundles by their insertion timestamp.
     sbundles.sort_by_key(|r| r.received_at);
     Ok(sbundles)
@@ -334,90 +336,87 @@ pub fn get_sbundles(
 ) -> eyre::Result<Vec<OrdersWithTimestamp>> {
     let simulated_bundles = get_sbundles_from_file(data_dir, from, to, block)
         .wrap_err_with(|| format!("Failed to get share bundles for block {}", block))?;
-    
+
     let bundles = simulated_bundles.into_iter().map(|v| (v, false));
 
     let bundles = bundles
-            .map(
-                |(record, used_sbundle)|
-                 -> eyre::Result<(u64, RawShareBundle, B256)> {
-                    let ShareBundleRecord {
-                        received_at,
-                        bundle_hash,
-                        body,
-                    } = record;
+        .map(
+            |(record, used_sbundle)| -> eyre::Result<(u64, RawShareBundle, B256)> {
+                let ShareBundleRecord {
+                    received_at,
+                    bundle_hash,
+                    body,
+                } = record;
 
-                    let hash = (bundle_hash.len() == 32).then(|| B256::from_slice(&bundle_hash)).ok_or_else(|| eyre::eyre!("Invalid hash length"))?;
-                    let mut bundle = serde_json::from_str::<RawShareBundle>(&body)
-                        .wrap_err_with(|| {
-                            format!("Failed to parse share bundle {:?}", hash)
-                        })?;
-                    // if it was used by the live builder we are sure that it has correct block range
-                    // so we modify it here to correct db overwrites
-                    if used_sbundle {
-                        bundle.inclusion.block = U64::from(block);
-                        bundle.inclusion.max_block = None;
-                    }
-
-                    Ok((
-                        (received_at.unix_timestamp_nanos() / 1_000_000)
-                            .try_into()?,
-                        bundle,
-                        hash,
-                    ))
-                },
-            )
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut result = Vec::with_capacity(bundles.len());
-        let mut inserted_bundles: HashSet<B256> = HashSet::default();
-
-        for (timestamp_ms, bundle, hash) in bundles {
-            if inserted_bundles.contains(&hash) {
-                continue;
-            }
-            let from = bundle.inclusion.block.to::<u64>();
-            let to = bundle
-                .inclusion
-                .max_block
-                .unwrap_or(bundle.inclusion.block)
-                .to::<u64>();
-
-            if !(from <= block && block <= to) {
-                continue;
-            }
-
-            let raw_order = RawOrder::ShareBundle(bundle);
-
-            let order: Order = {
-                let initial_attempt = raw_order.clone().decode(TxEncoding::NoBlobData);
-
-                match initial_attempt {
-                    Ok(order) => order,
-                    Err(err) => {
-                        // now we try to decode it with blob data
-                        raw_order
-                            .decode(TxEncoding::WithBlobData)
-                            .wrap_err_with(|| {
-                                format!(
-                                    "Failed to decode share bundle {:?} with blob data: {}",
-                                    hash, err
-                                )
-                            })?
-                    }
+                let hash = (bundle_hash.len() == 32)
+                    .then(|| B256::from_slice(&bundle_hash))
+                    .ok_or_else(|| eyre::eyre!("Invalid hash length"))?;
+                let mut bundle = serde_json::from_str::<RawShareBundle>(&body)
+                    .wrap_err_with(|| format!("Failed to parse share bundle {:?}", hash))?;
+                // if it was used by the live builder we are sure that it has correct block range
+                // so we modify it here to correct db overwrites
+                if used_sbundle {
+                    bundle.inclusion.block = U64::from(block);
+                    bundle.inclusion.max_block = None;
                 }
-            };
 
-            result.push(OrdersWithTimestamp {
-                timestamp_ms,
-                order,
-            });
-            inserted_bundles.insert(hash);
+                Ok((
+                    (received_at.unix_timestamp_nanos() / 1_000_000).try_into()?,
+                    bundle,
+                    hash,
+                ))
+            },
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut result = Vec::with_capacity(bundles.len());
+    let mut inserted_bundles: HashSet<B256> = HashSet::default();
+
+    for (timestamp_ms, bundle, hash) in bundles {
+        if inserted_bundles.contains(&hash) {
+            continue;
+        }
+        let from = bundle.inclusion.block.to::<u64>();
+        let to = bundle
+            .inclusion
+            .max_block
+            .unwrap_or(bundle.inclusion.block)
+            .to::<u64>();
+
+        if !(from <= block && block <= to) {
+            continue;
         }
 
-        Ok(result)
-}
+        let raw_order = RawOrder::ShareBundle(bundle);
 
+        let order: Order = {
+            let initial_attempt = raw_order.clone().decode(TxEncoding::NoBlobData);
+
+            match initial_attempt {
+                Ok(order) => order,
+                Err(err) => {
+                    // now we try to decode it with blob data
+                    raw_order
+                        .decode(TxEncoding::WithBlobData)
+                        .wrap_err_with(|| {
+                            format!(
+                                "Failed to decode share bundle {:?} with blob data: {}",
+                                hash, err
+                            )
+                        })?
+                }
+            }
+        };
+
+        result.push(OrdersWithTimestamp {
+            timestamp_ms,
+            order,
+        });
+        inserted_bundles.insert(hash);
+    }
+
+    Ok(result)
+}
 
 #[derive(Debug, Clone)]
 pub struct PrivateTransactionsDatasource {
@@ -437,18 +436,13 @@ impl DataSource for PrivateTransactionsDatasource {
                 block_time + Duration::seconds(5),
             )
         };
-        let bundles = get_bundles(
-            self.path.as_path(),
-            from,
-            to,
-            block.block_number,
-        )
-        .wrap_err_with(|| {
-            format!(
-                "Failed to get private transactions for block {} at timestamp {}",
-                block.block_number, block.block_timestamp
-            )
-        })?;
+        let bundles = get_bundles(self.path.as_path(), from, to, block.block_number)
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to get private transactions for block {} at timestamp {}",
+                    block.block_number, block.block_timestamp
+                )
+            })?;
 
         trace!(
             "Fetched unfiltered private transactions, count: {}",
@@ -472,12 +466,12 @@ impl DataSource for PrivateTransactionsDatasource {
         //     "Fetched unfiltered share bundles, count: {}",
         //     sbundles.len()
         // );
-    
+
         Ok(DatasourceData {
             orders: bundles.into_iter().collect(),
-                // .into_iter()
-                // .chain(sbundles.into_iter())
-                // .collect(),
+            // .into_iter()
+            // .chain(sbundles.into_iter())
+            // .collect(),
             built_block_data: None,
         })
     }
