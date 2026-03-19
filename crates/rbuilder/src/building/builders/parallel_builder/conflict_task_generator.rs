@@ -10,8 +10,7 @@ use super::{
     conflict_resolvers::analyze_conflict_graph, task::ConflictTask, Algorithm, ConflictGroup,
     ConflictResolutionResultPerGroup, GroupId, ResolutionResult, TaskPriority, TaskQueue,
 };
-use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::{rngs::SmallRng, seq::SliceRandom, SeedableRng};
 use std::sync::mpsc as std_mpsc;
 
 const THRESHOLD_FOR_SIGNIFICANT_CHANGE: u64 = 20;
@@ -23,6 +22,7 @@ const MAX_LENGTH_FOR_ORIENTATION_SEARCH: usize = 14;
 const MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH: usize = 15;
 const MAX_DENSITY_FOR_ORIENTATION_SEARCH: f64 = 0.40;
 const MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH: usize = 16;
+const DEFAULT_PERMUTATION_SAMPLE_SEED: u64 = 0x06511;
 
 /// Manages conflicts and updates for conflict groups, coordinating with a worker pool to process tasks.
 pub struct ConflictTaskGenerator {
@@ -565,7 +565,7 @@ pub fn get_default_tasks_for_group(
                 },
                 _ => {
                     // Randomly sample 8 orders from selected_orders
-                    let mut rng = thread_rng();
+                    let mut rng = SmallRng::seed_from_u64(DEFAULT_PERMUTATION_SAMPLE_SEED);
                     let sample: Vec<_> = selected_orders
                         .choose_multiple(&mut rng, 8)
                         .cloned()
@@ -751,6 +751,20 @@ mod tests {
             )
         }
 
+        pub fn create_tx_with_nonce(&mut self, nonce: u64) -> Recovered<TransactionSigned> {
+            Recovered::new_unchecked(
+                TransactionSigned::new_unchecked(
+                    Transaction::Legacy(TxLegacy {
+                        nonce,
+                        ..Default::default()
+                    }),
+                    alloy_primitives::Signature::test_signature(),
+                    self.create_hash(),
+                ),
+                Address::default(),
+            )
+        }
+
         pub fn create_order(
             &mut self,
             read: Option<&SlotKey>,
@@ -775,6 +789,39 @@ mod tests {
                 order: Order::Tx(MempoolTx {
                     tx_with_blobs: TransactionSignedEcRecoveredWithBlobs::new_no_blobs(
                         self.create_tx(),
+                    )
+                    .unwrap(),
+                }),
+                used_state_trace: Some(trace),
+                sim_value,
+            })
+        }
+
+        pub fn create_order_with_unique_nonce(
+            &mut self,
+            read: Option<&SlotKey>,
+            write: Option<&SlotKey>,
+            coinbase_profit: U256,
+        ) -> Arc<SimulatedOrder> {
+            let mut trace = UsedStateTrace::default();
+            if let Some(read) = read {
+                trace
+                    .read_slot_values
+                    .insert(read.clone(), self.create_b256());
+            }
+            if let Some(write) = write {
+                trace
+                    .written_slot_values
+                    .insert(write.clone(), self.create_b256());
+            }
+
+            let sim_value = SimValue::new_test_no_gas(coinbase_profit, U256::ZERO);
+            let nonce = self.create_u64();
+
+            Arc::new(SimulatedOrder {
+                order: Order::Tx(MempoolTx {
+                    tx_with_blobs: TransactionSignedEcRecoveredWithBlobs::new_no_blobs(
+                        self.create_tx_with_nonce(nonce),
                     )
                     .unwrap(),
                 }),
@@ -1045,5 +1092,39 @@ mod tests {
         assert!(tasks
             .iter()
             .any(|task| matches!(task.algorithm, Algorithm::OrientationSearch)));
+    }
+
+    #[test]
+    fn test_default_large_group_sampling_is_reproducible() {
+        let mut data_generator = DataGenerator::new();
+        let orders: Vec<_> = (0..17)
+            .map(|idx| data_generator.create_order_with_unique_nonce(None, None, U256::from(idx + 1)))
+            .collect();
+
+        let group = create_conflict_group(1, orders, HashSet::default());
+        let tasks_a = get_default_tasks_for_group(&group, TaskPriority::High);
+        let tasks_b = get_default_tasks_for_group(&group, TaskPriority::High);
+
+        let sample_a: Vec<_> = tasks_a
+            .iter()
+            .find(|task| matches!(task.algorithm, Algorithm::AllPermutations))
+            .expect("expected all permutations fallback task")
+            .group
+            .orders
+            .iter()
+            .map(|order| order.order.id())
+            .collect();
+        let sample_b: Vec<_> = tasks_b
+            .iter()
+            .find(|task| matches!(task.algorithm, Algorithm::AllPermutations))
+            .expect("expected all permutations fallback task")
+            .group
+            .orders
+            .iter()
+            .map(|order| order.order.id())
+            .collect();
+
+        assert_eq!(sample_a, sample_b);
+        assert_eq!(sample_a.len(), 8);
     }
 }
