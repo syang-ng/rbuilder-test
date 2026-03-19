@@ -1059,11 +1059,13 @@ fn sequence_parallelism_budget(sequence_count: usize, max_group_parallelism: usi
     }
 
     if sequence_count < 64 {
-        max_group_parallelism.min(2)
-    } else if sequence_count < 256 {
         max_group_parallelism.min(4)
-    } else {
+    } else if sequence_count < 256 {
         max_group_parallelism.min(8)
+    } else if sequence_count < 1024 {
+        max_group_parallelism.min(16)
+    } else {
+        max_group_parallelism
     }
 }
 

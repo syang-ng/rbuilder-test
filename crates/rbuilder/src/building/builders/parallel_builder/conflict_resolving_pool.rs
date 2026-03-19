@@ -54,7 +54,7 @@ where
         let available_threads = thread::available_parallelism()
             .map(|value| value.get())
             .unwrap_or(1);
-        let max_outer_threads = (available_threads / 2).max(1);
+        let max_outer_threads = (available_threads / 4).max(1);
         let worker_threads = num_threads.max(1).min(max_outer_threads);
         let sequence_threads = available_threads.saturating_sub(worker_threads).max(1);
         let sequence_thread_pool = Arc::new(
@@ -74,7 +74,7 @@ where
             simulation_cache,
             worker_threads,
             sequence_thread_pool,
-            max_group_parallelism: sequence_threads.min(8),
+            max_group_parallelism: sequence_threads,
         }
     }
 
