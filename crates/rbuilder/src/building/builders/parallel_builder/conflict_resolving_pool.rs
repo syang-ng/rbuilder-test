@@ -61,7 +61,7 @@ where
     }
 
     pub fn start(&self) -> eyre::Result<()> {
-        let inner_threads = 25;
+        let inner_threads = 20;
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(inner_threads)
             .build_global();

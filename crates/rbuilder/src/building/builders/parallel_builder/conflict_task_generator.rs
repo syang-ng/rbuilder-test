@@ -19,6 +19,7 @@ const THRESHOLD_FOR_SIGNIFICANT_CHANGE: u64 = 20;
 const NUMBER_OF_TOP_ORDERS_TO_CONSIDER_FOR_SIGNIFICANT_CHANGE: usize = 10;
 const MAX_LENGTH_FOR_ALL_PERMUTATIONS: usize = 3;
 const NUMBER_OF_RANDOM_TASKS: usize = 50;
+const CUTOFF_K: usize = 8;
 
 /// Manages conflicts and updates for conflict groups, coordinating with a worker pool to process tasks.
 pub struct ConflictTaskGenerator {
@@ -425,7 +426,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 
     let created_at = Instant::now();
 
-    if group.orders.len() > 8 {
+    if group.orders.len() >= CUTOFF_K {
         let orders = &group.orders;
         let order_nonces: Vec<_> = orders
             .iter()
@@ -534,7 +535,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 
         // println!("generating random sample for group {} {}", percentage, percentage_contracts);
         let new_group = match selected_orders.len() {
-            len if len <= 8 => ConflictGroup {
+            len if len < CUTOFF_K => ConflictGroup {
                 id: group.id,
                 orders: Arc::new(selected_orders),
                 conflicting_group_ids: group.conflicting_group_ids.clone(),
@@ -542,7 +543,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
             _ => {
                 // Randomly sample 8 orders from selected_orders
                 let mut rng = thread_rng();
-                let sample: Vec<_> = selected_orders.choose_multiple(&mut rng, 8).cloned().collect();
+                let sample: Vec<_> = selected_orders.choose_multiple(&mut rng, CUTOFF_K-1).cloned().collect();
                 ConflictGroup {
                     id: group.id,
                     orders: Arc::new(sample),

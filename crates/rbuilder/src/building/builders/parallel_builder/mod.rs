@@ -459,17 +459,25 @@ where
     println!("New Processing {} groups", groups.len());
     for group in &groups {
         println!("New Group ID: {}, Orders: {}", group.id, group.orders.len());
+        group.orders.iter().for_each(|order| {
+            println!(
+                "Group ID: {}, Order ID: {}, {:?}",
+                group.id,
+                order.order.id(),
+                order.sim_value,
+            )
+        });
 
-        if group.orders.len() > 8 {
-            // show details of the orders in the group
-            for order in group.orders.iter() {
-                println!(
-                    "Order ID: {}, {:?}",
-                    order.order.id(),
-                    order.order,
-                )
-            }
-        }
+        // if group.orders.len() > 8 {
+        //     // show details of the orders in the group
+        //     for order in group.orders.iter() {
+        //         println!(
+        //             "Order ID: {}, {:?}",
+        //             order.order.id(),
+        //             order.order,
+        //         )
+        //     }
+        // }
     }
 
     let results = conflict_resolving_pool.process_groups_default_backtest(
