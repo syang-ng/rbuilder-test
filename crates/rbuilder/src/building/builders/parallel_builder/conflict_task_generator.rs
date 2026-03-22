@@ -18,6 +18,7 @@ const NUMBER_OF_TOP_ORDERS_TO_CONSIDER_FOR_SIGNIFICANT_CHANGE: usize = 10;
 const MAX_LENGTH_FOR_ALL_PERMUTATIONS: usize = 3;
 const NUMBER_OF_RANDOM_TASKS: usize = 50;
 const MIN_LENGTH_FOR_ORIENTATION_SEARCH: usize = 8;
+const MAX_FALLBACK_PERMUTATION_ORDERS: usize = MIN_LENGTH_FOR_ORIENTATION_SEARCH - 1;
 const MAX_LENGTH_FOR_ORIENTATION_SEARCH: usize = 14;
 const MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH: usize = 15;
 const MAX_DENSITY_FOR_ORIENTATION_SEARCH: f64 = 0.40;
@@ -431,7 +432,7 @@ pub fn get_default_tasks_for_group(
 
     let created_at = Instant::now();
 
-    if group.orders.len() > 8 {
+    if group.orders.len() >= MIN_LENGTH_FOR_ORIENTATION_SEARCH {
         let orders = &group.orders;
         let order_nonces: Vec<_> = orders
             .iter()
@@ -473,11 +474,6 @@ pub fn get_default_tasks_for_group(
             // Skip orders with nonce conflicts
         }
         let selected_orders: Vec<_> = selected.iter().map(|&idx| orders[idx].clone()).collect();
-        println!(
-            "prev orders: {} selected orders: {}",
-            orders.len(),
-            selected_orders.len()
-        );
 
         // let overlap_rate_of_nonces = order_nonces.iter().flatten().counts_by(|nonce| nonce.clone());
 
@@ -522,7 +518,6 @@ pub fn get_default_tasks_for_group(
         };
 
         if percentage_contracts >= 20.0 {
-            println!("generating random tasks for group");
             let random_order_group = ConflictGroup {
                 id: group.id,
                 orders: Arc::new(selected_orders.clone()),
@@ -558,16 +553,16 @@ pub fn get_default_tasks_for_group(
             });
         } else {
             let new_group = match selected_orders.len() {
-                len if len <= 8 => ConflictGroup {
+                len if len <= MAX_FALLBACK_PERMUTATION_ORDERS => ConflictGroup {
                     id: group.id,
                     orders: Arc::new(selected_orders),
                     conflicting_group_ids: group.conflicting_group_ids.clone(),
                 },
                 _ => {
-                    // Randomly sample 8 orders from selected_orders
+                    // Keep sampled exhaustive search in the 7! budget that the performance branch used.
                     let mut rng = SmallRng::seed_from_u64(DEFAULT_PERMUTATION_SAMPLE_SEED);
                     let sample: Vec<_> = selected_orders
-                        .choose_multiple(&mut rng, 8)
+                        .choose_multiple(&mut rng, MAX_FALLBACK_PERMUTATION_ORDERS)
                         .cloned()
                         .collect();
                     ConflictGroup {
@@ -589,11 +584,7 @@ pub fn get_default_tasks_for_group(
     } else {
         tasks.push(ConflictTask {
             group_idx: group.id,
-            algorithm: if should_use_orientation_search(group.orders.as_ref()) {
-                Algorithm::OrientationSearch
-            } else {
-                Algorithm::PermutationsWithNonces
-            },
+            algorithm: Algorithm::PermutationsWithNonces,
             priority,
             group: group.clone(),
             created_at,
@@ -679,7 +670,9 @@ pub fn get_default_tasks_for_group(
 
 fn should_use_orientation_search(orders: &[Arc<SimulatedOrder>]) -> bool {
     let n = orders.len();
-    if n < MIN_LENGTH_FOR_ORIENTATION_SEARCH {
+    if !(MIN_LENGTH_FOR_ORIENTATION_SEARCH..=MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH)
+        .contains(&n)
+    {
         return false;
     }
 
@@ -1076,15 +1069,23 @@ mod tests {
             .collect();
 
         let mut orders = Vec::new();
-        orders.push(data_generator.create_order(Some(&slots[0]), None, U256::from(10)));
+        orders.push(data_generator.create_order_with_unique_nonce(
+            Some(&slots[0]),
+            None,
+            U256::from(10),
+        ));
         for idx in 1..7 {
-            orders.push(data_generator.create_order(
+            orders.push(data_generator.create_order_with_unique_nonce(
                 Some(&slots[idx]),
                 Some(&slots[idx - 1]),
                 U256::from((idx + 1) as u64 * 10),
             ));
         }
-        orders.push(data_generator.create_order(None, Some(&slots[6]), U256::from(90)));
+        orders.push(data_generator.create_order_with_unique_nonce(
+            None,
+            Some(&slots[6]),
+            U256::from(90),
+        ));
 
         let group = create_conflict_group(1, orders, HashSet::default());
         let tasks = get_default_tasks_for_group(&group, TaskPriority::High);
@@ -1098,7 +1099,9 @@ mod tests {
     fn test_default_large_group_sampling_is_reproducible() {
         let mut data_generator = DataGenerator::new();
         let orders: Vec<_> = (0..17)
-            .map(|idx| data_generator.create_order_with_unique_nonce(None, None, U256::from(idx + 1)))
+            .map(|idx| {
+                data_generator.create_order_with_unique_nonce(None, None, U256::from(idx + 1))
+            })
             .collect();
 
         let group = create_conflict_group(1, orders, HashSet::default());
@@ -1125,6 +1128,36 @@ mod tests {
             .collect();
 
         assert_eq!(sample_a, sample_b);
-        assert_eq!(sample_a.len(), 8);
+        assert_eq!(sample_a.len(), MAX_FALLBACK_PERMUTATION_ORDERS);
+    }
+
+    #[test]
+    fn test_default_eight_order_dense_group_uses_seven_order_fallback() {
+        let mut data_generator = DataGenerator::new();
+        let hot_slot = SlotKey {
+            address: Address::repeat_byte(0x42),
+            key: data_generator.create_b256(),
+        };
+        let orders: Vec<_> = (0..MIN_LENGTH_FOR_ORIENTATION_SEARCH)
+            .map(|idx| {
+                data_generator.create_order_with_unique_nonce(
+                    Some(&hot_slot),
+                    Some(&hot_slot),
+                    U256::from(idx as u64 + 1),
+                )
+            })
+            .collect();
+
+        let group = create_conflict_group(1, orders, HashSet::default());
+        let tasks = get_default_tasks_for_group(&group, TaskPriority::High);
+        let fallback_task = tasks
+            .iter()
+            .find(|task| matches!(task.algorithm, Algorithm::AllPermutations))
+            .expect("expected all permutations fallback task");
+
+        assert_eq!(
+            fallback_task.group.orders.len(),
+            MAX_FALLBACK_PERMUTATION_ORDERS
+        );
     }
 }

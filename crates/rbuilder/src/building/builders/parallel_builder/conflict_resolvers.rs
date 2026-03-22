@@ -175,14 +175,10 @@ impl ResolverContext {
             sequence_parallelism_budget(sequence_to_try.len(), self.max_group_parallelism);
         if desired_parallelism <= 1 {
             let mut resolver_ctx = self.clone_for_parallel_batch();
-            return resolver_ctx.process_sequence_batch(sequence_to_try, task);
+            return resolver_ctx.process_sequence_batch(&sequence_to_try, task);
         }
 
         let batch_size = sequence_to_try.len().div_ceil(desired_parallelism);
-        let batches: Vec<Vec<Vec<usize>>> = sequence_to_try
-            .chunks(batch_size)
-            .map(|chunk| chunk.to_vec())
-            .collect();
         let state = self.state.clone();
         let ctx = self.ctx.clone();
         let cancellation_token = self.cancellation_token.clone();
@@ -191,8 +187,8 @@ impl ResolverContext {
         let max_group_parallelism = self.max_group_parallelism;
 
         let best = self.sequence_thread_pool.install(|| {
-            batches
-                .into_par_iter()
+            sequence_to_try
+                .par_chunks(batch_size)
                 .map(|batch| {
                     let mut resolver_ctx = ResolverContext {
                         state: state.clone(),
@@ -249,7 +245,7 @@ impl ResolverContext {
 
     fn process_sequence_batch(
         &mut self,
-        sequences: Vec<Vec<usize>>,
+        sequences: &[Vec<usize>],
         task: &ConflictTask,
     ) -> Result<ResolutionResult> {
         let mut best_resolution_result = ResolutionResult {
@@ -279,7 +275,7 @@ impl ResolverContext {
     /// A tuple containing the resolution result and the final block state.
     fn process_sequence_of_orders(
         &mut self,
-        sequence_of_orders: Vec<usize>,
+        sequence_of_orders: &[usize],
         task: &ConflictTask,
         state_provider: Arc<dyn StateProvider>,
     ) -> Result<(ResolutionResult, BlockState)> {
