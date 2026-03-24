@@ -3,12 +3,16 @@ use ahash::{HashMap, HashSet};
 use alloy_primitives::{utils::format_ether, U256};
 use crossbeam_queue::SegQueue;
 use itertools::Itertools;
-use std::{sync::Arc, time::Instant};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::{cell::RefCell, sync::Arc, time::Instant};
 use tracing::trace;
 
 use super::{
-    conflict_resolvers::analyze_conflict_graph, task::ConflictTask, Algorithm, ConflictGroup,
-    ConflictResolutionResultPerGroup, GroupId, ResolutionResult, TaskPriority, TaskQueue,
+    conflict_resolvers::{analyze_conflict_graph, ConflictGraphStats},
+    task::ConflictTask,
+    Algorithm, ConflictGroup, ConflictResolutionResultPerGroup, GroupId, ResolutionResult,
+    TaskPriority, TaskQueue,
 };
 use rand::{rngs::SmallRng, seq::SliceRandom, SeedableRng};
 use std::sync::mpsc as std_mpsc;
@@ -24,6 +28,81 @@ const MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH: usize = 15;
 const MAX_DENSITY_FOR_ORIENTATION_SEARCH: f64 = 0.40;
 const MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH: usize = 16;
 const DEFAULT_PERMUTATION_SAMPLE_SEED: u64 = 0x06511;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DefaultGraphStudyRecord {
+    pub group_id: GroupId,
+    pub algorithm: String,
+    pub original_order_count: usize,
+    pub selected_order_count: usize,
+    pub edge_count: usize,
+    pub density: f64,
+    pub max_degree: usize,
+    pub has_missing_traces: bool,
+    pub orientation_eligible: bool,
+    pub random_task_added: bool,
+    pub candidate_sequence_count: Option<usize>,
+    pub best_profit: Option<U256>,
+}
+
+thread_local! {
+    static DEFAULT_GRAPH_STUDY_RECORDS: RefCell<Option<Arc<Mutex<Vec<DefaultGraphStudyRecord>>>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn start_default_graph_study_capture() {
+    DEFAULT_GRAPH_STUDY_RECORDS.with(|records| {
+        *records.borrow_mut() = Some(Arc::new(Mutex::new(Vec::new())));
+    });
+}
+
+pub(crate) fn take_default_graph_study_records() -> Vec<DefaultGraphStudyRecord> {
+    DEFAULT_GRAPH_STUDY_RECORDS.with(|records| {
+        records
+            .borrow_mut()
+            .take()
+            .map(|records| records.lock().clone())
+            .unwrap_or_default()
+    })
+}
+
+pub(crate) fn current_default_graph_study_collector(
+) -> Option<Arc<Mutex<Vec<DefaultGraphStudyRecord>>>> {
+    DEFAULT_GRAPH_STUDY_RECORDS.with(|records| records.borrow().clone())
+}
+
+fn default_graph_study_enabled() -> bool {
+    DEFAULT_GRAPH_STUDY_RECORDS.with(|records| records.borrow().is_some())
+}
+
+fn record_default_graph_study(record: DefaultGraphStudyRecord) {
+    DEFAULT_GRAPH_STUDY_RECORDS.with(|records| {
+        if let Some(records) = records.borrow().as_ref() {
+            records.lock().push(record);
+        }
+    });
+}
+
+pub(crate) fn update_default_graph_study_record(
+    collector: &Arc<Mutex<Vec<DefaultGraphStudyRecord>>>,
+    group_id: GroupId,
+    algorithm: Algorithm,
+    candidate_sequence_count: Option<usize>,
+    best_profit: Option<U256>,
+) {
+    let algorithm = format!("{:?}", algorithm);
+    let mut records = collector.lock();
+    if let Some(record) = records
+        .iter_mut()
+        .find(|record| record.group_id == group_id && record.algorithm == algorithm)
+    {
+        if let Some(candidate_sequence_count) = candidate_sequence_count {
+            record.candidate_sequence_count = Some(candidate_sequence_count);
+        }
+        if let Some(best_profit) = best_profit {
+            record.best_profit = Some(best_profit);
+        }
+    }
+}
 
 /// Manages conflicts and updates for conflict groups, coordinating with a worker pool to process tasks.
 pub struct ConflictTaskGenerator {
@@ -474,6 +553,10 @@ pub fn get_default_tasks_for_group(
             // Skip orders with nonce conflicts
         }
         let selected_orders: Vec<_> = selected.iter().map(|&idx| orders[idx].clone()).collect();
+        let selected_order_count = selected_orders.len();
+        let selected_stats = analyze_conflict_graph(&selected_orders);
+        let orientation_eligible =
+            should_use_orientation_search_for_stats(selected_order_count, &selected_stats);
 
         // let overlap_rate_of_nonces = order_nonces.iter().flatten().counts_by(|nonce| nonce.clone());
 
@@ -539,7 +622,7 @@ pub fn get_default_tasks_for_group(
         }
 
         // println!("generating random sample for group {} {}", percentage, percentage_contracts);
-        if should_use_orientation_search(&selected_orders) {
+        if orientation_eligible {
             tasks.push(ConflictTask {
                 group_idx: group.id,
                 algorithm: Algorithm::OrientationSearch,
@@ -581,6 +664,25 @@ pub fn get_default_tasks_for_group(
                 created_at,
             });
         }
+
+        if default_graph_study_enabled() {
+            for task in &tasks {
+                record_default_graph_study(DefaultGraphStudyRecord {
+                    group_id: group.id,
+                    algorithm: format!("{:?}", task.algorithm),
+                    original_order_count: group.orders.len(),
+                    selected_order_count,
+                    edge_count: selected_stats.edge_count,
+                    density: selected_stats.density,
+                    max_degree: selected_stats.max_degree,
+                    has_missing_traces: selected_stats.has_missing_traces,
+                    orientation_eligible,
+                    random_task_added: percentage_contracts >= 20.0,
+                    candidate_sequence_count: None,
+                    best_profit: None,
+                });
+            }
+        }
     } else {
         tasks.push(ConflictTask {
             group_idx: group.id,
@@ -589,6 +691,29 @@ pub fn get_default_tasks_for_group(
             group: group.clone(),
             created_at,
         });
+
+        if default_graph_study_enabled() {
+            let stats = analyze_conflict_graph(group.orders.as_ref());
+            for task in &tasks {
+                record_default_graph_study(DefaultGraphStudyRecord {
+                    group_id: group.id,
+                    algorithm: format!("{:?}", task.algorithm),
+                    original_order_count: group.orders.len(),
+                    selected_order_count: group.orders.len(),
+                    edge_count: stats.edge_count,
+                    density: stats.density,
+                    max_degree: stats.max_degree,
+                    has_missing_traces: stats.has_missing_traces,
+                    orientation_eligible: should_use_orientation_search_for_stats(
+                        group.orders.len(),
+                        &stats,
+                    ),
+                    random_task_added: false,
+                    candidate_sequence_count: None,
+                    best_profit: None,
+                });
+            }
+        }
     }
 
     // // Sort the orders by gas used
@@ -668,15 +793,12 @@ pub fn get_default_tasks_for_group(
     tasks
 }
 
-fn should_use_orientation_search(orders: &[Arc<SimulatedOrder>]) -> bool {
-    let n = orders.len();
+fn should_use_orientation_search_for_stats(n: usize, stats: &ConflictGraphStats) -> bool {
     if !(MIN_LENGTH_FOR_ORIENTATION_SEARCH..=MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH)
         .contains(&n)
     {
         return false;
     }
-
-    let stats = analyze_conflict_graph(orders);
     if stats.has_missing_traces {
         return false;
     }

@@ -57,6 +57,11 @@ struct Cli {
     compare_backtest: bool,
     #[clap(long, help = "Path to csv file to write output to")]
     csv: Option<PathBuf>,
+    #[clap(
+        long,
+        help = "Path to csv file to write default builder graph-study output to"
+    )]
+    graph_stats_csv: Option<PathBuf>,
     #[clap(long, help = "Ignored signers")]
     ignored_signers: Vec<Address>,
     #[clap(help = "Blocks")]
@@ -133,6 +138,13 @@ where
     } else {
         None
     };
+    let mut graph_stats_csv_output = if let Some(file) = cli.graph_stats_csv {
+        let mut graph_stats_csv_output = GraphStatsCSVWriter::new(file)?;
+        graph_stats_csv_output.write_header()?;
+        Some(graph_stats_csv_output)
+    } else {
+        None
+    };
 
     let blocklist = config
         .base_config()
@@ -201,6 +213,9 @@ where
         for o in output {
             if let Some(csv_output) = &mut csv_output {
                 csv_output.write_block_data(&o)?;
+            }
+            if let Some(graph_stats_csv_output) = &mut graph_stats_csv_output {
+                graph_stats_csv_output.write_block_data(&o)?;
             }
 
             let our = o
@@ -394,6 +409,62 @@ impl CSVResultWriter {
             line.push_str(&format!(",{}", format_ether(builder_res)));
         }
         writeln!(self.file, "{}", line)?;
+        self.file.flush()
+    }
+}
+
+#[derive(Debug)]
+struct GraphStatsCSVWriter {
+    file: File,
+}
+
+impl GraphStatsCSVWriter {
+    fn new(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Self { file })
+    }
+
+    fn write_header(&mut self) -> io::Result<()> {
+        writeln!(
+            self.file,
+            "block_number,builder_name,group_id,algorithm,original_order_count,selected_order_count,edge_count,density,max_degree,has_missing_traces,orientation_eligible,random_task_added,candidate_sequence_count,best_profit"
+        )?;
+        self.file.flush()
+    }
+
+    fn write_block_data(&mut self, value: &BlockBacktestValue) -> io::Result<()> {
+        for builder_output in &value.builder_outputs {
+            for record in &builder_output.graph_study_records {
+                writeln!(
+                    self.file,
+                    "{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{}",
+                    value.block_number,
+                    builder_output.builder_name,
+                    record.group_id,
+                    record.algorithm,
+                    record.original_order_count,
+                    record.selected_order_count,
+                    record.edge_count,
+                    record.density,
+                    record.max_degree,
+                    record.has_missing_traces,
+                    record.orientation_eligible,
+                    record.random_task_added,
+                    record
+                        .candidate_sequence_count
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    record
+                        .best_profit
+                        .map(|value| value.to_string())
+                        .unwrap_or_default()
+                )?;
+            }
+        }
         self.file.flush()
     }
 }

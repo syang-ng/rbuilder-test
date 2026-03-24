@@ -1,7 +1,7 @@
 use alloy_primitives::utils::format_ether;
 use crossbeam_queue::SegQueue;
 use eyre::Result;
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use reth_provider::StateProvider;
 use std::{
     sync::{mpsc as std_mpsc, Arc},
@@ -13,7 +13,10 @@ use tracing::{trace, warn};
 
 use super::{
     conflict_resolvers::ResolverContext,
-    conflict_task_generator::{get_default_tasks_for_group, get_tasks_for_group},
+    conflict_task_generator::{
+        current_default_graph_study_collector, get_default_tasks_for_group, get_tasks_for_group,
+        DefaultGraphStudyRecord,
+    },
     simulation_cache::SharedSimulationCache,
     ConflictGroup, ConflictResolutionResultPerGroup, ConflictTask, GroupId, ResolutionResult,
     TaskPriority,
@@ -107,6 +110,7 @@ where
                             Arc::clone(&simulation_cache),
                             Arc::clone(&sequence_thread_pool),
                             max_group_parallelism,
+                            None,
                         ) {
                             match group_result_sender.send((task_id, result)) {
                                 Ok(_) => {
@@ -142,6 +146,7 @@ where
         simulation_cache: Arc<SharedSimulationCache>,
         sequence_thread_pool: Arc<ThreadPool>,
         max_group_parallelism: usize,
+        graph_study_collector: Option<Arc<parking_lot::Mutex<Vec<DefaultGraphStudyRecord>>>>,
     ) -> Result<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut merging_context = ResolverContext::new(
             state,
@@ -150,6 +155,7 @@ where
             simulation_cache,
             sequence_thread_pool,
             max_group_parallelism,
+            graph_study_collector,
         );
         let task_id = task.group_idx;
         let task_group = task.group.clone();
@@ -181,6 +187,42 @@ where
         }
     }
 
+    fn process_backtest_tasks(
+        &self,
+        tasks: Vec<ConflictTask>,
+        ctx: &BlockBuildingContext,
+        state: Arc<dyn StateProvider>,
+        simulation_cache: Arc<SharedSimulationCache>,
+        graph_study_collector: Option<Arc<parking_lot::Mutex<Vec<DefaultGraphStudyRecord>>>>,
+    ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+
+        let concurrent_tasks = tasks.len().min(self.max_group_parallelism).max(1);
+        let per_task_parallelism = (self.max_group_parallelism / concurrent_tasks).max(1);
+        let sequence_thread_pool = Arc::clone(&self.sequence_thread_pool);
+
+        self.sequence_thread_pool.install(|| {
+            tasks
+                .into_par_iter()
+                .filter_map(|task| {
+                    Self::process_task(
+                        task,
+                        ctx,
+                        state.clone(),
+                        CancellationToken::new(),
+                        Arc::clone(&simulation_cache),
+                        Arc::clone(&sequence_thread_pool),
+                        per_task_parallelism,
+                        graph_study_collector.clone(),
+                    )
+                    .ok()
+                })
+                .collect()
+        })
+    }
+
     pub fn process_groups_backtest(
         &mut self,
         new_groups: Vec<ConflictGroup>,
@@ -188,26 +230,14 @@ where
         state: Arc<dyn StateProvider>,
         simulation_cache: Arc<SharedSimulationCache>,
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
-        let mut results = Vec::new();
-        for new_group in new_groups {
-            let tasks = get_tasks_for_group(&new_group, TaskPriority::High, self.safe_sorting_only);
-            for task in tasks {
-                let simulation_cache = Arc::clone(&simulation_cache);
-                let result = Self::process_task(
-                    task,
-                    ctx,
-                    state.clone(),
-                    CancellationToken::new(),
-                    simulation_cache,
-                    Arc::clone(&self.sequence_thread_pool),
-                    self.max_group_parallelism,
-                );
-                if let Ok(result) = result {
-                    results.push(result);
-                }
-            }
-        }
-        results
+        let tasks: Vec<_> = new_groups
+            .into_iter()
+            .flat_map(|new_group| {
+                get_tasks_for_group(&new_group, TaskPriority::High, self.safe_sorting_only)
+            })
+            .collect();
+
+        self.process_backtest_tasks(tasks, ctx, state, simulation_cache, None)
     }
 
     pub fn process_groups_default_backtest(
@@ -217,25 +247,17 @@ where
         state: Arc<dyn StateProvider>,
         simulation_cache: Arc<SharedSimulationCache>,
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
-        let mut results = Vec::new();
-        for new_group in new_groups {
-            let tasks = get_default_tasks_for_group(&new_group, TaskPriority::High);
-            for task in tasks {
-                let simulation_cache = Arc::clone(&simulation_cache);
-                let result = Self::process_task(
-                    task,
-                    ctx,
-                    state.clone(),
-                    CancellationToken::new(),
-                    simulation_cache,
-                    Arc::clone(&self.sequence_thread_pool),
-                    self.max_group_parallelism,
-                );
-                if let Ok(result) = result {
-                    results.push(result);
-                }
-            }
-        }
-        results
+        let tasks: Vec<_> = new_groups
+            .into_iter()
+            .flat_map(|new_group| get_default_tasks_for_group(&new_group, TaskPriority::High))
+            .collect();
+
+        self.process_backtest_tasks(
+            tasks,
+            ctx,
+            state,
+            simulation_cache,
+            current_default_graph_study_collector(),
+        )
     }
 }

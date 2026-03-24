@@ -336,11 +336,6 @@ where
     let processing_start = Instant::now();
     let groups = conflict_finder.get_order_groups();
 
-    println!("Old Processing {} groups", groups.len());
-    for group in &groups {
-        println!("Old Group ID: {}, Orders: {}", group.id, group.orders.len());
-    }
-
     let results = conflict_resolving_pool.process_groups_backtest(
         groups,
         &input.ctx,
@@ -454,18 +449,6 @@ where
     // Group processing
     let processing_start = Instant::now();
     let groups = conflict_finder.get_order_groups();
-
-    println!("New Processing {} groups", groups.len());
-    for group in &groups {
-        println!("New Group ID: {}, Orders: {}", group.id, group.orders.len());
-
-        if group.orders.len() > 8 {
-            // show details of the orders in the group
-            for order in group.orders.iter() {
-                println!("Order ID: {}, {:?}", order.order.id(), order.order,)
-            }
-        }
-    }
 
     let results = conflict_resolving_pool.process_groups_default_backtest(
         groups,

@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use super::{
+    conflict_task_generator::{update_default_graph_study_record, DefaultGraphStudyRecord},
     simulation_cache::{CachedSimulationState, SharedSimulationCache},
     Algorithm, ConflictTask, ResolutionResult,
 };
@@ -41,6 +42,34 @@ pub(crate) struct ConflictGraphStats {
 struct OrientationProblem {
     hard_precedence: Vec<u32>,
     soft_conflicts: Vec<(usize, usize)>,
+}
+
+#[derive(Debug)]
+struct TaskExecutionData {
+    order_ids_by_index: Vec<OrderId>,
+    order_id_to_index: HashMap<OrderId, usize>,
+}
+
+impl TaskExecutionData {
+    fn new(task: &ConflictTask) -> Self {
+        let order_ids_by_index: Vec<_> = task
+            .group
+            .orders
+            .iter()
+            .map(|sim_order| sim_order.order.id())
+            .collect();
+        let order_id_to_index = order_ids_by_index
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, order_id)| (order_id, idx))
+            .collect();
+
+        Self {
+            order_ids_by_index,
+            order_id_to_index,
+        }
+    }
 }
 
 pub(crate) fn analyze_conflict_graph(orders: &[Arc<SimulatedOrder>]) -> ConflictGraphStats {
@@ -95,6 +124,7 @@ pub struct ResolverContext {
     pub simulation_cache: Arc<SharedSimulationCache>,
     pub sequence_thread_pool: Arc<ThreadPool>,
     pub max_group_parallelism: usize,
+    pub graph_study_collector: Option<Arc<parking_lot::Mutex<Vec<DefaultGraphStudyRecord>>>>,
 }
 
 impl ResolverContext {
@@ -114,6 +144,7 @@ impl ResolverContext {
         simulation_cache: Arc<SharedSimulationCache>,
         sequence_thread_pool: Arc<ThreadPool>,
         max_group_parallelism: usize,
+        graph_study_collector: Option<Arc<parking_lot::Mutex<Vec<DefaultGraphStudyRecord>>>>,
     ) -> Self {
         ResolverContext {
             state,
@@ -122,6 +153,7 @@ impl ResolverContext {
             simulation_cache,
             sequence_thread_pool,
             max_group_parallelism,
+            graph_study_collector,
         }
     }
 
@@ -142,7 +174,17 @@ impl ResolverContext {
         );
 
         let sequence_to_try = generate_sequences_of_orders_to_try(&task);
-        let best = self.evaluate_sequences(sequence_to_try, &task)?;
+        if let Some(collector) = &self.graph_study_collector {
+            update_default_graph_study_record(
+                collector,
+                task.group.id,
+                task.algorithm,
+                Some(sequence_to_try.len()),
+                None,
+            );
+        }
+        let task_execution_data = TaskExecutionData::new(&task);
+        let best = self.evaluate_sequences(sequence_to_try, &task, &task_execution_data)?;
 
         let mut best_resolution_result = ResolutionResult {
             total_profit: U256::ZERO,
@@ -156,6 +198,15 @@ impl ResolverContext {
             best_resolution_result.total_profit,
             task.algorithm
         );
+        if let Some(collector) = &self.graph_study_collector {
+            update_default_graph_study_record(
+                collector,
+                task.group.id,
+                task.algorithm,
+                None,
+                Some(best_resolution_result.total_profit),
+            );
+        }
         Ok(best_resolution_result)
     }
 
@@ -163,6 +214,7 @@ impl ResolverContext {
         &self,
         sequence_to_try: Vec<Vec<usize>>,
         task: &ConflictTask,
+        task_execution_data: &TaskExecutionData,
     ) -> Result<ResolutionResult> {
         if sequence_to_try.is_empty() {
             return Ok(ResolutionResult {
@@ -175,7 +227,11 @@ impl ResolverContext {
             sequence_parallelism_budget(sequence_to_try.len(), self.max_group_parallelism);
         if desired_parallelism <= 1 {
             let mut resolver_ctx = self.clone_for_parallel_batch();
-            return resolver_ctx.process_sequence_batch(&sequence_to_try, task);
+            return resolver_ctx.process_sequence_batch(
+                &sequence_to_try,
+                task,
+                task_execution_data,
+            );
         }
 
         let batch_size = sequence_to_try.len().div_ceil(desired_parallelism);
@@ -197,8 +253,9 @@ impl ResolverContext {
                         simulation_cache: simulation_cache.clone(),
                         sequence_thread_pool: Arc::clone(&sequence_thread_pool),
                         max_group_parallelism,
+                        graph_study_collector: self.graph_study_collector.clone(),
                     };
-                    resolver_ctx.process_sequence_batch(batch, task)
+                    resolver_ctx.process_sequence_batch(batch, task, task_execution_data)
                 })
                 .try_reduce_with(|a: ResolutionResult, b: ResolutionResult| {
                     Ok(if a.total_profit >= b.total_profit {
@@ -223,6 +280,7 @@ impl ResolverContext {
             simulation_cache: self.simulation_cache.clone(),
             sequence_thread_pool: Arc::clone(&self.sequence_thread_pool),
             max_group_parallelism: self.max_group_parallelism,
+            graph_study_collector: self.graph_study_collector.clone(),
         }
     }
 
@@ -247,6 +305,7 @@ impl ResolverContext {
         &mut self,
         sequences: &[Vec<usize>],
         task: &ConflictTask,
+        task_execution_data: &TaskExecutionData,
     ) -> Result<ResolutionResult> {
         let mut best_resolution_result = ResolutionResult {
             total_profit: U256::ZERO,
@@ -254,8 +313,12 @@ impl ResolverContext {
         };
 
         for sequence_of_orders in sequences {
-            let (resolution_result, _state) =
-                self.process_sequence_of_orders(sequence_of_orders, task, self.state.clone())?;
+            let (resolution_result, _state) = self.process_sequence_of_orders(
+                sequence_of_orders,
+                task,
+                task_execution_data,
+                self.state.clone(),
+            )?;
             self.update_best_result(resolution_result, &mut best_resolution_result);
         }
 
@@ -277,13 +340,14 @@ impl ResolverContext {
         &mut self,
         sequence_of_orders: &[usize],
         task: &ConflictTask,
+        task_execution_data: &TaskExecutionData,
         state_provider: Arc<dyn StateProvider>,
     ) -> Result<(ResolutionResult, BlockState)> {
         // @todo actually reuse it for the duration of the block
         let mut local_ctx = ThreadBlockBuildingContext::default();
 
-        let order_id_to_index = self.initialize_order_id_to_index_map(task);
-        let full_sequence_of_orders = self.initialize_full_order_ids_vec(&sequence_of_orders, task);
+        let full_sequence_of_orders =
+            self.initialize_full_order_ids_vec(sequence_of_orders, task_execution_data);
 
         // Check for cached simulation state
         let (cached_state_option, cached_up_to_index) = self
@@ -296,8 +360,10 @@ impl ResolverContext {
         partial_block.pre_block_call(&self.ctx, &mut local_ctx, &mut state)?;
 
         // Initialize sequenced_order_result
-        let mut sequenced_order_result =
-            self.initialize_result_order_sequence(&cached_state_option, &order_id_to_index);
+        let mut sequenced_order_result = self.initialize_result_order_sequence(
+            &cached_state_option,
+            &task_execution_data.order_id_to_index,
+        );
 
         let mut total_profit = cached_state_option
             .as_ref()
@@ -392,25 +458,15 @@ impl ResolverContext {
         };
     }
 
-    /// Initializes a HashMap of order id to index.
-    fn initialize_order_id_to_index_map(&self, task: &ConflictTask) -> HashMap<OrderId, usize> {
-        task.group
-            .orders
-            .iter()
-            .enumerate()
-            .map(|(idx, sim_order)| (sim_order.order.id(), idx))
-            .collect()
-    }
-
     /// Initializes a vector of full order ids corresponding to the sequence of orders.
     fn initialize_full_order_ids_vec(
         &self,
         sequence_of_orders: &[usize],
-        task: &ConflictTask,
+        task_execution_data: &TaskExecutionData,
     ) -> Vec<OrderId> {
         sequence_of_orders
             .iter()
-            .map(|&idx| task.group.orders[idx].order.id())
+            .map(|&idx| task_execution_data.order_ids_by_index[idx])
             .collect()
     }
 

@@ -13,7 +13,7 @@ pub struct BacktestResultsStorage {
     conn: SqliteConnection,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StoredBacktestResult {
     pub time: time::OffsetDateTime,
     pub rbuilder_version: String,
@@ -183,6 +183,7 @@ mod tests {
                 our_bid_value: u256(19),
                 included_orders: vec![order_id(1)],
                 included_order_profits: vec![u256(100)],
+                graph_study_records: Vec::new(),
             }],
         };
 

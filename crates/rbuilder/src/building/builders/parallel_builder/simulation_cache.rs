@@ -80,12 +80,10 @@ impl SharedSimulationCache {
         let mut current_state: Option<Arc<CachedSimulationState>> = None;
         let mut last_cached_index = 0;
 
-        let mut partial_key = ordering.to_owned();
-
-        while !partial_key.is_empty() {
-            if let Some(cached_result) = cache_lock.inner_cache.get(&partial_key) {
+        for partial_len in (1..=ordering.len()).rev() {
+            if let Some(cached_result) = cache_lock.inner_cache.get(&ordering[..partial_len]) {
                 current_state = Some(cached_result.clone());
-                last_cached_index = partial_key.len();
+                last_cached_index = partial_len;
 
                 // Update statistics
                 if last_cached_index == ordering.len() {
@@ -98,9 +96,6 @@ impl SharedSimulationCache {
 
                 break;
             }
-
-            // Remove the last `OrderId` and try again with a shorter partial key
-            partial_key.pop();
         }
 
         (current_state, last_cached_index)
