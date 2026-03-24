@@ -35,6 +35,9 @@ const MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH: usize = 15;
 const MAX_DENSITY_FOR_ORIENTATION_SEARCH: f64 = 0.40;
 const MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH: usize = 16;
 const DEFAULT_PERMUTATION_SAMPLE_SEED: u64 = 0x06511;
+const FALLBACK_PERMUTATION_SEQUENCE_BUDGET: usize = 5_040;
+const FALLBACK_PERMUTATION_WORK_BUDGET: usize =
+    FALLBACK_PERMUTATION_SEQUENCE_BUDGET * MAX_FALLBACK_PERMUTATION_ORDERS;
 
 static DEFAULT_GRAPH_STUDY_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -826,6 +829,9 @@ fn should_use_orientation_search_for_stats(n: usize, stats: &ConflictGraphStats)
     if stats.has_missing_traces {
         return false;
     }
+    if estimated_orientation_work_upper_bound_exceeds_budget(n, stats.edge_count) {
+        return false;
+    }
 
     if n <= MAX_LENGTH_FOR_ORIENTATION_SEARCH
         && stats.edge_count <= MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH
@@ -837,6 +843,25 @@ fn should_use_orientation_search_for_stats(n: usize, stats: &ConflictGraphStats)
     n <= MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH
         && stats.edge_count <= n + 2
         && stats.max_degree <= 2
+}
+
+fn estimated_orientation_work_upper_bound_exceeds_budget(
+    order_count: usize,
+    conflict_edge_count: usize,
+) -> bool {
+    let sequence_upper_bound = estimated_orientation_sequence_upper_bound(conflict_edge_count);
+    order_count
+        .checked_mul(sequence_upper_bound)
+        .unwrap_or(usize::MAX)
+        > FALLBACK_PERMUTATION_WORK_BUDGET
+}
+
+fn estimated_orientation_sequence_upper_bound(conflict_edge_count: usize) -> usize {
+    if conflict_edge_count >= usize::BITS as usize {
+        usize::MAX
+    } else {
+        1usize << conflict_edge_count
+    }
 }
 
 #[cfg(test)]
@@ -1305,5 +1330,45 @@ mod tests {
             fallback_task.group.orders.len(),
             MAX_FALLBACK_PERMUTATION_ORDERS
         );
+    }
+
+    #[test]
+    fn test_default_long_sparse_group_skips_orientation_when_budget_too_large() {
+        let mut data_generator = DataGenerator::new();
+        let slots: Vec<_> = (0..15)
+            .map(|idx| SlotKey {
+                address: Address::repeat_byte((idx + 1) as u8),
+                key: data_generator.create_b256(),
+            })
+            .collect();
+
+        let mut orders = Vec::new();
+        orders.push(data_generator.create_order_with_unique_nonce(
+            Some(&slots[0]),
+            None,
+            U256::from(10),
+        ));
+        for idx in 1..15 {
+            orders.push(data_generator.create_order_with_unique_nonce(
+                Some(&slots[idx]),
+                Some(&slots[idx - 1]),
+                U256::from((idx + 1) as u64 * 10),
+            ));
+        }
+        orders.push(data_generator.create_order_with_unique_nonce(
+            None,
+            Some(&slots[14]),
+            U256::from(160),
+        ));
+
+        let group = create_conflict_group(1, orders, HashSet::default());
+        let tasks = get_default_tasks_for_group(&group, TaskPriority::High);
+
+        assert!(!tasks
+            .iter()
+            .any(|task| matches!(task.algorithm, Algorithm::OrientationSearch)));
+        assert!(tasks
+            .iter()
+            .any(|task| matches!(task.algorithm, Algorithm::AllPermutations)));
     }
 }
