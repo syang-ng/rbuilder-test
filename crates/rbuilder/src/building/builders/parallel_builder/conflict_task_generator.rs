@@ -5,7 +5,14 @@ use crossbeam_queue::SegQueue;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, sync::Arc, time::Instant};
+use std::{
+    cell::RefCell,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 use tracing::trace;
 
 use super::{
@@ -29,6 +36,8 @@ const MAX_DENSITY_FOR_ORIENTATION_SEARCH: f64 = 0.40;
 const MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH: usize = 16;
 const DEFAULT_PERMUTATION_SAMPLE_SEED: u64 = 0x06511;
 
+static DEFAULT_GRAPH_STUDY_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DefaultGraphStudyRecord {
     pub group_id: GroupId,
@@ -50,9 +59,16 @@ thread_local! {
 }
 
 pub(crate) fn start_default_graph_study_capture() {
+    if !DEFAULT_GRAPH_STUDY_CAPTURE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     DEFAULT_GRAPH_STUDY_RECORDS.with(|records| {
         *records.borrow_mut() = Some(Arc::new(Mutex::new(Vec::new())));
     });
+}
+
+pub(crate) fn set_default_graph_study_capture_enabled(enabled: bool) {
+    DEFAULT_GRAPH_STUDY_CAPTURE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 pub(crate) fn take_default_graph_study_records() -> Vec<DefaultGraphStudyRecord> {
@@ -554,9 +570,17 @@ pub fn get_default_tasks_for_group(
         }
         let selected_orders: Vec<_> = selected.iter().map(|&idx| orders[idx].clone()).collect();
         let selected_order_count = selected_orders.len();
-        let selected_stats = analyze_conflict_graph(&selected_orders);
-        let orientation_eligible =
-            should_use_orientation_search_for_stats(selected_order_count, &selected_stats);
+        let graph_study_enabled = default_graph_study_enabled();
+        let should_analyze_conflict_graph = graph_study_enabled
+            || (MIN_LENGTH_FOR_ORIENTATION_SEARCH..=MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH)
+                .contains(&selected_order_count);
+        let selected_stats = if should_analyze_conflict_graph {
+            analyze_conflict_graph(&selected_orders)
+        } else {
+            ConflictGraphStats::default()
+        };
+        let orientation_eligible = should_analyze_conflict_graph
+            && should_use_orientation_search_for_stats(selected_order_count, &selected_stats);
 
         // let overlap_rate_of_nonces = order_nonces.iter().flatten().counts_by(|nonce| nonce.clone());
 

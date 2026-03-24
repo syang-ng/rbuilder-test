@@ -17,6 +17,7 @@ use crate::{
         execute::{backtest_simulate_block, BlockBacktestValue},
         BacktestResultsStorage, BlockData, HistoricalDataStorage, StoredBacktestResult,
     },
+    building::builders::parallel_builder::conflict_task_generator::set_default_graph_study_capture_enabled,
     live_builder::{base_config::load_config_toml_and_env, cli::LiveBuilderConfig},
     utils::timestamp_ms_to_offset_datetime,
 };
@@ -145,6 +146,7 @@ where
     } else {
         None
     };
+    set_default_graph_study_capture_enabled(graph_stats_csv_output.is_some());
 
     let blocklist = config
         .base_config()
