@@ -1,7 +1,7 @@
 use alloy_primitives::utils::format_ether;
 use crossbeam_queue::SegQueue;
 use eyre::Result;
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use rayon::{prelude::*, ThreadPool, ThreadPoolBuilder};
 use reth_provider::StateProvider;
 use std::{
     sync::{mpsc as std_mpsc, Arc},
@@ -43,6 +43,38 @@ impl<P> ConflictResolvingPool<P>
 where
     P: StateProviderFactory + Clone + 'static,
 {
+    fn with_thread_allocation(
+        task_queue: TaskQueue,
+        safe_sorting_only: bool,
+        group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
+        cancellation_token: CancellationToken,
+        ctx: BlockBuildingContext,
+        provider: P,
+        simulation_cache: Arc<SharedSimulationCache>,
+        worker_threads: usize,
+        sequence_threads: usize,
+    ) -> Self {
+        let sequence_thread_pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(sequence_threads.max(1))
+                .build()
+                .expect("failed to build sequence thread pool"),
+        );
+
+        Self {
+            task_queue,
+            group_result_sender,
+            safe_sorting_only,
+            cancellation_token,
+            ctx,
+            provider,
+            simulation_cache,
+            worker_threads,
+            sequence_thread_pool,
+            max_group_parallelism: sequence_threads.max(1),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_threads: usize,
@@ -60,25 +92,47 @@ where
         let max_outer_threads = (available_threads / 4).max(1);
         let worker_threads = num_threads.max(1).min(max_outer_threads);
         let sequence_threads = available_threads.saturating_sub(worker_threads).max(1);
-        let sequence_thread_pool = Arc::new(
-            ThreadPoolBuilder::new()
-                .num_threads(sequence_threads)
-                .build()
-                .expect("failed to build sequence thread pool"),
-        );
 
-        Self {
+        Self::with_thread_allocation(
             task_queue,
-            group_result_sender,
             safe_sorting_only,
+            group_result_sender,
             cancellation_token,
             ctx,
             provider,
             simulation_cache,
             worker_threads,
-            sequence_thread_pool,
-            max_group_parallelism: sequence_threads,
-        }
+            sequence_threads,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_backtest(
+        num_threads: usize,
+        task_queue: TaskQueue,
+        safe_sorting_only: bool,
+        group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
+        cancellation_token: CancellationToken,
+        ctx: BlockBuildingContext,
+        provider: P,
+        simulation_cache: Arc<SharedSimulationCache>,
+    ) -> Self {
+        let available_threads = thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1);
+        let sequence_threads = num_threads.max(1).min(available_threads).max(1);
+
+        Self::with_thread_allocation(
+            task_queue,
+            safe_sorting_only,
+            group_result_sender,
+            cancellation_token,
+            ctx,
+            provider,
+            simulation_cache,
+            0,
+            sequence_threads,
+        )
     }
 
     pub fn start(&self) -> eyre::Result<()> {
@@ -187,46 +241,28 @@ where
         }
     }
 
-    pub fn process_groups_backtest(
-        &mut self,
-        new_groups: Vec<ConflictGroup>,
-        ctx: &BlockBuildingContext,
-        state: Arc<dyn StateProvider>,
-        simulation_cache: Arc<SharedSimulationCache>,
-    ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
-        let mut results = Vec::new();
-        for new_group in new_groups {
-            let tasks = get_tasks_for_group(&new_group, TaskPriority::High, self.safe_sorting_only);
-            for task in tasks {
-                let result = Self::process_task(
-                    task,
-                    ctx,
-                    state.clone(),
-                    CancellationToken::new(),
-                    Arc::clone(&simulation_cache),
-                    Arc::clone(&self.sequence_thread_pool),
-                    self.max_group_parallelism,
-                    None,
-                );
-                if let Ok(result) = result {
-                    results.push(result);
-                }
-            }
-        }
-        results
+    fn should_parallelize_backtest_tasks(&self, task_count: usize) -> bool {
+        task_count >= (self.max_group_parallelism / 2).max(8)
     }
 
-    pub fn process_groups_default_backtest(
-        &mut self,
-        new_groups: Vec<ConflictGroup>,
+    fn backtest_task_parallelism_budget(&self, task_count: usize) -> usize {
+        (self.max_group_parallelism / task_count.max(1)).clamp(1, 2)
+    }
+
+    fn process_backtest_tasks(
+        &self,
+        tasks: Vec<ConflictTask>,
         ctx: &BlockBuildingContext,
         state: Arc<dyn StateProvider>,
         simulation_cache: Arc<SharedSimulationCache>,
+        graph_study_collector: Option<Arc<parking_lot::Mutex<Vec<DefaultGraphStudyRecord>>>>,
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
-        let graph_study_collector = current_default_graph_study_collector();
-        let mut results = Vec::new();
-        for new_group in new_groups {
-            let tasks = get_default_tasks_for_group(&new_group, TaskPriority::High);
+        if tasks.is_empty() {
+            return Vec::new();
+        }
+
+        if !self.should_parallelize_backtest_tasks(tasks.len()) {
+            let mut results = Vec::with_capacity(tasks.len());
             for task in tasks {
                 let result = Self::process_task(
                     task,
@@ -242,7 +278,67 @@ where
                     results.push(result);
                 }
             }
+            return results;
         }
-        results
+
+        let per_task_parallelism = self.backtest_task_parallelism_budget(tasks.len());
+        let sequence_thread_pool = Arc::clone(&self.sequence_thread_pool);
+
+        self.sequence_thread_pool.install(|| {
+            tasks
+                .into_par_iter()
+                .filter_map(|task| {
+                    Self::process_task(
+                        task,
+                        ctx,
+                        state.clone(),
+                        CancellationToken::new(),
+                        Arc::clone(&simulation_cache),
+                        Arc::clone(&sequence_thread_pool),
+                        per_task_parallelism,
+                        graph_study_collector.clone(),
+                    )
+                    .ok()
+                })
+                .collect()
+        })
+    }
+
+    pub fn process_groups_backtest(
+        &mut self,
+        new_groups: Vec<ConflictGroup>,
+        ctx: &BlockBuildingContext,
+        state: Arc<dyn StateProvider>,
+        simulation_cache: Arc<SharedSimulationCache>,
+    ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
+        let tasks: Vec<_> = new_groups
+            .into_iter()
+            .flat_map(|new_group| {
+                get_tasks_for_group(&new_group, TaskPriority::High, self.safe_sorting_only)
+            })
+            .collect();
+
+        self.process_backtest_tasks(tasks, ctx, state, simulation_cache, None)
+    }
+
+    pub fn process_groups_default_backtest(
+        &mut self,
+        new_groups: Vec<ConflictGroup>,
+        ctx: &BlockBuildingContext,
+        state: Arc<dyn StateProvider>,
+        simulation_cache: Arc<SharedSimulationCache>,
+    ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
+        let tasks: Vec<_> = new_groups
+            .into_iter()
+            .flat_map(|new_group| get_default_tasks_for_group(&new_group, TaskPriority::High))
+            .collect();
+
+        self.process_backtest_tasks(
+            tasks,
+            ctx,
+            state,
+            simulation_cache,
+            current_default_graph_study_collector(),
+        )
     }
 }

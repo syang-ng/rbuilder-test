@@ -314,7 +314,7 @@ where
     // Worker pool and conflict manager creation
     let setup_start = Instant::now();
 
-    let mut conflict_resolving_pool = ConflictResolvingPool::new(
+    let mut conflict_resolving_pool = ConflictResolvingPool::new_backtest(
         config.num_threads,
         Arc::clone(&task_queue),
         config.safe_sorting_only,
@@ -428,7 +428,7 @@ where
     // Worker pool and conflict manager creation
     let setup_start = Instant::now();
 
-    let mut conflict_resolving_pool = ConflictResolvingPool::new(
+    let mut conflict_resolving_pool = ConflictResolvingPool::new_backtest(
         config.num_threads,
         Arc::clone(&task_queue),
         config.safe_sorting_only,
