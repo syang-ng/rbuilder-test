@@ -1110,8 +1110,15 @@ fn sequence_parallelism_budget(sequence_count: usize, max_group_parallelism: usi
         return 1;
     }
 
-    let scaled_parallelism = (sequence_count / MIN_SEQUENCES_FOR_PARALLEL_EVAL).next_power_of_two();
-    scaled_parallelism.min(max_group_parallelism).max(1)
+    if sequence_count < 64 {
+        max_group_parallelism.min(4)
+    } else if sequence_count < 256 {
+        max_group_parallelism.min(8)
+    } else if sequence_count < 1024 {
+        max_group_parallelism.min(16)
+    } else {
+        max_group_parallelism
+    }
 }
 
 fn orders_conflict(left: &SimulatedOrder, right: &SimulatedOrder) -> bool {
