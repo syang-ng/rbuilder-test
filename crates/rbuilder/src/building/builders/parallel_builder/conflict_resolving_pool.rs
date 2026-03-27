@@ -11,9 +11,14 @@ use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
 use super::{
-    conflict_resolvers::ResolverContext, conflict_task_generator::get_tasks_for_group,
-    simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
-    ConflictTask, GroupId, ResolutionResult, TaskPriority,
+    conflict_resolvers::ResolverContext,
+    conflict_task_generator::{
+        current_default_graph_study_collector, get_default_tasks_for_group, get_tasks_for_group,
+        DefaultGraphStudyRecord,
+    },
+    simulation_cache::SharedSimulationCache,
+    ConflictGroup, ConflictResolutionResultPerGroup, ConflictTask, GroupId, ResolutionResult,
+    TaskPriority,
 };
 use crate::{building::BlockBuildingContext, provider::StateProviderFactory, utils::elapsed_ms};
 
@@ -82,6 +87,7 @@ where
                             block_state.clone(),
                             cancellation_token.clone(),
                             Arc::clone(&simulation_cache),
+                            None,
                         ) {
                             match group_result_sender.send((task_id, result)) {
                                 Ok(_) => {
@@ -115,12 +121,14 @@ where
         state: Arc<dyn StateProvider>,
         cancellation_token: CancellationToken,
         simulation_cache: Arc<SharedSimulationCache>,
+        graph_study_collector: Option<Arc<parking_lot::Mutex<Vec<DefaultGraphStudyRecord>>>>,
     ) -> Result<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut merging_context = ResolverContext::new(
             state,
             ctx.clone(),
             cancellation_token.clone(),
             simulation_cache,
+            graph_study_collector,
         );
         let task_id = task.group_idx;
         let task_group = task.group.clone();
@@ -170,6 +178,35 @@ where
                     state.clone(),
                     CancellationToken::new(),
                     simulation_cache,
+                    None,
+                );
+                if let Ok(result) = result {
+                    results.push(result);
+                }
+            }
+        }
+        results
+    }
+
+    pub fn process_groups_default_backtest(
+        &mut self,
+        new_groups: Vec<ConflictGroup>,
+        ctx: &BlockBuildingContext,
+        state: Arc<dyn StateProvider>,
+        simulation_cache: Arc<SharedSimulationCache>,
+    ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
+        let graph_study_collector = current_default_graph_study_collector();
+        let mut results = Vec::new();
+        for new_group in new_groups {
+            let tasks = get_default_tasks_for_group(&new_group, TaskPriority::High);
+            for task in tasks {
+                let result = Self::process_task(
+                    task,
+                    ctx,
+                    state.clone(),
+                    CancellationToken::new(),
+                    Arc::clone(&simulation_cache),
+                    graph_study_collector.clone(),
                 );
                 if let Ok(result) = result {
                     results.push(result);

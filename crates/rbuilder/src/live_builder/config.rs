@@ -19,7 +19,8 @@ use crate::{
         builders::{
             ordering_builder::{OrderingBuilderConfig, OrderingBuildingAlgorithm},
             parallel_builder::{
-                parallel_build_backtest, ParallelBuilderConfig, ParallelBuildingAlgorithm,
+                default_parallel_build_backtest, parallel_build_backtest, ParallelBuilderConfig,
+                ParallelBuildingAlgorithm,
             },
             BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
         },
@@ -99,6 +100,7 @@ pub const BID_SOURCE_WAIT_TIME_SECS: u64 = 2;
 pub enum SpecificBuilderConfig {
     ParallelBuilder(ParallelBuilderConfig),
     OrderingBuilder(OrderingBuilderConfig),
+    DefaultBuilder(ParallelBuilderConfig),
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -603,6 +605,9 @@ impl LiveBuilderConfig for Config {
             SpecificBuilderConfig::ParallelBuilder(config) => {
                 parallel_build_backtest::<P>(input, config)
             }
+            SpecificBuilderConfig::DefaultBuilder(config) => {
+                default_parallel_build_backtest::<P>(input, config)
+            }
         }
     }
 }
@@ -846,6 +851,13 @@ where
         SpecificBuilderConfig::ParallelBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(
                 parallel_cfg,
+                max_order_execution_duration_warning,
+                cfg.name,
+            ))
+        }
+        SpecificBuilderConfig::DefaultBuilder(default_cfg) => {
+            Arc::new(ParallelBuildingAlgorithm::new(
+                default_cfg,
                 max_order_execution_duration_warning,
                 cfg.name,
             ))

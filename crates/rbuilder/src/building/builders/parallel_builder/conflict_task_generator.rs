@@ -6,6 +6,11 @@ use rbuilder_primitives::SimulatedOrder;
 use std::{sync::Arc, time::Instant};
 use tracing::trace;
 
+pub(crate) use super::default_helper::{
+    current_default_graph_study_collector, get_default_tasks_for_group,
+    set_default_graph_study_capture_enabled, start_default_graph_study_capture,
+    take_default_graph_study_records, update_default_graph_study_record, DefaultGraphStudyRecord,
+};
 use super::{
     task::ConflictTask, Algorithm, ConflictGroup, ConflictResolutionResultPerGroup, GroupId,
     ResolutionResult, TaskPriority, TaskQueue,
@@ -284,7 +289,7 @@ impl ConflictTaskGenerator {
         orders
             .iter()
             .map(|o| o.sim_value.full_profit_info().coinbase_profit())
-            .sorted_by(|a, b| b.cmp(a))
+            .sorted_by(|a: &U256, b: &U256| b.cmp(a))
             .take(n)
             .sum()
     }

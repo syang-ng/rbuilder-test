@@ -1,7 +1,14 @@
 use crate::{
     backtest::BlockData,
     building::{
-        builders::BacktestSimulateBlockInput, sim::simulate_all_orders_with_sim_tree,
+        builders::{
+            parallel_builder::conflict_task_generator::{
+                start_default_graph_study_capture, take_default_graph_study_records,
+                DefaultGraphStudyRecord,
+            },
+            BacktestSimulateBlockInput,
+        },
+        sim::simulate_all_orders_with_sim_tree,
         BlockBuildingContext, BundleErr, NullPartialBlockExecutionTracer, OrderErr, TransactionErr,
     },
     live_builder::{block_list_provider::BlockList, cli::LiveBuilderConfig},
@@ -17,7 +24,7 @@ use std::sync::Arc;
 
 use super::OrdersWithTimestamp;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BacktestBuilderOutput {
     pub orders_included: usize,
     pub builder_name: String,
@@ -26,10 +33,12 @@ pub struct BacktestBuilderOutput {
     pub included_orders: Vec<OrderId>,
     #[serde(default)]
     pub included_order_profits: Vec<U256>,
+    #[serde(default)]
+    pub graph_study_records: Vec<DefaultGraphStudyRecord>,
 }
 
 /// Result of a backtest simulation usually stored for later comparison
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BlockBacktestValue {
     pub block_number: u64,
     /// mev boost bid trace value of the winning bid
@@ -201,11 +210,13 @@ where
             provider: provider.clone(),
         };
 
+        start_default_graph_study_capture();
         let block = config.build_backtest_block(
             &building_algorithm_name,
             input,
             NullPartialBlockExecutionTracer {},
         )?;
+        let graph_study_records = take_default_graph_study_records();
         builder_outputs.push(BacktestBuilderOutput {
             orders_included: block.trace.included_orders.len(),
             builder_name: building_algorithm_name,
@@ -222,6 +233,7 @@ where
                 .iter()
                 .map(|o| o.coinbase_profit)
                 .collect(),
+            graph_study_records,
         });
     }
 
