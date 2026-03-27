@@ -19,6 +19,7 @@ use crate::{
     },
     live_builder::cli::LiveBuilderConfig,
     provider::StateProviderFactory,
+    utils::elapsed_ms,
 };
 use clap::Parser;
 use rbuilder_primitives::{order_statistics::OrderStatistics, Order, OrderId, SimulatedOrder};
@@ -84,11 +85,17 @@ where
     ProviderType: StateProviderFactory + Clone + 'static,
     OrdersSourceType: OrdersSource<ConfigType, ProviderType>,
 {
+    let total_start = Instant::now();
+    let mut step_start = Instant::now();
     let ctx = orders_source.create_block_building_context()?;
+    print_backtest_timing("create_block_building_context", step_start, total_start);
 
+    step_start = Instant::now();
     let config = orders_source.config();
     config.base_config().setup_tracing_subscriber()?;
+    print_backtest_timing("setup_tracing_subscriber", step_start, total_start);
 
+    step_start = Instant::now();
     let available_orders = orders_source.available_orders();
     let mut order_statistics = OrderStatistics::new();
     for order in &available_orders {
@@ -98,25 +105,35 @@ where
     println!("Available orders: {}", available_orders.len());
     println!("Available orders: {}", available_orders.len());
     println!("Order statistics: {order_statistics:?}");
+    print_backtest_timing("load_available_orders", step_start, total_start);
 
+    step_start = Instant::now();
     let provider_factory = orders_source.create_provider_factory()?;
     orders_source.print_custom_stats(provider_factory.clone())?;
+    print_backtest_timing("create_provider_and_stats", step_start, total_start);
 
+    step_start = Instant::now();
     let BacktestBlockInput { sim_orders, .. } = backtest_prepare_orders_from_building_context(
         ctx.clone(),
         available_orders.clone(),
         provider_factory.clone(),
     )?;
+    print_backtest_timing("simulate_available_orders", step_start, total_start);
 
     if let Some(tx_hash) = build_block_cfg.show_tx_extra_data {
+        step_start = Instant::now();
         print_orders_with_tx_hash(tx_hash, &available_orders, &sim_orders);
+        print_backtest_timing("show_tx_extra_data", step_start, total_start);
     }
 
     if build_block_cfg.show_orders {
+        step_start = Instant::now();
         print_order_and_timestamp(&available_orders, orders_source.block_time_as_unix_ms());
+        print_backtest_timing("show_orders", step_start, total_start);
     }
 
     if build_block_cfg.show_sim {
+        step_start = Instant::now();
         let order_and_timestamp: HashMap<OrderId, u64> = available_orders
             .iter()
             .map(|order| (order.order.id(), order.timestamp_ms))
@@ -126,13 +143,23 @@ where
             &order_and_timestamp,
             orders_source.block_time_as_unix_ms(),
         );
+        print_backtest_timing("show_sim", step_start, total_start);
     }
 
     if !build_block_cfg.no_block_building {
+        println!(
+            "[backtest-build-block] start_block_building total_elapsed_ms={:.2}",
+            elapsed_ms(total_start)
+        );
         let winning_builder = build_block_cfg
             .builders
             .iter()
             .filter_map(|builder_name: &String| {
+                println!(
+                    "[backtest-build-block] start_builder builder={} total_elapsed_ms={:.2}",
+                    builder_name,
+                    elapsed_ms(total_start)
+                );
                 let input = BacktestSimulateBlockInput {
                     ctx: ctx.clone(),
                     builder_name: builder_name.clone(),
@@ -171,6 +198,12 @@ where
                 println!("Builder profit: {}", format_ether(block.trace.bid_value));
                 println!("Builder time:   {} ms", build_time_ms);
                 println!(
+                    "[backtest-build-block] finish_builder builder={} build_time_ms={} total_elapsed_ms={:.2}",
+                    builder_name,
+                    build_time_ms,
+                    elapsed_ms(total_start)
+                );
+                println!(
                     "Number of used orders: {}",
                     block.trace.included_orders.len()
                 );
@@ -188,7 +221,21 @@ where
         }
     }
 
+    println!(
+        "[backtest-build-block] done total_elapsed_ms={:.2}",
+        elapsed_ms(total_start)
+    );
+
     Ok(())
+}
+
+fn print_backtest_timing(step: &str, step_start: Instant, total_start: Instant) {
+    println!(
+        "[backtest-build-block] step={} step_ms={:.2} total_elapsed_ms={:.2}",
+        step,
+        elapsed_ms(step_start),
+        elapsed_ms(total_start)
+    );
 }
 
 fn print_order(order: &Order) {
