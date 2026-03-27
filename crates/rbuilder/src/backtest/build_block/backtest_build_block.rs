@@ -14,8 +14,14 @@ use crate::{
         OrdersWithTimestamp,
     },
     building::{
-        builders::BacktestSimulateBlockInput, BlockBuildingContext, ExecutionResult,
-        NullPartialBlockExecutionTracer,
+        builders::{
+            parallel_builder::conflict_task_generator::{
+                set_default_graph_study_capture_enabled, start_default_graph_study_capture,
+                take_default_graph_study_records, DefaultGraphStudyRecord,
+            },
+            BacktestSimulateBlockInput,
+        },
+        BlockBuildingContext, ExecutionResult, NullPartialBlockExecutionTracer,
     },
     live_builder::cli::LiveBuilderConfig,
     provider::StateProviderFactory,
@@ -23,7 +29,13 @@ use crate::{
 };
 use clap::Parser;
 use rbuilder_primitives::{order_statistics::OrderStatistics, Order, OrderId, SimulatedOrder};
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{
+    fs::File,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 #[derive(Parser, Debug)]
 pub struct BuildBlockCfg {
@@ -51,6 +63,11 @@ pub struct BuildBlockCfg {
         help = "Shows any order and sim order containing this tx hash. Example: --show-tx-extra-data 0x4905f253e997236afecddb080e38028227b083c4d9921209df7fda192f0ec428"
     )]
     pub show_tx_extra_data: Option<TxHash>,
+    #[clap(
+        long,
+        help = "Path to csv file to write default builder graph-study output to"
+    )]
+    pub graph_stats_csv: Option<PathBuf>,
 }
 
 /// Provides all the orders needed to simulate the construction of a block.
@@ -94,6 +111,15 @@ where
     let config = orders_source.config();
     config.base_config().setup_tracing_subscriber()?;
     print_backtest_timing("setup_tracing_subscriber", step_start, total_start);
+
+    let mut graph_stats_csv_output = if let Some(path) = &build_block_cfg.graph_stats_csv {
+        let mut graph_stats_csv_output = GraphStatsCSVWriter::new(path)?;
+        graph_stats_csv_output.write_header()?;
+        Some(graph_stats_csv_output)
+    } else {
+        None
+    };
+    set_default_graph_study_capture_enabled(graph_stats_csv_output.is_some());
 
     step_start = Instant::now();
     let available_orders = orders_source.available_orders();
@@ -166,6 +192,7 @@ where
                     sim_orders: &sim_orders,
                     provider: provider_factory.clone(),
                 };
+                start_default_graph_study_capture();
                 let build_res = if build_block_cfg.trace_block_building {
                     let build_start = Instant::now();
                     let build_res = config.build_backtest_block(
@@ -186,6 +213,18 @@ where
                     (build_res, build_time_ms)
                 };
                 let (build_res, build_time_ms) = build_res;
+                let graph_study_records = take_default_graph_study_records();
+                if let Some(graph_stats_csv_output) = &mut graph_stats_csv_output {
+                    if let Err(err) = graph_stats_csv_output.write_builder_records(
+                        ctx.block(),
+                        builder_name,
+                        &graph_study_records,
+                    ) {
+                        println!(
+                            "Failed to write graph-study csv for builder {builder_name}: {err:?}"
+                        );
+                    }
+                }
                 if let Err(err) = &build_res {
                     println!("Error building block: {err:?}");
                     return None;
@@ -236,6 +275,65 @@ fn print_backtest_timing(step: &str, step_start: Instant, total_start: Instant) 
         elapsed_ms(step_start),
         elapsed_ms(total_start)
     );
+}
+
+#[derive(Debug)]
+struct GraphStatsCSVWriter {
+    file: File,
+}
+
+impl GraphStatsCSVWriter {
+    fn new(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        Ok(Self { file })
+    }
+
+    fn write_header(&mut self) -> io::Result<()> {
+        writeln!(
+            self.file,
+            "block_number,builder_name,group_id,algorithm,original_order_count,selected_order_count,edge_count,density,max_degree,has_missing_traces,orientation_eligible,random_task_added,candidate_sequence_count,best_profit"
+        )?;
+        self.file.flush()
+    }
+
+    fn write_builder_records(
+        &mut self,
+        block_number: u64,
+        builder_name: &str,
+        records: &[DefaultGraphStudyRecord],
+    ) -> io::Result<()> {
+        for record in records {
+            writeln!(
+                self.file,
+                "{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{}",
+                block_number,
+                builder_name,
+                record.group_id,
+                record.algorithm,
+                record.original_order_count,
+                record.selected_order_count,
+                record.edge_count,
+                record.density,
+                record.max_degree,
+                record.has_missing_traces,
+                record.orientation_eligible,
+                record.random_task_added,
+                record
+                    .candidate_sequence_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .best_profit
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            )?;
+        }
+        self.file.flush()
+    }
 }
 
 fn print_order(order: &Order) {
