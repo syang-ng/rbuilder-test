@@ -9,7 +9,10 @@ use eyre::Context;
 use jsonrpsee::RpcModule;
 use rbuilder::{
     building::{
-        builders::{parallel_builder::parallel_build_backtest, BacktestSimulateBlockInput, Block},
+        builders::{
+            parallel_builder::{default_parallel_build_backtest, parallel_build_backtest},
+            BacktestSimulateBlockInput, Block,
+        },
         journal::{NullOrderJournalObserverFactory, OrderJournalObserverFactory},
         order_priority::{FullProfitInfoGetter, NonMempoolProfitInfoGetter},
         BuiltBlockTrace, PartialBlockExecutionTracer,
@@ -276,6 +279,9 @@ impl LiveBuilderConfig for FlashbotsConfig {
             }
             SpecificBuilderConfig::ParallelBuilder(config) => {
                 parallel_build_backtest::<P>(input, config)
+            }
+            SpecificBuilderConfig::DefaultBuilder(config) => {
+                default_parallel_build_backtest::<P>(input, config)
             }
         }
     }
