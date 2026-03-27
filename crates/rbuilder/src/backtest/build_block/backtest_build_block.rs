@@ -22,7 +22,7 @@ use crate::{
 };
 use clap::Parser;
 use rbuilder_primitives::{order_statistics::OrderStatistics, Order, OrderId, SimulatedOrder};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 #[derive(Parser, Debug)]
 pub struct BuildBlockCfg {
@@ -140,16 +140,25 @@ where
                     provider: provider_factory.clone(),
                 };
                 let build_res = if build_block_cfg.trace_block_building {
-                    config.build_backtest_block(
-                    builder_name,
-                    input,
-                    crate::backtest::build_block::full_partial_block_execution_tracer::FullPartialBlockExecutionTracer::new())
+                    let build_start = Instant::now();
+                    let build_res = config.build_backtest_block(
+                        builder_name,
+                        input,
+                        crate::backtest::build_block::full_partial_block_execution_tracer::FullPartialBlockExecutionTracer::new(),
+                    );
+                    let build_time_ms = build_start.elapsed().as_millis() as u64;
+                    (build_res, build_time_ms)
                 } else {
-                    config.build_backtest_block(
-                    builder_name,
-                    input,
-                    NullPartialBlockExecutionTracer{})
+                    let build_start = Instant::now();
+                    let build_res = config.build_backtest_block(
+                        builder_name,
+                        input,
+                        NullPartialBlockExecutionTracer {},
+                    );
+                    let build_time_ms = build_start.elapsed().as_millis() as u64;
+                    (build_res, build_time_ms)
                 };
+                let (build_res, build_time_ms) = build_res;
                 if let Err(err) = &build_res {
                     println!("Error building block: {err:?}");
                     return None;
@@ -160,6 +169,7 @@ where
                     ctx.block()
                 );
                 println!("Builder profit: {}", format_ether(block.trace.bid_value));
+                println!("Builder time:   {} ms", build_time_ms);
                 println!(
                     "Number of used orders: {}",
                     block.trace.included_orders.len()

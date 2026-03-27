@@ -277,10 +277,11 @@ fn print_backtest_value(mut output: BlockBacktestValue) {
     println!("bid_val:     {}", format_ether(output.winning_bid_value));
     if let Some(best_b) = output.builder_outputs.first() {
         println!(
-            "best_bldr:   {} {} {}",
+            "best_bldr:   {} {} {} {}ms",
             format_ether(best_b.our_bid_value),
             best_b.orders_included,
-            best_b.builder_name
+            best_b.builder_name,
+            best_b.build_time_ms
         );
     }
     println!("won_by:      {}", output.extra_data);
@@ -293,10 +294,11 @@ fn print_backtest_value(mut output: BlockBacktestValue) {
     );
     for b in output.builder_outputs {
         println!(
-            "  bldr:  {} {} {}",
+            "  bldr:  {} {} {} {}ms",
             format_ether(b.our_bid_value),
             b.orders_included,
-            b.builder_name
+            b.builder_name,
+            b.build_time_ms
         );
     }
 
@@ -361,6 +363,20 @@ fn print_backtest_value_diff(stored: &StoredBacktestResult, output: &BlockBackte
             format_ether(profit_stored)
         );
     }
+    for builder in &output.builder_outputs {
+        if let Some(stored_builder) = stored
+            .builder_outputs
+            .iter()
+            .find(|stored_builder| stored_builder.builder_name == builder.builder_name)
+        {
+            if stored_builder.build_time_ms != builder.build_time_ms {
+                println!(
+                    "diff in {} build_time_ms: {} -> {}",
+                    builder.builder_name, stored_builder.build_time_ms, builder.build_time_ms
+                );
+            }
+        }
+    }
     println!()
 }
 
@@ -388,6 +404,7 @@ impl CSVResultWriter {
         line.push_str("block_number,winning_bid_value,simulated_orders_count");
         for builder_name in &self.builder_names {
             line.push_str(&format!(",{builder_name}"));
+            line.push_str(&format!(",{builder_name}_build_time_ms"));
         }
         writeln!(self.file, "{line}")?;
         self.file.flush()
@@ -402,13 +419,17 @@ impl CSVResultWriter {
             value.simulated_orders_count
         ));
         for builder in &self.builder_names {
-            let builder_res = value
+            let builder_output = value
                 .builder_outputs
                 .iter()
-                .find(|b| b.builder_name == *builder)
-                .map(|b| b.our_bid_value)
-                .unwrap_or_default();
-            line.push_str(&format!(",{}", format_ether(builder_res)));
+                .find(|b| b.builder_name == *builder);
+            let builder_res = builder_output.map(|b| b.our_bid_value).unwrap_or_default();
+            let builder_time_ms = builder_output.map(|b| b.build_time_ms).unwrap_or_default();
+            line.push_str(&format!(
+                ",{},{}",
+                format_ether(builder_res),
+                builder_time_ms
+            ));
         }
         writeln!(self.file, "{line}")?;
         self.file.flush()

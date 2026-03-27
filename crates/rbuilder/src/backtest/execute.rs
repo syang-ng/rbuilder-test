@@ -20,7 +20,7 @@ use alloy_primitives::U256;
 use rbuilder_primitives::{Order, OrderId, SimulatedOrder};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use super::OrdersWithTimestamp;
 
@@ -29,6 +29,8 @@ pub struct BacktestBuilderOutput {
     pub orders_included: usize,
     pub builder_name: String,
     pub our_bid_value: U256,
+    #[serde(default)]
+    pub build_time_ms: u64,
     #[serde(default)]
     pub included_orders: Vec<OrderId>,
     #[serde(default)]
@@ -211,16 +213,19 @@ where
         };
 
         start_default_graph_study_capture();
+        let build_start = Instant::now();
         let block = config.build_backtest_block(
             &building_algorithm_name,
             input,
             NullPartialBlockExecutionTracer {},
         )?;
+        let build_time_ms = build_start.elapsed().as_millis() as u64;
         let graph_study_records = take_default_graph_study_records();
         builder_outputs.push(BacktestBuilderOutput {
             orders_included: block.trace.included_orders.len(),
             builder_name: building_algorithm_name,
             our_bid_value: block.trace.bid_value,
+            build_time_ms,
             included_orders: block
                 .trace
                 .included_orders

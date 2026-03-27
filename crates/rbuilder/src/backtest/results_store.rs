@@ -181,6 +181,7 @@ mod tests {
                 orders_included: 7,
                 builder_name: "builder".to_string(),
                 our_bid_value: u256(19),
+                build_time_ms: 42,
                 included_orders: vec![order_id(1)],
                 included_order_profits: vec![u256(100)],
                 graph_study_records: Vec::new(),
