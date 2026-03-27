@@ -4,6 +4,7 @@ use derivative::Derivative;
 use eyre::Result;
 use itertools::Itertools;
 use rand::{seq::SliceRandom, SeedableRng};
+use rayon::prelude::*;
 use reth::providers::StateProvider;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -148,10 +149,48 @@ impl ResolverContext {
             sequence_of_orders: vec![],
         };
 
-        for sequence_of_orders in sequence_to_try {
-            let (resolution_result, _state) =
-                self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone())?;
-            self.update_best_result(resolution_result, &mut best_resolution_result);
+        if sequence_to_try.len() <= 1 {
+            for sequence_of_orders in sequence_to_try {
+                let (resolution_result, _state) =
+                    self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone())?;
+                self.update_best_result(resolution_result, &mut best_resolution_result);
+            }
+        } else {
+            let state = Arc::clone(&self.state);
+            let ctx = self.ctx.clone();
+            let cancellation_token = self.cancellation_token.clone();
+            let simulation_cache = Arc::clone(&self.simulation_cache);
+
+            let best_parallel_result = sequence_to_try
+                .into_par_iter()
+                .map(|sequence_of_orders| {
+                    let mut resolver_ctx = ResolverContext::new(
+                        Arc::clone(&state),
+                        ctx.clone(),
+                        cancellation_token.clone(),
+                        Arc::clone(&simulation_cache),
+                        None,
+                    );
+                    resolver_ctx
+                        .process_sequence_of_orders(
+                            sequence_of_orders,
+                            &task,
+                            Arc::clone(&resolver_ctx.state),
+                        )
+                        .map(|(resolution_result, _state)| resolution_result)
+                })
+                .try_reduce_with(|left, right| {
+                    Ok(if left.total_profit >= right.total_profit {
+                        left
+                    } else {
+                        right
+                    })
+                })
+                .transpose()?;
+
+            if let Some(best_parallel_result) = best_parallel_result {
+                self.update_best_result(best_parallel_result, &mut best_resolution_result);
+            }
         }
 
         trace!(
