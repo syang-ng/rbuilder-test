@@ -1,4 +1,4 @@
-use ahash::{HashMap, HashSet};
+use ahash::HashMap;
 use alloy_primitives::{Address, U256};
 use derivative::Derivative;
 use eyre::Result;
@@ -22,8 +22,6 @@ use crate::building::{
 };
 use rbuilder_primitives::{evm_inspector::UsedStateTrace, OrderId, SimulatedOrder};
 
-const MAX_ORIENTATION_SEARCH_NODES: usize = 16;
-
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ConflictGraphStats {
     pub edge_count: usize,
@@ -32,10 +30,13 @@ pub(crate) struct ConflictGraphStats {
     pub has_missing_traces: bool,
 }
 
+const MIN_LENGTH_FOR_RECURSIVE_DEFAULT: usize = 8;
+const RECURSIVE_DEFAULT_SEED_COUNT: usize = MIN_LENGTH_FOR_RECURSIVE_DEFAULT - 1;
+const RECURSIVE_DEFAULT_SAMPLE_SEED: u64 = 0x06511;
+
 #[derive(Debug, Clone)]
-struct OrientationProblem {
-    hard_precedence: Vec<u32>,
-    soft_conflicts: Vec<(usize, usize)>,
+struct InteractionGraph {
+    neighbors: Vec<Vec<usize>>,
 }
 
 pub(crate) fn analyze_conflict_graph(orders: &[Arc<SimulatedOrder>]) -> ConflictGraphStats {
@@ -133,17 +134,49 @@ impl ResolverContext {
             task.algorithm
         );
 
-        let sequence_to_try = generate_sequences_of_orders_to_try(&task);
+        let (best_resolution_result, candidate_sequence_count) =
+            if matches!(task.algorithm, Algorithm::RecursiveDefault) {
+                self.resolve_recursive_default_task(&task)?
+            } else {
+                let sequence_to_try = generate_sequences_of_orders_to_try(&task);
+                let best_resolution_result =
+                    self.evaluate_sequences_for_task(&task, sequence_to_try.clone())?;
+                (best_resolution_result, sequence_to_try.len())
+            };
+
         if let Some(collector) = &self.graph_study_collector {
             update_default_graph_study_record(
                 collector,
                 task.group.id,
                 task.algorithm,
-                Some(sequence_to_try.len()),
+                Some(candidate_sequence_count),
                 None,
             );
         }
 
+        trace!(
+            "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
+            task.group.id,
+            best_resolution_result.total_profit,
+            task.algorithm
+        );
+        if let Some(collector) = &self.graph_study_collector {
+            update_default_graph_study_record(
+                collector,
+                task.group.id,
+                task.algorithm,
+                None,
+                Some(best_resolution_result.total_profit),
+            );
+        }
+        Ok(best_resolution_result)
+    }
+
+    fn evaluate_sequences_for_task(
+        &mut self,
+        task: &ConflictTask,
+        sequence_to_try: Vec<Vec<usize>>,
+    ) -> Result<ResolutionResult> {
         let mut best_resolution_result = ResolutionResult {
             total_profit: U256::ZERO,
             sequence_of_orders: vec![],
@@ -152,7 +185,7 @@ impl ResolverContext {
         if sequence_to_try.len() <= 1 {
             for sequence_of_orders in sequence_to_try {
                 let (resolution_result, _state) =
-                    self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone())?;
+                    self.process_sequence_of_orders(sequence_of_orders, task, self.state.clone())?;
                 self.update_best_result(resolution_result, &mut best_resolution_result);
             }
         } else {
@@ -174,7 +207,7 @@ impl ResolverContext {
                     resolver_ctx
                         .process_sequence_of_orders(
                             sequence_of_orders,
-                            &task,
+                            task,
                             Arc::clone(&resolver_ctx.state),
                         )
                         .map(|(resolution_result, _state)| resolution_result)
@@ -193,22 +226,53 @@ impl ResolverContext {
             }
         }
 
-        trace!(
-            "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
-            task.group.id,
-            best_resolution_result.total_profit,
-            task.algorithm
-        );
-        if let Some(collector) = &self.graph_study_collector {
-            update_default_graph_study_record(
-                collector,
-                task.group.id,
-                task.algorithm,
-                None,
-                Some(best_resolution_result.total_profit),
-            );
-        }
         Ok(best_resolution_result)
+    }
+
+    fn resolve_recursive_default_task(
+        &mut self,
+        task: &ConflictTask,
+    ) -> Result<(ResolutionResult, usize)> {
+        let orders = task.group.orders.as_ref();
+        let interaction_graph = build_interaction_graph(orders);
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(RECURSIVE_DEFAULT_SAMPLE_SEED);
+        let indices = (0..orders.len()).collect::<Vec<_>>();
+
+        let mut solve_small = |subproblem_indices: &[usize]| {
+            self.solve_small_recursive_default_subproblem(task, subproblem_indices)
+        };
+
+        let (sequence_of_orders, mut candidate_sequence_count) =
+            solve_recursive_default_indices_with_solver(
+                &interaction_graph,
+                &indices,
+                &mut rng,
+                &mut solve_small,
+            )?;
+
+        let (resolution_result, _state) =
+            self.process_sequence_of_orders(sequence_of_orders, task, self.state.clone())?;
+        candidate_sequence_count += 1;
+        Ok((resolution_result, candidate_sequence_count))
+    }
+
+    fn solve_small_recursive_default_subproblem(
+        &mut self,
+        root_task: &ConflictTask,
+        indices: &[usize],
+    ) -> Result<(Vec<usize>, usize)> {
+        if indices.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let subtask = create_recursive_subtask(root_task, indices);
+        let candidate_sequences = generate_all_permutations_with_nonces(&subtask);
+        let candidate_sequence_count = candidate_sequences.len();
+        let best_result = self.evaluate_sequences_for_task(&subtask, candidate_sequences)?;
+        Ok((
+            remap_resolution_result_indices(&best_result, indices),
+            candidate_sequence_count,
+        ))
     }
 
     /// Updates the best result if a better one is found.
@@ -439,9 +503,11 @@ fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize>> {
         Algorithm::ReverseGreedy => generate_greedy_sequence(task, true),
         Algorithm::Length => generate_length_based_sequence(task),
         Algorithm::AllPermutations => generate_all_permutations(task),
+        Algorithm::RecursiveDefault => {
+            unreachable!("RecursiveDefault is handled directly in ResolverContext")
+        }
         Algorithm::Random { seed, count } => generate_random_permutations(task, seed, count),
         Algorithm::PermutationsWithNonces => generate_all_permutations_with_nonces(task),
-        Algorithm::OrientationSearch => generate_orientation_search_sequences(task),
         Algorithm::BestOfN => analyze_group_conflicts_and_find_best(task), // BestOfN implementation
     }
 }
@@ -489,35 +555,213 @@ fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
         .collect()
 }
 
-fn generate_orientation_search_sequences(task: &ConflictTask) -> Vec<Vec<usize>> {
-    let order_group = &task.group;
-    if order_group.orders.len() <= 1 {
-        return vec![(0..order_group.orders.len()).collect()];
+fn solve_recursive_default_indices_with_solver<F>(
+    interaction_graph: &InteractionGraph,
+    indices: &[usize],
+    rng: &mut rand::rngs::SmallRng,
+    solve_small: &mut F,
+) -> Result<(Vec<usize>, usize)>
+where
+    F: FnMut(&[usize]) -> Result<(Vec<usize>, usize)>,
+{
+    if indices.is_empty() {
+        return Ok((Vec::new(), 0));
     }
 
-    let Some(problem) = build_orientation_problem(order_group.orders.as_ref()) else {
-        return generate_all_permutations_with_nonces(task);
-    };
-
-    let n = order_group.orders.len();
-    let mut reach = problem.hard_precedence;
-    let mut sequences = Vec::new();
-    let mut seen = HashSet::default();
-
-    enumerate_orientations(
-        n,
-        &problem.soft_conflicts,
-        0,
-        &mut reach,
-        &mut seen,
-        &mut sequences,
-    );
-
-    if sequences.is_empty() {
-        generate_all_permutations_with_nonces(task)
-    } else {
-        sequences
+    if indices.len() < MIN_LENGTH_FOR_RECURSIVE_DEFAULT {
+        return solve_small(indices);
     }
+
+    let seed_indices = sample_seed_indices(indices, rng);
+    solve_recursive_default_from_seed_indices_with_solver(
+        interaction_graph,
+        indices,
+        &seed_indices,
+        rng,
+        solve_small,
+    )
+}
+
+fn solve_recursive_default_from_seed_indices_with_solver<F>(
+    interaction_graph: &InteractionGraph,
+    indices: &[usize],
+    seed_indices: &[usize],
+    rng: &mut rand::rngs::SmallRng,
+    solve_small: &mut F,
+) -> Result<(Vec<usize>, usize)>
+where
+    F: FnMut(&[usize]) -> Result<(Vec<usize>, usize)>,
+{
+    let residual_components =
+        partition_residual_components(indices, &seed_indices, interaction_graph);
+    let (mut sequence, mut candidate_sequence_count) = solve_small(seed_indices)?;
+
+    for component in residual_components {
+        let (component_sequence, component_candidate_count) =
+            solve_recursive_default_indices_with_solver(
+                interaction_graph,
+                &component,
+                rng,
+                solve_small,
+            )?;
+        sequence.extend(component_sequence);
+        candidate_sequence_count += component_candidate_count;
+    }
+
+    Ok((sequence, candidate_sequence_count))
+}
+
+fn sample_seed_indices(indices: &[usize], rng: &mut rand::rngs::SmallRng) -> Vec<usize> {
+    let sample_size = RECURSIVE_DEFAULT_SEED_COUNT.min(indices.len());
+    indices
+        .choose_multiple(rng, sample_size)
+        .copied()
+        .collect::<Vec<_>>()
+}
+
+fn partition_residual_components(
+    indices: &[usize],
+    seed_indices: &[usize],
+    interaction_graph: &InteractionGraph,
+) -> Vec<Vec<usize>> {
+    let mut is_seed = vec![false; interaction_graph.neighbors.len()];
+    for &seed_idx in seed_indices {
+        is_seed[seed_idx] = true;
+    }
+
+    let residual_indices = indices
+        .iter()
+        .copied()
+        .filter(|idx| {
+            !is_seed[*idx]
+                && seed_indices
+                    .iter()
+                    .all(|seed_idx| !interaction_graph.has_edge(*idx, *seed_idx))
+        })
+        .collect::<Vec<_>>();
+
+    connected_components(&residual_indices, interaction_graph)
+}
+
+fn connected_components(
+    indices: &[usize],
+    interaction_graph: &InteractionGraph,
+) -> Vec<Vec<usize>> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut in_subproblem = vec![false; interaction_graph.neighbors.len()];
+    for &idx in indices {
+        in_subproblem[idx] = true;
+    }
+
+    let mut visited = vec![false; interaction_graph.neighbors.len()];
+    let mut components = Vec::new();
+
+    for &start_idx in indices {
+        if visited[start_idx] {
+            continue;
+        }
+
+        let mut stack = vec![start_idx];
+        let mut component = Vec::new();
+        visited[start_idx] = true;
+
+        while let Some(node_idx) = stack.pop() {
+            component.push(node_idx);
+            for &neighbor_idx in &interaction_graph.neighbors[node_idx] {
+                if in_subproblem[neighbor_idx] && !visited[neighbor_idx] {
+                    visited[neighbor_idx] = true;
+                    stack.push(neighbor_idx);
+                }
+            }
+        }
+
+        component.sort_unstable();
+        components.push(component);
+    }
+
+    components.sort_by_key(|component| component[0]);
+    components
+}
+
+fn build_interaction_graph(orders: &[Arc<SimulatedOrder>]) -> InteractionGraph {
+    let node_count = orders.len();
+    let mut neighbors = vec![Vec::new(); node_count];
+
+    for left in 0..node_count {
+        for right in (left + 1)..node_count {
+            if orders_conflict(&orders[left], &orders[right]) {
+                add_interaction_edge(&mut neighbors, left, right);
+            }
+        }
+    }
+
+    let mut nonce_to_node_map: HashMap<(Address, u64), usize> = HashMap::default();
+    for (idx, order) in orders.iter().enumerate() {
+        for nonce in order.nonces() {
+            nonce_to_node_map.insert((nonce.address, nonce.nonce), idx);
+        }
+    }
+
+    for (idx, order) in orders.iter().enumerate() {
+        for nonce in order.nonces() {
+            if nonce.nonce == 0 {
+                continue;
+            }
+
+            if let Some(&prev_idx) = nonce_to_node_map.get(&(nonce.address, nonce.nonce - 1)) {
+                if prev_idx != idx {
+                    add_interaction_edge(&mut neighbors, prev_idx, idx);
+                }
+            }
+        }
+    }
+
+    InteractionGraph { neighbors }
+}
+
+fn add_interaction_edge(neighbors: &mut [Vec<usize>], left: usize, right: usize) {
+    if !neighbors[left].contains(&right) {
+        neighbors[left].push(right);
+    }
+    if !neighbors[right].contains(&left) {
+        neighbors[right].push(left);
+    }
+}
+
+impl InteractionGraph {
+    fn has_edge(&self, left: usize, right: usize) -> bool {
+        self.neighbors[left].contains(&right)
+    }
+}
+
+fn create_recursive_subtask(root_task: &ConflictTask, indices: &[usize]) -> ConflictTask {
+    let orders = indices
+        .iter()
+        .map(|&idx| root_task.group.orders[idx].clone())
+        .collect::<Vec<_>>();
+
+    ConflictTask {
+        group_idx: root_task.group_idx,
+        algorithm: Algorithm::PermutationsWithNonces,
+        priority: root_task.priority,
+        group: super::ConflictGroup {
+            id: root_task.group.id,
+            orders: Arc::new(orders),
+            conflicting_group_ids: root_task.group.conflicting_group_ids.clone(),
+        },
+        created_at: root_task.created_at,
+    }
+}
+
+fn remap_resolution_result_indices(result: &ResolutionResult, indices: &[usize]) -> Vec<usize> {
+    result
+        .sequence_of_orders
+        .iter()
+        .map(|(local_idx, _)| indices[*local_idx])
+        .collect()
 }
 
 /// Generates static sequences of order indices based on gas price and coinbase profit.
@@ -663,11 +907,16 @@ fn analyze_group_conflicts_and_find_best(task: &ConflictTask) -> Vec<Vec<usize>>
 }
 
 fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>> {
-    let order_group = &task.group;
-    let node_count = order_group.orders.len();
+    generate_all_permutations_with_nonces_for_orders(task.group.orders.as_ref())
+}
+
+fn generate_all_permutations_with_nonces_for_orders(
+    orders: &[Arc<SimulatedOrder>],
+) -> Vec<Vec<usize>> {
+    let node_count = orders.len();
     let mut nonce_to_node_map: HashMap<(Address, u64), usize> = HashMap::default();
 
-    for (original_order_idx, order_arc) in order_group.orders.iter().enumerate() {
+    for (original_order_idx, order_arc) in orders.iter().enumerate() {
         for nonce in order_arc.nonces() {
             nonce_to_node_map.insert((nonce.address, nonce.nonce), original_order_idx);
         }
@@ -676,7 +925,7 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
     let mut successors = vec![Vec::new(); node_count];
     let mut in_degrees = vec![0usize; node_count];
 
-    for (order_i_original_idx, order_i_arc) in order_group.orders.iter().enumerate() {
+    for (order_i_original_idx, order_i_arc) in orders.iter().enumerate() {
         for nonce_i in order_i_arc.nonces() {
             if nonce_i.nonce == 0 {
                 continue;
@@ -708,223 +957,7 @@ fn generate_all_permutations_with_nonces(task: &ConflictTask) -> Vec<Vec<usize>>
     all_permutations_indices
 }
 
-fn build_orientation_problem(orders: &[Arc<SimulatedOrder>]) -> Option<OrientationProblem> {
-    if orders.is_empty() || orders.len() > MAX_ORIENTATION_SEARCH_NODES {
-        return None;
-    }
-
-    if orders.iter().any(|order| order.used_state_trace.is_none()) {
-        return None;
-    }
-
-    let n = orders.len();
-    let mut hard_precedence = vec![0u32; n];
-    let mut nonce_to_order: HashMap<(Address, u64), usize> = HashMap::default();
-
-    for (idx, order) in orders.iter().enumerate() {
-        for nonce in order.order.nonces() {
-            nonce_to_order.insert((nonce.address, nonce.nonce), idx);
-        }
-    }
-
-    for (idx, order) in orders.iter().enumerate() {
-        for nonce in order.order.nonces() {
-            if nonce.nonce == 0 {
-                continue;
-            }
-
-            if let Some(&prev_idx) = nonce_to_order.get(&(nonce.address, nonce.nonce - 1)) {
-                if prev_idx != idx {
-                    hard_precedence[prev_idx] |= bit(idx);
-                }
-            }
-        }
-    }
-
-    if !close_transitive_closure(&mut hard_precedence, n) {
-        return None;
-    }
-
-    let mut soft_conflicts = Vec::new();
-    for left in 0..n {
-        for right in (left + 1)..n {
-            if !orders_conflict(&orders[left], &orders[right]) {
-                continue;
-            }
-
-            if hard_precedence[left] & bit(right) != 0 || hard_precedence[right] & bit(left) != 0 {
-                continue;
-            }
-
-            soft_conflicts.push((left, right));
-        }
-    }
-
-    Some(OrientationProblem {
-        hard_precedence,
-        soft_conflicts,
-    })
-}
-
-fn enumerate_orientations(
-    node_count: usize,
-    soft_conflicts: &[(usize, usize)],
-    edge_idx: usize,
-    reach: &mut [u32],
-    seen: &mut HashSet<Vec<usize>>,
-    sequences: &mut Vec<Vec<usize>>,
-) {
-    if edge_idx == soft_conflicts.len() {
-        if let Some(sequence) = canonical_topological_order(reach, node_count) {
-            if seen.insert(sequence.clone()) {
-                sequences.push(sequence);
-            }
-        }
-        return;
-    }
-
-    let (left, right) = soft_conflicts[edge_idx];
-    let left_before_right = reach[left] & bit(right) != 0;
-    let right_before_left = reach[right] & bit(left) != 0;
-
-    if left_before_right && right_before_left {
-        return;
-    }
-    if left_before_right {
-        enumerate_orientations(
-            node_count,
-            soft_conflicts,
-            edge_idx + 1,
-            reach,
-            seen,
-            sequences,
-        );
-        return;
-    }
-    if right_before_left {
-        enumerate_orientations(
-            node_count,
-            soft_conflicts,
-            edge_idx + 1,
-            reach,
-            seen,
-            sequences,
-        );
-        return;
-    }
-
-    let snapshot = reach.to_vec();
-    if add_precedence_edge(reach, left, right, node_count) {
-        enumerate_orientations(
-            node_count,
-            soft_conflicts,
-            edge_idx + 1,
-            reach,
-            seen,
-            sequences,
-        );
-    }
-
-    reach.copy_from_slice(&snapshot);
-    if add_precedence_edge(reach, right, left, node_count) {
-        enumerate_orientations(
-            node_count,
-            soft_conflicts,
-            edge_idx + 1,
-            reach,
-            seen,
-            sequences,
-        );
-    }
-    reach.copy_from_slice(&snapshot);
-}
-
-fn add_precedence_edge(reach: &mut [u32], from: usize, to: usize, node_count: usize) -> bool {
-    if from == to || reach[to] & bit(from) != 0 {
-        return false;
-    }
-
-    let mut predecessors_mask = bit(from);
-    for idx in 0..node_count {
-        if reach[idx] & bit(from) != 0 {
-            predecessors_mask |= bit(idx);
-        }
-    }
-
-    let successors_mask = reach[to] | bit(to);
-    for idx in 0..node_count {
-        if predecessors_mask & bit(idx) != 0 {
-            reach[idx] |= successors_mask;
-            if reach[idx] & bit(idx) != 0 {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn close_transitive_closure(reach: &mut [u32], node_count: usize) -> bool {
-    for pivot in 0..node_count {
-        let pivot_bit = bit(pivot);
-        let pivot_reach = reach[pivot];
-        for node in 0..node_count {
-            if reach[node] & pivot_bit != 0 {
-                reach[node] |= pivot_reach;
-            }
-        }
-    }
-
-    (0..node_count).all(|idx| reach[idx] & bit(idx) == 0)
-}
-
-fn canonical_topological_order(reach: &[u32], node_count: usize) -> Option<Vec<usize>> {
-    let mut remaining = if node_count == 32 {
-        u32::MAX
-    } else {
-        (1u32 << node_count) - 1
-    };
-    let mut sequence = Vec::with_capacity(node_count);
-
-    while remaining != 0 {
-        let mut next_node = None;
-        for node in 0..node_count {
-            let node_bit = bit(node);
-            if remaining & node_bit == 0 {
-                continue;
-            }
-
-            let mut has_incoming = false;
-            for other in 0..node_count {
-                if other == node || remaining & bit(other) == 0 {
-                    continue;
-                }
-                if reach[other] & node_bit != 0 {
-                    has_incoming = true;
-                    break;
-                }
-            }
-
-            if !has_incoming {
-                next_node = Some(node);
-                break;
-            }
-        }
-
-        let Some(node) = next_node else {
-            return None;
-        };
-        sequence.push(node);
-        remaining &= !bit(node);
-    }
-
-    Some(sequence)
-}
-
-fn bit(idx: usize) -> u32 {
-    1u32 << idx
-}
-
-fn orders_conflict(left: &SimulatedOrder, right: &SimulatedOrder) -> bool {
+pub(crate) fn orders_conflict(left: &SimulatedOrder, right: &SimulatedOrder) -> bool {
     match (&left.used_state_trace, &right.used_state_trace) {
         (Some(left_trace), Some(right_trace)) => traces_conflict(left_trace, right_trace),
         _ => true,
@@ -1007,6 +1040,7 @@ mod tests {
     use super::*;
     use crate::building::builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority};
     use rbuilder_primitives::{
+        evm_inspector::{SlotKey, UsedStateTrace},
         Bundle, Metadata, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
         LAST_BUNDLE_VERSION,
     };
@@ -1086,6 +1120,57 @@ mod tests {
                 None,
             ))
         }
+
+        fn create_slot(key: u64) -> SlotKey {
+            SlotKey {
+                address: Address::ZERO,
+                key: B256::from(alloy_primitives::U256::from(key)),
+            }
+        }
+
+        pub fn create_traced_order(
+            &mut self,
+            profit: u64,
+            read_slots: &[u64],
+            write_slots: &[u64],
+        ) -> Arc<SimulatedOrder> {
+            let tx = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(self.create_tx()).unwrap();
+            let mut trace = UsedStateTrace::default();
+            for slot in read_slots {
+                trace.read_slot_values.insert(
+                    Self::create_slot(*slot),
+                    B256::from(alloy_primitives::U256::from(*slot + 100)),
+                );
+            }
+            for slot in write_slots {
+                trace.written_slot_values.insert(
+                    Self::create_slot(*slot),
+                    B256::from(alloy_primitives::U256::from(*slot + 200)),
+                );
+            }
+
+            Arc::new(SimulatedOrder::new(
+                Arc::new(Order::Bundle(Bundle {
+                    block: Some(0),
+                    min_timestamp: None,
+                    max_timestamp: None,
+                    txs: vec![tx],
+                    reverting_tx_hashes: Vec::new(),
+                    hash: B256::ZERO,
+                    uuid: Uuid::new_v4(),
+                    replacement_data: None,
+                    signer: None,
+                    metadata: Metadata::default(),
+                    dropping_tx_hashes: Vec::new(),
+                    refund: None,
+                    refund_identity: None,
+                    version: LAST_BUNDLE_VERSION,
+                    external_hash: None,
+                })),
+                SimValue::new_test_no_gas(U256::from(profit), U256::from(profit)),
+                Some(trace),
+            ))
+        }
     }
 
     // Helper function to create an order group
@@ -1146,6 +1231,110 @@ mod tests {
         assert_eq!(sequences[3], vec![1, 2, 0]);
         assert_eq!(sequences[4], vec![2, 0, 1]);
         assert_eq!(sequences[5], vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn test_partition_residual_components_discards_seed_conflicts() {
+        let mut data_generator = DataGenerator::new();
+        let orders = vec![
+            data_generator.create_traced_order(10, &[], &[1]),
+            data_generator.create_traced_order(11, &[], &[2]),
+            data_generator.create_traced_order(12, &[], &[3]),
+            data_generator.create_traced_order(13, &[], &[4]),
+            data_generator.create_traced_order(14, &[], &[5]),
+            data_generator.create_traced_order(15, &[], &[6]),
+            data_generator.create_traced_order(16, &[], &[7]),
+            data_generator.create_traced_order(17, &[], &[100]),
+            data_generator.create_traced_order(18, &[100], &[]),
+            data_generator.create_traced_order(19, &[1], &[]),
+        ];
+        let interaction_graph = build_interaction_graph(&orders);
+        let indices = (0..orders.len()).collect::<Vec<_>>();
+        let seed_indices = (0..7).collect::<Vec<_>>();
+
+        let components = partition_residual_components(&indices, &seed_indices, &interaction_graph);
+
+        assert_eq!(components, vec![vec![7, 8]]);
+    }
+
+    #[test]
+    fn test_recursive_default_appends_residual_component_solutions_without_cartesian() {
+        let mut data_generator = DataGenerator::new();
+        let orders = vec![
+            data_generator.create_traced_order(10, &[], &[1]),
+            data_generator.create_traced_order(11, &[], &[2]),
+            data_generator.create_traced_order(12, &[], &[3]),
+            data_generator.create_traced_order(13, &[], &[4]),
+            data_generator.create_traced_order(14, &[], &[5]),
+            data_generator.create_traced_order(15, &[], &[6]),
+            data_generator.create_traced_order(16, &[], &[7]),
+            data_generator.create_traced_order(17, &[], &[100]),
+            data_generator.create_traced_order(18, &[100], &[]),
+        ];
+        let interaction_graph = build_interaction_graph(&orders);
+        let indices = (0..orders.len()).collect::<Vec<_>>();
+        let seed_indices = (0..7).collect::<Vec<_>>();
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(RECURSIVE_DEFAULT_SAMPLE_SEED);
+        let mut solve_small = |subproblem_indices: &[usize]| -> Result<(Vec<usize>, usize)> {
+            Ok((subproblem_indices.to_vec(), 1))
+        };
+
+        let (sequence, candidate_sequence_count) =
+            solve_recursive_default_from_seed_indices_with_solver(
+                &interaction_graph,
+                &indices,
+                &seed_indices,
+                &mut rng,
+                &mut solve_small,
+            )
+            .unwrap();
+
+        assert_eq!(sequence, vec![0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(candidate_sequence_count, 2);
+    }
+
+    #[test]
+    fn test_remap_resolution_result_indices_maps_local_sequence_back_to_parent() {
+        let resolution_result = ResolutionResult {
+            total_profit: U256::ZERO,
+            sequence_of_orders: vec![
+                (1, U256::from(10)),
+                (0, U256::from(20)),
+                (2, U256::from(30)),
+            ],
+        };
+        let indices = vec![4, 7, 9];
+
+        let remapped = remap_resolution_result_indices(&resolution_result, &indices);
+
+        assert_eq!(remapped, vec![7, 4, 9]);
+    }
+
+    #[test]
+    fn test_solve_recursive_default_indices_delegates_small_subproblems() {
+        let mut data_generator = DataGenerator::new();
+        let orders = vec![
+            data_generator.create_traced_order(10, &[], &[1]),
+            data_generator.create_traced_order(11, &[], &[2]),
+            data_generator.create_traced_order(12, &[], &[3]),
+        ];
+        let interaction_graph = build_interaction_graph(&orders);
+        let indices = (0..orders.len()).collect::<Vec<_>>();
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(RECURSIVE_DEFAULT_SAMPLE_SEED);
+        let mut solve_small = |subproblem_indices: &[usize]| -> Result<(Vec<usize>, usize)> {
+            Ok((subproblem_indices.iter().rev().copied().collect(), 6))
+        };
+
+        let (sequence, candidate_sequence_count) = solve_recursive_default_indices_with_solver(
+            &interaction_graph,
+            &indices,
+            &mut rng,
+            &mut solve_small,
+        )
+        .unwrap();
+
+        assert_eq!(sequence, vec![2, 1, 0]);
+        assert_eq!(candidate_sequence_count, 6);
     }
 
     #[test]

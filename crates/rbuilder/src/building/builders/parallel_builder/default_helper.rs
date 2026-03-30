@@ -1,8 +1,5 @@
 use alloy_primitives::U256;
-use itertools::Itertools;
 use parking_lot::Mutex;
-use rand::{rngs::SmallRng, seq::SliceRandom, SeedableRng};
-use rbuilder_primitives::SimulatedOrder;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell,
@@ -19,17 +16,7 @@ use super::{
     Algorithm, ConflictGroup, GroupId, TaskPriority,
 };
 
-const NUMBER_OF_RANDOM_TASKS: usize = 50;
-const MIN_LENGTH_FOR_ORIENTATION_SEARCH: usize = 8;
-const MAX_FALLBACK_PERMUTATION_ORDERS: usize = MIN_LENGTH_FOR_ORIENTATION_SEARCH - 1;
-const MAX_LENGTH_FOR_ORIENTATION_SEARCH: usize = 14;
-const MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH: usize = 15;
-const MAX_DENSITY_FOR_ORIENTATION_SEARCH: f64 = 0.40;
-const MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH: usize = 16;
-const DEFAULT_PERMUTATION_SAMPLE_SEED: u64 = 0x06511;
-const FALLBACK_PERMUTATION_SEQUENCE_BUDGET: usize = 5_040;
-const FALLBACK_PERMUTATION_WORK_BUDGET: usize =
-    FALLBACK_PERMUTATION_SEQUENCE_BUDGET * MAX_FALLBACK_PERMUTATION_ORDERS;
+const MIN_LENGTH_FOR_EXPANDED_SELECTION: usize = 8;
 
 static DEFAULT_GRAPH_STUDY_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -43,8 +30,6 @@ pub struct DefaultGraphStudyRecord {
     pub density: f64,
     pub max_degree: usize,
     pub has_missing_traces: bool,
-    pub orientation_eligible: bool,
-    pub random_task_added: bool,
     pub candidate_sequence_count: Option<usize>,
     pub best_profit: Option<U256>,
 }
@@ -122,112 +107,20 @@ pub(crate) fn get_default_tasks_for_group(
     let mut tasks = vec![];
     let created_at = Instant::now();
 
-    if group.orders.len() >= MIN_LENGTH_FOR_ORIENTATION_SEARCH {
-        let orders = &group.orders;
-        let order_nonces: Vec<_> = orders
-            .iter()
-            .map(|order_arc| order_arc.order.nonces())
-            .collect();
-
-        let mut idx_and_value: Vec<(usize, U256)> = orders
-            .iter()
-            .enumerate()
-            .map(|(idx, order_arc)| (idx, order_value(order_arc)))
-            .collect();
-        idx_and_value.sort_by(|a, b| b.1.cmp(&a.1));
-
-        let mut used_nonces = std::collections::HashSet::new();
-        let mut selected = vec![];
-
-        for (idx, _) in idx_and_value {
-            let nonces = &order_nonces[idx];
-            let conflict = nonces.iter().any(|nonce| used_nonces.contains(nonce));
-
-            if !conflict {
-                selected.push(idx);
-                for nonce in nonces {
-                    used_nonces.insert(nonce.clone());
-                }
-            }
-        }
-
-        let selected_orders: Vec<_> = selected.iter().map(|&idx| orders[idx].clone()).collect();
-        let selected_order_count = selected_orders.len();
+    if group.orders.len() >= MIN_LENGTH_FOR_EXPANDED_SELECTION {
         let graph_study_enabled = default_graph_study_enabled();
-        let should_analyze_conflict_graph = graph_study_enabled
-            || (MIN_LENGTH_FOR_ORIENTATION_SEARCH..=MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH)
-                .contains(&selected_order_count);
-        let selected_stats = if should_analyze_conflict_graph {
-            analyze_conflict_graph(&selected_orders)
+        let group_stats = if graph_study_enabled {
+            analyze_conflict_graph(group.orders.as_ref())
         } else {
             ConflictGraphStats::default()
         };
-        let orientation_eligible = should_analyze_conflict_graph
-            && should_use_orientation_search_for_stats(selected_order_count, &selected_stats);
-
-        let target_contracts: Vec<_> = selected_orders
-            .iter()
-            .flat_map(|order_arc| {
-                order_arc
-                    .order
-                    .list_txs()
-                    .into_iter()
-                    .filter_map(|(tx, _)| tx.to())
-            })
-            .collect();
-        let overlap_rate_of_target_contracts = target_contracts.iter().counts_by(|addr| *addr);
-        let max_overlap_contracts = overlap_rate_of_target_contracts
-            .values()
-            .max()
-            .cloned()
-            .unwrap_or(0);
-        let denominator_contracts = target_contracts.len();
-        let percentage_contracts = if denominator_contracts > 0 {
-            (max_overlap_contracts as f64) / (denominator_contracts as f64) * 100.0
-        } else {
-            0.0
-        };
-        let random_task_added = percentage_contracts >= 20.0;
-
-        if random_task_added {
-            tasks.push(ConflictTask {
-                group_idx: group.id,
-                algorithm: Algorithm::Random {
-                    seed: group.id as u64,
-                    count: NUMBER_OF_RANDOM_TASKS,
-                },
-                priority,
-                group: ConflictGroup {
-                    id: group.id,
-                    orders: Arc::new(selected_orders.clone()),
-                    conflicting_group_ids: group.conflicting_group_ids.clone(),
-                },
-                created_at,
-            });
-        }
-
-        if orientation_eligible {
-            tasks.push(ConflictTask {
-                group_idx: group.id,
-                algorithm: Algorithm::OrientationSearch,
-                priority,
-                group: ConflictGroup {
-                    id: group.id,
-                    orders: Arc::new(selected_orders),
-                    conflicting_group_ids: group.conflicting_group_ids.clone(),
-                },
-                created_at,
-            });
-        } else {
-            let exhaustive_group = build_fallback_permutation_group(group, selected_orders);
-            tasks.push(ConflictTask {
-                group_idx: group.id,
-                algorithm: Algorithm::AllPermutations,
-                priority,
-                group: exhaustive_group,
-                created_at,
-            });
-        }
+        tasks.push(ConflictTask {
+            group_idx: group.id,
+            algorithm: Algorithm::RecursiveDefault,
+            priority,
+            group: group.clone(),
+            created_at,
+        });
 
         if default_graph_study_enabled() {
             for task in &tasks {
@@ -235,13 +128,11 @@ pub(crate) fn get_default_tasks_for_group(
                     group_id: group.id,
                     algorithm: format!("{:?}", task.algorithm),
                     original_order_count: group.orders.len(),
-                    selected_order_count,
-                    edge_count: selected_stats.edge_count,
-                    density: selected_stats.density,
-                    max_degree: selected_stats.max_degree,
-                    has_missing_traces: selected_stats.has_missing_traces,
-                    orientation_eligible,
-                    random_task_added,
+                    selected_order_count: group.orders.len(),
+                    edge_count: group_stats.edge_count,
+                    density: group_stats.density,
+                    max_degree: group_stats.max_degree,
+                    has_missing_traces: group_stats.has_missing_traces,
                     candidate_sequence_count: None,
                     best_profit: None,
                 });
@@ -268,11 +159,6 @@ pub(crate) fn get_default_tasks_for_group(
                     density: stats.density,
                     max_degree: stats.max_degree,
                     has_missing_traces: stats.has_missing_traces,
-                    orientation_eligible: should_use_orientation_search_for_stats(
-                        group.orders.len(),
-                        &stats,
-                    ),
-                    random_task_added: false,
                     candidate_sequence_count: None,
                     best_profit: None,
                 });
@@ -283,75 +169,141 @@ pub(crate) fn get_default_tasks_for_group(
     tasks
 }
 
-fn order_value(order: &SimulatedOrder) -> U256 {
-    order.sim_value.full_profit_info().coinbase_profit()
-}
+#[cfg(test)]
+mod tests {
+    use ahash::HashSet;
+    use alloy_consensus::TxLegacy;
+    use alloy_primitives::{Address, B256};
+    use rbuilder_primitives::{
+        evm_inspector::{SlotKey, UsedStateTrace},
+        Bundle, Metadata, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
+        LAST_BUNDLE_VERSION,
+    };
+    use reth::primitives::TransactionSigned;
+    use reth_primitives::{Recovered, Transaction};
+    use uuid::Uuid;
 
-fn build_fallback_permutation_group(
-    group: &ConflictGroup,
-    selected_orders: Vec<Arc<SimulatedOrder>>,
-) -> ConflictGroup {
-    match selected_orders.len() {
-        len if len <= MAX_FALLBACK_PERMUTATION_ORDERS => ConflictGroup {
-            id: group.id,
-            orders: Arc::new(selected_orders),
-            conflicting_group_ids: group.conflicting_group_ids.clone(),
-        },
-        _ => {
-            let mut rng = SmallRng::seed_from_u64(DEFAULT_PERMUTATION_SAMPLE_SEED);
-            let sample: Vec<_> = selected_orders
-                .choose_multiple(&mut rng, MAX_FALLBACK_PERMUTATION_ORDERS)
-                .cloned()
-                .collect();
-            ConflictGroup {
-                id: group.id,
-                orders: Arc::new(sample),
-                conflicting_group_ids: group.conflicting_group_ids.clone(),
+    use super::*;
+
+    struct DataGenerator {
+        next_nonce: u64,
+    }
+
+    impl DataGenerator {
+        fn new() -> Self {
+            Self { next_nonce: 0 }
+        }
+
+        fn create_tx(&mut self) -> Recovered<TransactionSigned> {
+            let nonce = self.next_nonce;
+            self.next_nonce += 1;
+            Recovered::new_unchecked(
+                TransactionSigned::new_unchecked(
+                    Transaction::Legacy(TxLegacy {
+                        nonce,
+                        ..Default::default()
+                    }),
+                    alloy_primitives::Signature::test_signature(),
+                    B256::from(alloy_primitives::U256::from(nonce + 1)),
+                ),
+                Address::default(),
+            )
+        }
+
+        fn create_slot(key: u64) -> SlotKey {
+            SlotKey {
+                address: Address::ZERO,
+                key: B256::from(alloy_primitives::U256::from(key)),
             }
         }
-    }
-}
 
-fn should_use_orientation_search_for_stats(n: usize, stats: &ConflictGraphStats) -> bool {
-    if !(MIN_LENGTH_FOR_ORIENTATION_SEARCH..=MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH)
-        .contains(&n)
-    {
-        return false;
-    }
-    if stats.has_missing_traces {
-        return false;
-    }
-    if estimated_orientation_work_upper_bound_exceeds_budget(n, stats.edge_count) {
-        return false;
+        fn create_order(
+            &mut self,
+            profit: u64,
+            read_slots: &[u64],
+            write_slots: &[u64],
+        ) -> Arc<SimulatedOrder> {
+            let tx = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(self.create_tx()).unwrap();
+            let mut trace = UsedStateTrace::default();
+            for slot in read_slots {
+                trace.read_slot_values.insert(
+                    Self::create_slot(*slot),
+                    B256::from(alloy_primitives::U256::from(*slot + 100)),
+                );
+            }
+            for slot in write_slots {
+                trace.written_slot_values.insert(
+                    Self::create_slot(*slot),
+                    B256::from(alloy_primitives::U256::from(*slot + 200)),
+                );
+            }
+
+            Arc::new(SimulatedOrder::new(
+                Arc::new(Order::Bundle(Bundle {
+                    block: Some(0),
+                    min_timestamp: None,
+                    max_timestamp: None,
+                    txs: vec![tx],
+                    reverting_tx_hashes: Vec::new(),
+                    hash: B256::ZERO,
+                    uuid: Uuid::new_v4(),
+                    replacement_data: None,
+                    signer: None,
+                    metadata: Metadata::default(),
+                    dropping_tx_hashes: Vec::new(),
+                    refund: None,
+                    refund_identity: None,
+                    version: LAST_BUNDLE_VERSION,
+                    external_hash: None,
+                })),
+                SimValue::new_test_no_gas(U256::from(profit), U256::from(profit)),
+                Some(trace),
+            ))
+        }
     }
 
-    if n <= MAX_LENGTH_FOR_ORIENTATION_SEARCH
-        && stats.edge_count <= MAX_CONFLICT_EDGES_FOR_ORIENTATION_SEARCH
-        && stats.density <= MAX_DENSITY_FOR_ORIENTATION_SEARCH
-    {
-        return true;
+    fn create_group(id: GroupId, orders: Vec<Arc<SimulatedOrder>>) -> ConflictGroup {
+        ConflictGroup {
+            id,
+            orders: Arc::new(orders),
+            conflicting_group_ids: Arc::new(HashSet::<GroupId>::default().into_iter().collect()),
+        }
     }
 
-    n <= MAX_LENGTH_FOR_PATH_LIKE_ORIENTATION_SEARCH
-        && stats.edge_count <= n + 2
-        && stats.max_degree <= 2
-}
+    #[test]
+    fn test_large_default_group_keeps_full_group_for_recursive_default() {
+        let mut data = DataGenerator::new();
+        let orders = vec![
+            data.create_order(10, &[], &[1]),
+            data.create_order(11, &[1], &[2]),
+            data.create_order(12, &[2], &[3]),
+            data.create_order(13, &[3], &[4]),
+            data.create_order(14, &[4], &[5]),
+            data.create_order(15, &[5], &[6]),
+            data.create_order(16, &[6], &[7]),
+            data.create_order(17, &[], &[]),
+            data.create_order(18, &[], &[]),
+        ];
+        let group = create_group(1, orders);
 
-fn estimated_orientation_work_upper_bound_exceeds_budget(
-    order_count: usize,
-    conflict_edge_count: usize,
-) -> bool {
-    let sequence_upper_bound = estimated_orientation_sequence_upper_bound(conflict_edge_count);
-    order_count
-        .checked_mul(sequence_upper_bound)
-        .unwrap_or(usize::MAX)
-        > FALLBACK_PERMUTATION_WORK_BUDGET
-}
+        let tasks = get_default_tasks_for_group(&group, TaskPriority::High);
 
-fn estimated_orientation_sequence_upper_bound(conflict_edge_count: usize) -> usize {
-    if conflict_edge_count >= usize::BITS as usize {
-        usize::MAX
-    } else {
-        1usize << conflict_edge_count
+        assert_eq!(tasks.len(), 1);
+        assert!(matches!(tasks[0].algorithm, Algorithm::RecursiveDefault));
+        assert_eq!(tasks[0].group.orders.len(), group.orders.len());
+    }
+
+    #[test]
+    fn test_large_default_group_uses_single_recursive_default_task() {
+        let mut data = DataGenerator::new();
+        let orders = (0..9)
+            .map(|idx| data.create_order(100 + idx, &[], &[idx + 1]))
+            .collect();
+        let group = create_group(2, orders);
+
+        let tasks = get_default_tasks_for_group(&group, TaskPriority::High);
+
+        assert_eq!(tasks.len(), 1);
+        assert!(matches!(tasks[0].algorithm, Algorithm::RecursiveDefault));
     }
 }

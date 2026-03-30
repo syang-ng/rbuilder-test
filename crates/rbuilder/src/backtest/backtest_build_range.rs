@@ -454,7 +454,7 @@ impl GraphStatsCSVWriter {
     fn write_header(&mut self) -> io::Result<()> {
         writeln!(
             self.file,
-            "block_number,builder_name,group_id,algorithm,original_order_count,selected_order_count,edge_count,density,max_degree,has_missing_traces,orientation_eligible,random_task_added,candidate_sequence_count,best_profit"
+            "block_number,builder_name,group_id,algorithm,original_order_count,selected_order_count,edge_count,density,max_degree,has_missing_traces,candidate_sequence_count,best_profit"
         )?;
         self.file.flush()
     }
@@ -464,7 +464,7 @@ impl GraphStatsCSVWriter {
             for record in &builder_output.graph_study_records {
                 writeln!(
                     self.file,
-                    "{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{:.6},{},{},{},{}",
                     value.block_number,
                     builder_output.builder_name,
                     record.group_id,
@@ -475,8 +475,6 @@ impl GraphStatsCSVWriter {
                     record.density,
                     record.max_degree,
                     record.has_missing_traces,
-                    record.orientation_eligible,
-                    record.random_task_added,
                     record
                         .candidate_sequence_count
                         .map(|value| value.to_string())

@@ -67,12 +67,12 @@ pub enum Algorithm {
     Length,
     /// `AllPermutations` checks all possible permutations of the group.
     AllPermutations,
+    /// `RecursiveDefault` samples seed orders, extracts independent residual components, and solves them recursively.
+    RecursiveDefault,
     /// `Random` checks random permutations of the group.
     Random { seed: u64, count: usize },
     /// `PermutationsWithNonces` checks all possible permutations of the group with nonces.
     PermutationsWithNonces,
-    /// `OrientationSearch` orients pairwise conflicts and only evaluates one canonical order per orientation.
-    OrientationSearch,
     /// `BestOfN` checks N bundles and picks the best one.
     BestOfN,
 }
