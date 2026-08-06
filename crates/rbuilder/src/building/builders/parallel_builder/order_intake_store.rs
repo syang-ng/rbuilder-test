@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::{
-    building::{builders::OrderConsumer, SimulatedOrderStore},
-    live_builder::simulation::SimulatedOrderCommand,
-    primitives::SimulatedOrder,
+use crate::building::{
+    builders::OrderConsumer, journal::SimulatedOrderJournalCommand, SimulatedOrderStore,
 };
+use rbuilder_primitives::SimulatedOrder;
 
 /// Struct that allow getting the new orders from the order/cancellation stream in the way the parallel builder likes it.
 /// Contains the current whole set of orders but also can be queried for deltas on the orders ONLY if the deltas are all additions
@@ -19,7 +18,7 @@ pub struct OrderIntakeStore {
 }
 
 impl OrderIntakeStore {
-    pub fn new(orders_input_stream: broadcast::Receiver<SimulatedOrderCommand>) -> Self {
+    pub fn new(orders_input_stream: broadcast::Receiver<SimulatedOrderJournalCommand>) -> Self {
         let order_sink = SimulatedOrderStore::new();
         Self {
             order_consumer: OrderConsumer::new(orders_input_stream),

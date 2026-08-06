@@ -1,54 +1,107 @@
 //! builders is a subprocess that builds a block
 pub mod block_building_helper;
+pub mod block_building_helper_stats_logger;
 pub mod mock_block_building_helper;
 pub mod ordering_builder;
 pub mod parallel_builder;
 
 use crate::{
-    building::{BlockBuildingContext, BuiltBlockTrace, SimulatedOrderSink},
+    building::{
+        journal::{JournalSequenceNumber, SimulatedOrderJournalCommand},
+        BlockBuildingContext, BuiltBlockTrace, SimulatedOrderSink,
+    },
     live_builder::{
-        payload_events::{InternalPayloadId, MevBoostSlotData},
+        block_output::unfinished_block_processing::UnfinishedBuiltBlocksInput,
+        building::built_block_cache::BuiltBlockCache, payload_events::InternalPayloadId,
         simulation::SimulatedOrderCommand,
     },
-    primitives::{AccountNonce, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
     utils::{is_provider_factory_health_error, NonceCache},
 };
 use ahash::HashSet;
-use alloy_eips::eip4844::BlobTransactionSidecar;
+use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, Bytes};
-use block_building_helper::BiddableUnfinishedBlock;
-use reth::primitives::SealedBlock;
-use std::{fmt::Debug, sync::Arc};
+use rbuilder_primitives::{mev_boost::BidAdjustmentDataV3, AccountNonce, OrderId, SimulatedOrder};
+use reth_ethereum_primitives::Block as EthereumBlock;
+use reth_primitives_traits::SealedBlock;
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::sync::{
     broadcast,
     broadcast::error::{RecvError, TryRecvError},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use super::{simulated_order_command_to_sink, OrderPriority, PrioritizedOrderStore};
+
+/// Orders that blocking_consume_next_commands will consume.
+/// A slow algorithm would check approx every 200ms, to fill this batch size it would take
+/// 8192/.2 = 40960 order/sec which is even more than what we see in the whole slot for a busy block.
+const ORDERS_CONSUMED_PER_BATCH: usize = 8192;
 
 /// Block we built
 #[derive(Debug, Clone)]
 pub struct Block {
+    pub builder_name: String,
     pub trace: BuiltBlockTrace,
-    pub sealed_block: SealedBlock,
+    pub sealed_block: SealedBlock<EthereumBlock>,
     /// Sidecars for the txs included in SealedBlock
-    pub txs_blobs_sidecars: Vec<Arc<BlobTransactionSidecar>>,
+    pub txs_blobs_sidecars: Vec<Arc<BlobTransactionSidecarVariant>>,
     /// The Pectra execution requests for this bid.
     pub execution_requests: Vec<Bytes>,
-    pub builder_name: String,
+    /// Bid adjustment data by fee payer address.
+    pub bid_adjustments: HashMap<Address, BidAdjustmentDataV3>,
+}
+
+/// Id to uniquely identify every block built (unique even among different algorithms).
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash)]
+pub struct BuiltBlockId(pub u64);
+
+impl BuiltBlockId {
+    pub const ZERO: Self = Self(0);
+}
+
+#[derive(Debug)]
+pub struct BuiltBlockIdSource {
+    next_id: AtomicU64,
+}
+
+impl BuiltBlockIdSource {
+    pub fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(0),
+        }
+    }
+    pub fn get_new_id(&self) -> BuiltBlockId {
+        BuiltBlockId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl Default for BuiltBlockIdSource {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug)]
 pub struct LiveBuilderInput<P> {
     pub provider: P,
     pub ctx: BlockBuildingContext,
-    pub input: broadcast::Receiver<SimulatedOrderCommand>,
-    pub sink: Arc<dyn UnfinishedBlockBuildingSink>,
+    pub input: broadcast::Receiver<SimulatedOrderJournalCommand>,
+    pub sink: UnfinishedBuiltBlocksInput,
     pub builder_name: String,
     pub cancel: CancellationToken,
+    pub built_block_cache: Arc<BuiltBlockCache>,
+    pub built_block_id_source: Arc<BuiltBlockIdSource>,
+    pub max_order_execution_duration_warning: Option<Duration>,
 }
 
 /// Struct that helps reading new orders/cancellations
@@ -56,41 +109,61 @@ pub struct LiveBuilderInput<P> {
 /// Call consume_next_cancellations and use cancel_data
 #[derive(Debug)]
 pub struct OrderConsumer {
-    orders: broadcast::Receiver<SimulatedOrderCommand>,
+    orders: broadcast::Receiver<SimulatedOrderJournalCommand>,
     // consume_next_batch scratchpad
     new_commands: Vec<SimulatedOrderCommand>,
+    /// last journal sequence number processed + 1. 0 means nothing processed yet.
+    next_journal_sequence_number: JournalSequenceNumber,
 }
 
 impl OrderConsumer {
-    pub fn new(orders: broadcast::Receiver<SimulatedOrderCommand>) -> Self {
+    pub fn new(orders: broadcast::Receiver<SimulatedOrderJournalCommand>) -> Self {
         Self {
             orders,
             new_commands: Vec::new(),
+            next_journal_sequence_number: 0,
         }
     }
 
-    /// Returns true if success, on false builder should stop
+    fn add_command(&mut self, command: SimulatedOrderJournalCommand) {
+        self.new_commands.push(command.command().clone());
+        if command.sequence_number() != self.next_journal_sequence_number {
+            error!(
+                "Journal sequence number mismatch. Expected: {}, Got: {}",
+                self.next_journal_sequence_number,
+                command.sequence_number()
+            );
+        }
+        self.next_journal_sequence_number = command.sequence_number() + 1;
+    }
+    /// On Ok returned:
+    ///     None -> builder should stop
+    ///     Some(next_seq) -> next_seq is the next expected sequence number for the order journal (last seen + 1)
+    /// Returns true if success, on false
     /// New commands are accumulatd in self.new_commands
     /// Call apply_new_commands to easily consume them.
     /// This method will block until the first command is received
-    pub fn blocking_consume_next_commands(&mut self) -> eyre::Result<bool> {
+    /// @Pending: This method consumes a fixed (ORDERS_CONSUMED_PER_BATCH) number of pending orders. We should reconsider doing something depending on the age of the orders?
+    pub fn blocking_consume_next_commands(
+        &mut self,
+    ) -> eyre::Result<Option<JournalSequenceNumber>> {
         match self.orders.blocking_recv() {
-            Ok(order) => self.new_commands.push(order),
+            Ok(order) => self.add_command(order),
             Err(RecvError::Closed) => {
-                return Ok(false);
+                return Ok(None);
             }
             Err(RecvError::Lagged(msg)) => {
                 warn!(msg, "Builder thread lagging on sim orders channel");
             }
         }
-        for _ in 0..1024 {
+        for _ in 0..ORDERS_CONSUMED_PER_BATCH {
             match self.orders.try_recv() {
-                Ok(order) => self.new_commands.push(order),
+                Ok(order) => self.add_command(order),
                 Err(TryRecvError::Empty) => {
                     break;
                 }
                 Err(TryRecvError::Closed) => {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(TryRecvError::Lagged(msg)) => {
                     warn!(msg, "Builder thread lagging on sim orders channel");
@@ -98,14 +171,14 @@ impl OrderConsumer {
                 }
             }
         }
-        Ok(true)
+        Ok(Some(self.next_journal_sequence_number))
     }
 
     pub fn new_commands(&self) -> &[SimulatedOrderCommand] {
         &self.new_commands
     }
 
-    // Apply insertions and sbundle cancellations on sink
+    // Apply insertions and cancellations on sink
     pub fn apply_new_commands<SinkType: SimulatedOrderSink>(&mut self, sink: &mut SinkType) {
         for order_command in self.new_commands.drain(..) {
             simulated_order_command_to_sink(order_command, sink);
@@ -113,6 +186,8 @@ impl OrderConsumer {
     }
 }
 
+/// Struct that allows to consume new SimulatedOrderJournalCommands from a broadcast::Receiver<SimulatedOrderJournalCommand> and get the new orders in a prioritized way.
+/// It's intended for single thread usage. It must be used by calling blocking_consume_next_batch and then current_block_orders.
 #[derive(Debug)]
 pub struct OrderIntakeConsumer<OrderPriorityType> {
     nonces: NonceCache,
@@ -124,8 +199,10 @@ pub struct OrderIntakeConsumer<OrderPriorityType> {
 }
 
 impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
-    /// See [`ShareBundleMerger`] for sbundle_merger_selected_signers
-    pub fn new(nonces: NonceCache, orders: broadcast::Receiver<SimulatedOrderCommand>) -> Self {
+    pub fn new(
+        nonces: NonceCache,
+        orders: broadcast::Receiver<SimulatedOrderJournalCommand>,
+    ) -> Self {
         Self {
             nonces,
             block_orders: PrioritizedOrderStore::new(vec![]),
@@ -134,23 +211,23 @@ impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
         }
     }
 
-    /// Returns true if success, on false builder should stop
+    /// On Ok returned:
+    ///     None -> builder should stop
+    ///     Some(next_seq) -> next_seq is the next expected sequence number for the order journal (last seen + 1)
     /// Blocks until the first item in the next batch is available.
-    pub fn blocking_consume_next_batch(&mut self) -> eyre::Result<bool> {
-        if !self.order_consumer.blocking_consume_next_commands()? {
-            return Ok(false);
+    pub fn blocking_consume_next_batch(&mut self) -> eyre::Result<Option<JournalSequenceNumber>> {
+        if let Some(next_seq) = self.order_consumer.blocking_consume_next_commands()? {
+            self.update_onchain_nonces()?;
+            self.order_consumer
+                .apply_new_commands(&mut self.block_orders);
+            Ok(Some(next_seq))
+        } else {
+            Ok(None)
         }
-        if !self.update_onchain_nonces()? {
-            return Ok(false);
-        }
-
-        self.order_consumer
-            .apply_new_commands(&mut self.block_orders);
-        Ok(true)
     }
 
     /// Updates block_orders with all the nonce needed for the new orders
-    fn update_onchain_nonces(&mut self) -> eyre::Result<bool> {
+    fn update_onchain_nonces(&mut self) -> eyre::Result<()> {
         let new_orders = self
             .order_consumer
             .new_commands()
@@ -174,7 +251,7 @@ impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
             }
         }
         self.block_orders.update_onchain_nonces(&nonces);
-        Ok(true)
+        Ok(())
     }
 
     pub fn current_block_orders(&self) -> PrioritizedOrderStore<OrderPriorityType> {
@@ -189,23 +266,17 @@ impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
     }
 }
 
-/// Output of the BlockBuildingAlgorithm.
-pub trait UnfinishedBlockBuildingSink: std::fmt::Debug + Send + Sync {
-    fn new_block(&self, block: BiddableUnfinishedBlock);
-
-    /// The sink may not like blocks where coinbase is the final fee_recipient (eg: this does not allows us to take profit!).
-    /// Not sure this is the right place for this func. Might move somewhere else.
-    fn can_use_suggested_fee_recipient_as_coinbase(&self) -> bool;
-}
-
 #[derive(Debug)]
 pub struct BlockBuildingAlgorithmInput<P> {
     pub provider: P,
     pub ctx: BlockBuildingContext,
-    pub input: broadcast::Receiver<SimulatedOrderCommand>,
+    pub input: broadcast::Receiver<SimulatedOrderJournalCommand>,
     /// output for the blocks
-    pub sink: Arc<dyn UnfinishedBlockBuildingSink>,
+    pub sink: UnfinishedBuiltBlocksInput,
+    /// A cache common to several builders so they can optimize their work looking at other builders blocks.
+    pub built_block_cache: Arc<BuiltBlockCache>,
     pub cancel: CancellationToken,
+    pub built_block_id_source: Arc<BuiltBlockIdSource>,
 }
 
 /// Algorithm to build blocks
@@ -217,17 +288,6 @@ where
 {
     fn name(&self) -> String;
     fn build_blocks(&self, input: BlockBuildingAlgorithmInput<P>);
-}
-
-/// Factory used to create UnfinishedBlockBuildingSink for builders.
-pub trait UnfinishedBlockBuildingSinkFactory: Debug + Send + Sync {
-    /// Creates an UnfinishedBlockBuildingSink to receive block for slot_data.
-    /// cancel: If this is signaled the sink should cancel. If any unrecoverable situation is found signal cancel.
-    fn create_sink(
-        &mut self,
-        slot_data: MevBoostSlotData,
-        cancel: CancellationToken,
-    ) -> Arc<dyn UnfinishedBlockBuildingSink>;
 }
 
 /// Basic configuration to run a single block building with a BlockBuildingAlgorithm

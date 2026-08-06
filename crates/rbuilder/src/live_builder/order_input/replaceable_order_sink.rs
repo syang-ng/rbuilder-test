@@ -1,7 +1,8 @@
 use tracing::info;
 
-use crate::primitives::{BundleReplacementData, Order, ShareBundleReplacementKey};
 use core::fmt::Debug;
+use rbuilder_primitives::{BundleReplacementData, Order};
+use std::sync::Arc;
 
 /// Receiver of order commands in a low level order stream (mempool + RPC calls).
 /// Orders are assumed to be immutable so there is no update.
@@ -11,9 +12,8 @@ use core::fmt::Debug;
 /// Due to source problems insert_order/remove_bundle can arrive out of order so Orders also have a sequence number
 /// so we can identify the newest.
 pub trait ReplaceableOrderSink: Debug + Send {
-    fn insert_order(&mut self, order: Order) -> bool;
+    fn insert_order(&mut self, order: Arc<Order>) -> bool;
     fn remove_bundle(&mut self, replacement_data: BundleReplacementData) -> bool;
-    fn remove_sbundle(&mut self, key: ShareBundleReplacementKey) -> bool;
     /// @Pending remove this ugly hack to check if we can stop sending data.
     /// It should be replaced for a better control over object destruction
     fn is_alive(&self) -> bool;
@@ -24,7 +24,7 @@ pub trait ReplaceableOrderSink: Debug + Send {
 pub struct ReplaceableOrderPrinter {}
 
 impl ReplaceableOrderSink for ReplaceableOrderPrinter {
-    fn insert_order(&mut self, order: Order) -> bool {
+    fn insert_order(&mut self, order: Arc<Order>) -> bool {
         info!(
             order_id = ?order.id(),
             order_rep_info = ?order.replacement_key_and_sequence_number(),
@@ -41,15 +41,27 @@ impl ReplaceableOrderSink for ReplaceableOrderPrinter {
     fn is_alive(&self) -> bool {
         true
     }
-
-    fn remove_sbundle(&mut self, key: ShareBundleReplacementKey) -> bool {
-        info!(key=?key,"Cancelled SBundle");
-        true
-    }
 }
 
 impl Drop for ReplaceableOrderPrinter {
     fn drop(&mut self) {
         println!("OrderPrinter Dropped");
+    }
+}
+
+#[derive(Debug)]
+pub struct NullReplaceableOrderSink {}
+
+impl ReplaceableOrderSink for NullReplaceableOrderSink {
+    fn insert_order(&mut self, _order: Arc<Order>) -> bool {
+        true
+    }
+
+    fn remove_bundle(&mut self, _replacement_data: BundleReplacementData) -> bool {
+        true
+    }
+
+    fn is_alive(&self) -> bool {
+        true
     }
 }

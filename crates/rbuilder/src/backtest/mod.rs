@@ -12,17 +12,17 @@ mod store;
 use ahash::HashMap;
 pub use backtest_build_range::run_backtest_build_range;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-use crate::{
-    mev_boost::BuilderBlockReceived,
-    primitives::{serialize::RawOrder, AccountNonce, Order, OrderId, OrderReplacementKey},
-    utils::offset_datetime_to_timestamp_ms,
-};
+use crate::{mev_boost::BuilderBlockReceived, utils::offset_datetime_to_timestamp_ms};
 use alloy_consensus::Transaction as TransactionTrait;
 use alloy_network_primitives::TransactionResponse;
-use alloy_primitives::{Address, TxHash, I256};
+use alloy_primitives::{TxHash, B256, I256};
 use alloy_rpc_types::{BlockTransactions, Transaction};
 pub use fetch::HistoricalDataFetcher;
+use rbuilder_primitives::{
+    serialize::RawOrder, AccountNonce, BundleReplacementKey, Order, OrderId,
+};
 pub use results_store::{BacktestResultsStorage, StoredBacktestResult};
 use serde::{Deserialize, Serialize};
 pub use store::HistoricalDataStorage;
@@ -39,7 +39,7 @@ impl From<OrdersWithTimestamp> for RawOrdersWithTimestamp {
     fn from(orders: OrdersWithTimestamp) -> Self {
         Self {
             timestamp_ms: orders.timestamp_ms,
-            order: orders.order.into(),
+            order: (*orders.order).clone().into(),
         }
     }
 }
@@ -47,7 +47,16 @@ impl From<OrdersWithTimestamp> for RawOrdersWithTimestamp {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrdersWithTimestamp {
     pub timestamp_ms: u64,
-    pub order: Order,
+    pub order: Arc<Order>,
+}
+
+/// Metadata needed to replay the order journal for a built block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalMetadata {
+    pub builder_name: String,
+    pub slot: u64,
+    pub parent_hash: B256,
+    pub next_journal_sequence_number: u32,
 }
 
 /// Historic data for a block.
@@ -58,6 +67,7 @@ pub struct BuiltBlockData {
     pub orders_closed_at: OffsetDateTime,
     pub sealed_at: OffsetDateTime,
     pub profit: I256,
+    pub journal_metadata: Option<JournalMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +82,12 @@ pub enum OrderFilteredReason {
     Ids,
     /// Order signer was explicitly filtered out
     Signer,
+    /// Order was filtered out for other reasons
+    Other { reason: String },
 }
+
+pub trait OrderFilterFn: Fn(&Order) -> Option<OrderFilteredReason> {}
+impl<T> OrderFilterFn for T where T: Fn(&Order) -> Option<OrderFilteredReason> {}
 
 #[derive(Debug, Clone)]
 pub struct BlockData {
@@ -139,7 +154,7 @@ impl BlockData {
                 .cmp(&a.timestamp_ms)
                 .then_with(|| a.order.id().cmp(&b.order.id()))
         });
-        let mut replacement_keys_seen: HashSet<OrderReplacementKey> = HashSet::default();
+        let mut replacement_keys_seen: HashSet<BundleReplacementKey> = HashSet::default();
 
         self.available_orders.retain(|orders| {
             if let Some(key) = orders.order.replacement_key() {
@@ -167,7 +182,7 @@ impl BlockData {
         let mempool_txs = self
             .available_orders
             .iter()
-            .filter_map(|o| match &o.order {
+            .filter_map(|o| match o.order.as_ref() {
                 Order::Tx(tx) => Some(tx.tx_with_blobs.hash()),
                 _ => None,
             })
@@ -189,9 +204,9 @@ impl BlockData {
         });
     }
 
-    pub fn filter_orders_by_ids(&mut self, order_ids: &[String]) {
+    pub fn filter_orders_by_ids(&mut self, order_ids: &[OrderId]) {
         self.available_orders.retain(|order| {
-            if order_ids.contains(&order.order.id().to_string()) {
+            if order_ids.contains(&order.order.id()) {
                 true
             } else {
                 trace!(order = ?order.order.id(), "order filtered by id");
@@ -202,21 +217,15 @@ impl BlockData {
         });
     }
 
-    pub fn filter_out_ignored_signers(&mut self, ignored_signers: &[Address]) {
+    pub fn filter_out_orders<Filter: OrderFilterFn>(&mut self, filter: Filter) {
         self.available_orders.retain(|orders| {
             let order = &orders.order;
-            let signer = if let Some(signer) = order.signer() {
-                signer
-            } else {
-                return true;
-            };
-            if !ignored_signers.contains(&signer) {
-                true
-            } else {
-                trace!(order = ?order.id(), "order filtered by ignored signers");
-                self.filtered_orders
-                    .insert(order.id(), OrderFilteredReason::Signer);
+            if let Some(reason) = filter(order) {
+                trace!(order = ?order.id(), "order filtered out");
+                self.filtered_orders.insert(order.id(), reason);
                 false
+            } else {
+                true
             }
         });
     }

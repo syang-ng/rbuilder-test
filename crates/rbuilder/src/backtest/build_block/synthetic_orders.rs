@@ -1,23 +1,23 @@
 use alloy_primitives::B256;
-use clap::{command, Parser};
+use clap::Parser;
+use rbuilder_config::load_toml_config;
+use rbuilder_primitives::{
+    Bundle, MempoolTx, Metadata, Order, TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
+};
 use reth_provider::test_utils::MockNodeTypesWithDB;
+use std::sync::Arc;
 use uuid::Uuid;
 
+use super::backtest_build_block::{run_backtest_build_block, BuildBlockCfg, OrdersSource};
 use crate::{
     backtest::OrdersWithTimestamp,
     building::{
         testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
         BlockBuildingContext,
     },
-    live_builder::{base_config::load_config_toml_and_env, cli::LiveBuilderConfig},
-    primitives::{
-        Bundle, MempoolTx, Metadata, Order, TransactionSignedEcRecoveredWithBlobs,
-        LAST_BUNDLE_VERSION,
-    },
+    live_builder::cli::LiveBuilderConfig,
     provider::state_provider_factory_from_provider_factory::StateProviderFactoryFromProviderFactory,
 };
-
-use super::backtest_build_block::{run_backtest_build_block, BuildBlockCfg, OrdersSource};
 
 #[derive(Parser, Debug)]
 struct ExtraCfg {
@@ -64,8 +64,8 @@ fn create_tip_tx(
 
 impl<ConfigType: LiveBuilderConfig> SyntheticOrdersSource<ConfigType> {
     fn new(extra_cfg: ExtraCfg, config: ConfigType) -> eyre::Result<Self> {
-        let block_number = 1;
-        let test_chain_state = TestChainState::new(BlockArgs::default().number(block_number))?;
+        let block_number = BlockArgs::MIN_BLOCK_NUMBER;
+        let test_chain_state = TestChainState::new(BlockArgs::default().with_number(block_number))?;
         let mut orders = Vec::new();
         for i in 0..extra_cfg.tx_count {
             let order = Order::Tx(MempoolTx::new(create_tip_tx(
@@ -76,7 +76,7 @@ impl<ConfigType: LiveBuilderConfig> SyntheticOrdersSource<ConfigType> {
             )));
             orders.push(OrdersWithTimestamp {
                 timestamp_ms: 0,
-                order,
+                order: Arc::new(order),
             });
         }
 
@@ -93,18 +93,22 @@ impl<ConfigType: LiveBuilderConfig> SyntheticOrdersSource<ConfigType> {
                 uuid: Uuid::nil(),
                 replacement_data: None,
                 signer: None,
+                refund_identity: None,
                 metadata: Metadata {
                     received_at_timestamp: time::OffsetDateTime::from_unix_timestamp(0).unwrap(),
+                    is_system: false,
                     refund_identity: None,
+                    disable_cross_region_sharing: false,
                 },
                 dropping_tx_hashes: Default::default(),
                 refund: None,
                 version: LAST_BUNDLE_VERSION,
+                external_hash: None,
             };
             bundle.hash_slow();
             orders.push(OrdersWithTimestamp {
                 timestamp_ms: 0,
-                order: Order::Bundle(bundle),
+                order: Arc::new(Order::Bundle(bundle)),
             });
         }
 
@@ -155,7 +159,7 @@ impl<ConfigType: LiveBuilderConfig>
 
 pub async fn run_backtest<ConfigType: LiveBuilderConfig>() -> eyre::Result<()> {
     let cli = Cli::parse();
-    let config: ConfigType = load_config_toml_and_env(cli.build_block_cfg.config.clone())?;
+    let config: ConfigType = load_toml_config(cli.build_block_cfg.config.clone())?;
     let order_source = SyntheticOrdersSource::new(cli.extra_cfg, config)?;
     run_backtest_build_block(cli.build_block_cfg, order_source).await
 }

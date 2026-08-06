@@ -1,6 +1,7 @@
 use alloy_consensus::SignableTransaction;
 use alloy_primitives::{Address, Signature, B256, U256};
-use reth_primitives::{public_key_to_address, Recovered, Transaction, TransactionSigned};
+use reth_ethereum_primitives::{Transaction, TransactionSigned};
+use reth_primitives_traits::{crypto::secp256k1::public_key_to_address, Recovered};
 use secp256k1::{Message, SecretKey, SECP256K1};
 
 /// Simple struct to sign txs/messages.
@@ -53,6 +54,7 @@ mod test {
     use alloy_consensus::TxEip1559;
     use alloy_primitives::{address, fixed_bytes, TxKind as TransactionKind};
     use reth_primitives_traits::SignerRecoverable;
+
     #[test]
     fn test_sign_transaction() {
         let secret =
@@ -64,8 +66,8 @@ mod test {
         let tx = Transaction::Eip1559(TxEip1559 {
             chain_id: 1,
             nonce: 2,
-            gas_limit: 21000,
-            max_fee_per_gas: 1000,
+            gas_limit: 21_000,
+            max_fee_per_gas: 0,
             max_priority_fee_per_gas: 20000,
             to: TransactionKind::Call(address),
             value: U256::from(3000u128),

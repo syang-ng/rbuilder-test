@@ -2,11 +2,13 @@ use alloy_primitives::{hex_literal::hex, Bytes};
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use eth_sparse_mpt::{
     test_utils::{get_test_change_set, get_test_multiproofs},
-    v1::reth_sparse_trie::{
-        change_set::ETHTrieChangeSet, hash::EthSparseTries,
-        shared_cache::RethSparseTrieShareCacheInternal, SparseTrieSharedCache,
+    v1::{
+        reth_sparse_trie::{
+            change_set::ETHTrieChangeSet, hash::EthSparseTries,
+            shared_cache::RethSparseTrieShareCacheInternal, SparseTrieSharedCache,
+        },
+        sparse_mpt::{DiffTrie, FixedTrie},
     },
-    v1::sparse_mpt::{DiffTrie, FixedTrie},
 };
 
 fn get_storage_tries(changes: &ETHTrieChangeSet, tries: &EthSparseTries) -> Vec<DiffTrie> {
@@ -118,8 +120,8 @@ fn gather_nodes(c: &mut Criterion) {
             .into_iter()
             .flat_map(|mp| mp.account_subtree.into_iter().collect::<Vec<_>>())
             .collect();
-        account_proof.sort_by_key(|(p, _)| p.clone());
-        account_proof.dedup_by_key(|(p, _)| p.clone());
+        account_proof.sort_by_key(|(p, _)| *p);
+        account_proof.dedup_by_key(|(p, _)| *p);
         account_proof
     };
 

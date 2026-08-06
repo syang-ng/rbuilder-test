@@ -10,7 +10,6 @@ reth_datadir = "/mnt/data/reth"
 
 coinbase_secret_key = "env:COINBASE_SECRET_KEY"
 relay_secret_key = "env:RELAY_SECRET_KEY"
-optimistic_relay_secret_key = "env:OPTIMISTIC_RELAY_SECRET_KEY"
 
 # cl_node_url can be a single value, array of values, or passed by an environment variables with values separated with a comma
 # cl_node_url = "http://localhost:3500"
@@ -26,7 +25,6 @@ ignore_cancellable_orders = true
 
 # genesis_fork_version = "0x00112233"
 
-sbundle_mergeable_signers = []
 live_builders = ["mp-ordering", "mgp-ordering", "merging"]
 
 enabled_relays = ["playground"]

@@ -5,13 +5,13 @@ use alloy_primitives::map::HashSet as AlloyHashSet;
 use tracing::trace;
 
 use alloy_primitives::{Bytes, B256};
-use alloy_trie::Nibbles;
+use nybbles::Nibbles;
 use rayon::prelude::*;
 use reth_errors::ProviderError;
 use reth_execution_errors::trie::StateProofError;
 use reth_provider::{
     providers::ConsistentDbView, BlockReader, DBProvider, DatabaseProviderFactory,
-    StateCommitmentProvider,
+    StorageSettingsCache,
 };
 use reth_trie::{proof::Proof, MultiProof as RethMultiProof, MultiProofTargets, EMPTY_ROOT_HASH};
 use reth_trie_db::{DatabaseHashedCursorFactory, DatabaseTrieCursorFactory};
@@ -62,7 +62,7 @@ pub struct TrieFetcher<Provider> {
 impl<Provider> TrieFetcher<Provider>
 where
     Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
-    Provider: StateCommitmentProvider,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
 {
     pub fn new(consistent_db_view: ConsistentDbView<Provider>) -> Self {
         Self { consistent_db_view }
@@ -79,14 +79,16 @@ where
             .map(|targets| -> Result<MultiProof, FetchNodeError> {
                 let start = Instant::now();
                 let provider = self.consistent_db_view.provider_ro()?;
-                let proof = Proof::new(
-                    DatabaseTrieCursorFactory::new(provider.tx_ref()),
-                    DatabaseHashedCursorFactory::new(provider.tx_ref()),
-                );
                 let targets_accounts = targets.len();
                 let targets_slots = targets.values().map(|v| v.len()).sum::<usize>();
 
-                let reth_multiproof = proof.multiproof(targets)?;
+                let reth_multiproof = reth_trie_db::with_adapter!(provider, |A| {
+                    Proof::new(
+                        DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref()),
+                        DatabaseHashedCursorFactory::new(provider.tx_ref()),
+                    )
+                    .multiproof(targets)
+                })?;
                 let result = convert_reth_multiproof(reth_multiproof, &all_requested_accounts);
                 let time_ms = start.elapsed().as_micros() as f64 / 1000.0;
                 trace!(
@@ -107,8 +109,8 @@ where
     }
 }
 
-fn pad_path(mut path: Nibbles) -> B256 {
-    path.as_mut_vec_unchecked().resize(64, 0);
+fn pad_path(path: Nibbles) -> B256 {
+    // `pack_to` writes left-aligned into the zeroed buffer
     let mut res = B256::default();
     path.pack_to(res.as_mut_slice());
     res
@@ -166,16 +168,16 @@ fn merge_results(
     let mut result = MultiProof::default();
     for mut proof in multiproofs {
         result.account_subtree.append(&mut proof.account_subtree);
-        result.account_subtree.sort_by_key(|s| s.0.clone());
-        result.account_subtree.dedup_by_key(|s| s.0.clone());
+        result.account_subtree.sort_by_key(|s| s.0);
+        result.account_subtree.dedup_by_key(|s| s.0);
 
         for (account, mut storage_proof) in proof.storages {
             let result_storage_proof = result.storages.entry(account).or_default();
             result_storage_proof
                 .subtree
                 .append(&mut storage_proof.subtree);
-            result_storage_proof.subtree.sort_by_key(|s| s.0.clone());
-            result_storage_proof.subtree.dedup_by_key(|s| s.0.clone());
+            result_storage_proof.subtree.sort_by_key(|s| s.0);
+            result_storage_proof.subtree.dedup_by_key(|s| s.0);
         }
     }
 
@@ -196,7 +198,7 @@ fn convert_reth_multiproof(
     for (k, v) in reth_proof.account_subtree.into_inner() {
         account_subtree.push((k, v));
     }
-    account_subtree.sort_by_key(|a| a.0.clone());
+    account_subtree.sort_by_key(|a| a.0);
     let mut storages = hash_map_with_capacity(reth_proof.storages.len());
     for (k, reth_storage_proof) in reth_proof.storages {
         if !all_requested_accounts.contains(&k) {
@@ -210,7 +212,7 @@ fn convert_reth_multiproof(
         for (k, v) in reth_storage_proof.subtree.into_inner() {
             subtree.push((k, v));
         }
-        subtree.sort_by_key(|a| a.0.clone());
+        subtree.sort_by_key(|a| a.0);
         let v = StorageMultiProof { subtree };
         storages.insert(k, v);
     }

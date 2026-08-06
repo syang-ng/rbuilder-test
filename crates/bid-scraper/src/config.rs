@@ -4,21 +4,22 @@ use serde_with::serde_as;
 use crate::{
     best_bid_ws_connector::ExternalWsPublisherConfig, bids_publisher::RelayBidsPublisherConfig,
     bloxroute_ws_publisher::BloxrouteWsPublisherConfig,
-    headers_publisher::RelayHeadersPublisherConfig,
+    headers_publisher::RelayHeadersPublisherConfig, titan_ws_publisher::TitanWsPublisherConfig,
     ultrasound_ws_publisher::UltrasoundWsPublisherConfig,
 };
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum PublisherConfig {
     RelayBids(RelayBidsPublisherConfig),
     RelayHeaders(RelayHeadersPublisherConfig),
     UltrasoundWs(UltrasoundWsPublisherConfig),
+    TitanWs(TitanWsPublisherConfig),
     BloxrouteWs(BloxrouteWsPublisherConfig),
     ExternalWs(ExternalWsPublisherConfig),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct NamedPublisherConfig {
     pub name: String,
     #[serde(flatten)]
@@ -33,6 +34,8 @@ pub struct Config {
     /// Example: "info"
     pub log_level: String,
     pub log_color: bool,
+    /// OTLP environment name, e.g. "production", "staging", etc.
+    pub otlp_env_name: Option<String>,
 
     /// Where we publish the bids. Example:"tcp://0.0.0.0:5555"
     pub publisher_url: String,

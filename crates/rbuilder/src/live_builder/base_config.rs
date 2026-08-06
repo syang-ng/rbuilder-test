@@ -1,14 +1,20 @@
 //! Config should always be deserializable, default values should be used
 //!
 use crate::{
-    building::builders::UnfinishedBlockBuildingSinkFactory,
-    live_builder::{order_input::OrderInputConfig, LiveBuilder},
+    building::journal::NullOrderJournalObserverFactory,
+    live_builder::{
+        order_flow_tracing::order_flow_tracer_manager::{
+            NullOrderFlowTracerManager, OrderFlowTracerManager, OrderFlowTracerManagerImpl,
+        },
+        order_input::{mempool_txs_detector::MempoolTxsDetector, OrderInputConfig},
+        process_killer::ProcessKiller,
+        LiveBuilder,
+    },
     provider::{
         ipc_state_provider::{IpcProviderConfig, IpcStateProviderFactory},
         StateProviderFactory,
     },
     roothash::RootHashContext,
-    utils::tracing::{setup_tracing_subscriber, LoggerConfig},
     utils::{
         constants::{MINS_PER_HOUR, SECS_PER_MINUTE},
         http_provider, ProviderFactoryReopener, Signer,
@@ -17,20 +23,19 @@ use crate::{
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
 use eth_sparse_mpt::{ETHSpareMPTVersion, RootHashThreadPool};
-use eyre::{eyre, Context};
+use eyre::Context;
 use jsonrpsee::RpcModule;
+use rbuilder_config::{EnvOrValue, LoggerConfig, OtlpConfig, TracingConfig};
 use reth::chainspec::chain_value_parser;
 use reth_chainspec::ChainSpec;
 use reth_db::DatabaseEnv;
 use reth_node_api::NodeTypesWithDBAdapter;
 use reth_node_ethereum::EthereumNode;
-use reth_primitives::StaticFileSegment;
 use reth_provider::StaticFileProviderFactory;
+use reth_provider::StaticFileSegment;
 use serde::{Deserialize, Deserializer};
-use serde_with::{serde_as, DeserializeAs};
+use serde_with::serde_as;
 use std::{
-    env::var,
-    fs::read_to_string,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     str::FromStr,
@@ -38,7 +43,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
-use tracing::{error, warn};
+use tracing::warn;
 use url::Url;
 
 use super::{
@@ -46,11 +51,9 @@ use super::{
         BlockListProvider, HttpBlockListProvider, NullBlockListProvider,
         StaticFileBlockListProvider,
     },
-    SlotSource,
+    block_output::unfinished_block_processing::UnfinishedBuiltBlocksInputFactory,
+    payload_events::MevBoostSlotDataGenerator,
 };
-
-/// Prefix for env variables in config
-const ENV_PREFIX: &str = "env:";
 
 /// Base config to be used by all builders.
 /// It allows us to create a base LiveBuilder with no algorithms or custom bidding.
@@ -70,17 +73,18 @@ pub struct BaseConfig {
     pub log_json: bool,
     log_level: EnvOrValue<String>,
     pub log_color: bool,
+    /// Name of the OTEL environment, e.g. `production`, `staging`, etc.
+    pub otlp_env_name: Option<String>,
 
     pub error_storage_path: Option<PathBuf>,
 
     coinbase_secret_key: Option<EnvOrValue<String>>,
 
-    pub flashbots_db: Option<EnvOrValue<String>>,
-
     pub el_node_ipc_path: Option<PathBuf>,
     pub jsonrpc_server_port: u16,
     #[serde(default = "default_ip")]
     pub jsonrpc_server_ip: Ipv4Addr,
+    pub jsonrpc_server_max_connections: Option<u32>,
 
     pub ignore_cancellable_orders: bool,
     pub ignore_blobs: bool,
@@ -89,6 +93,7 @@ pub struct BaseConfig {
     pub reth_datadir: Option<PathBuf>,
     pub reth_db_path: Option<PathBuf>,
     pub reth_static_files_path: Option<PathBuf>,
+    pub reth_rocksdb_path: Option<PathBuf>,
 
     /// Backwards compatibility. Downloads blocklist from a file.
     /// Same as setting a file name on blocklist.
@@ -111,12 +116,6 @@ pub struct BaseConfig {
     #[serde(deserialize_with = "deserialize_extra_data")]
     pub extra_data: Vec<u8>,
 
-    /// mev-share bundles coming from this address are treated in a special way(see [`ShareBundleMerger`])
-    pub sbundle_mergeable_signers: Option<Vec<Address>>,
-
-    /// Backwards compatible typo soon to be removed.
-    pub sbundle_mergeabe_signers: Option<Vec<Address>>,
-
     /// Number of threads used for incoming order simulation
     pub simulation_threads: usize,
     pub simulation_use_random_coinbase: bool,
@@ -131,10 +130,17 @@ pub struct BaseConfig {
     /// if 0 global rayon pool is used
     root_hash_threads: usize,
 
+    /// use pipelined finalization where blocks are "prefinalized" first
+    /// and payment tx is inserted later for faster bidding response time
+    pub adjust_finalized_blocks: bool,
+
     pub watchdog_timeout_sec: Option<u64>,
 
     /// List of `builders` to be used for live building
     pub live_builders: Vec<String>,
+
+    /// See [BlockBuildingHelperFromProvider::max_order_execution_duration_warning]
+    pub max_order_execution_duration_warning_us: Option<u64>,
 
     /// Config for IPC state provider
     pub ipc_provider: Option<IpcProviderConfig>,
@@ -142,6 +148,12 @@ pub struct BaseConfig {
     pub evm_caching_enable: bool,
     /// Use experimental code for faster finalize
     pub faster_finalize: bool,
+
+    /// See [OrderPool::time_to_keep_mempool_txs]
+    pub time_to_keep_mempool_txs_secs: u64,
+
+    /// The array of senders incoming transactions from which will not be counted towards the coinbase profit.
+    pub system_recipient_allowlist: Vec<Address>,
 
     // backtest config
     backtest_fetch_mempool_data_dir: EnvOrValue<String>,
@@ -152,45 +164,33 @@ pub struct BaseConfig {
     pub backtest_builders: Vec<String>,
     pub backtest_results_store_path: PathBuf,
     pub backtest_protect_bundle_signers: Vec<Address>,
+
+    /// We will store a file per block in this path.
+    pub orderflow_tracing_store_path: Option<PathBuf>,
+    /// Max number of blocks to keep in disk.
+    pub orderflow_tracing_max_blocks: usize,
 }
 
 pub fn default_ip() -> Ipv4Addr {
     Ipv4Addr::new(0, 0, 0, 0)
 }
 
-/// Loads config from toml file, some values can be loaded from env variables with the following syntax
-/// e.g. flashbots_db = "env:FLASHBOTS_DB"
-///
-/// variables that can be configured with env values:
-/// - log_level
-/// - coinbase_secret_key
-/// - flashbots_db
-/// - relay_secret_key
-/// - optimistic_relay_secret_key
-/// - backtest_fetch_mempool_data_dir
-pub fn load_config_toml_and_env<T: serde::de::DeserializeOwned>(
-    path: impl AsRef<Path>,
-) -> eyre::Result<T> {
-    let data = read_to_string(path.as_ref()).with_context(|| {
-        eyre!(
-            "Config file read error: {:?}",
-            path.as_ref().to_string_lossy()
-        )
-    })?;
-
-    let config: T = toml::from_str(&data).context("Config file parsing")?;
-    Ok(config)
-}
-
 impl BaseConfig {
     pub fn setup_tracing_subscriber(&self) -> eyre::Result<()> {
         let log_level = self.log_level.value()?;
-        let config = LoggerConfig {
+
+        let tracing_config = TracingConfig::new(LoggerConfig {
             env_filter: log_level,
             log_json: self.log_json,
             log_color: self.log_color,
-        };
-        setup_tracing_subscriber(config)?;
+        })
+        .maybe_with_otlp(
+            self.otlp_env_name
+                .as_ref()
+                .map(|name| OtlpConfig::new().with_environment(name.clone())),
+        );
+
+        let _guard = tracing_config.init_tracing()?;
         Ok(())
     }
 
@@ -218,22 +218,37 @@ impl BaseConfig {
     }
 
     /// Allows instantiating a [`LiveBuilder`] with an existing provider factory
-    pub async fn create_builder_with_provider_factory<P, SlotSourceType>(
+    pub async fn create_builder_with_provider_factory<P>(
         &self,
         cancellation_token: tokio_util::sync::CancellationToken,
-        sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
-        slot_source: SlotSourceType,
+        global_abort: tokio_util::sync::CancellationToken,
+        unfinished_built_blocks_input_factory: UnfinishedBuiltBlocksInputFactory<P>,
+        slot_source: MevBoostSlotDataGenerator,
         provider: P,
         blocklist_provider: Arc<dyn BlockListProvider>,
-    ) -> eyre::Result<super::LiveBuilder<P, SlotSourceType>>
+    ) -> eyre::Result<super::LiveBuilder<P>>
     where
         P: StateProviderFactory,
-        SlotSourceType: SlotSource,
     {
         let order_input_config = OrderInputConfig::from_config(self)?;
         let (orderpool_sender, orderpool_receiver) =
             mpsc::channel(order_input_config.input_channel_buffer_size);
-        Ok(LiveBuilder::<P, SlotSourceType> {
+
+        let order_flow_tracer_manager: Box<dyn OrderFlowTracerManager> =
+            if let Some(orderflow_tracing_store_path) = &self.orderflow_tracing_store_path {
+                if self.orderflow_tracing_max_blocks != 0 {
+                    Box::new(OrderFlowTracerManagerImpl::new(
+                        orderflow_tracing_store_path.clone(),
+                        self.orderflow_tracing_max_blocks,
+                    )?)
+                } else {
+                    Box::new(NullOrderFlowTracerManager {})
+                }
+            } else {
+                Box::new(NullOrderFlowTracerManager {})
+            };
+
+        Ok(LiveBuilder::<P> {
             watchdog_timeout: self.watchdog_timeout(),
             error_storage_path: self.error_storage_path.clone(),
             simulation_threads: self.simulation_threads,
@@ -246,41 +261,38 @@ impl BaseConfig {
             extra_data: self.extra_data.clone(),
             blocklist_provider,
 
-            global_cancellation: cancellation_token,
-
+            global_cancellation: cancellation_token.clone(),
+            global_abort,
+            critical_tasks_join_handles: Vec::new(),
+            process_killer: ProcessKiller::new(cancellation_token),
             extra_rpc: RpcModule::new(()),
-            sink_factory,
+            unfinished_built_blocks_input_factory,
             builders: Vec::new(),
 
             run_sparse_trie_prefetcher: self.root_hash_use_sparse_trie,
 
             orderpool_sender,
             orderpool_receiver,
-            sbundle_merger_selected_signers: Arc::new(self.sbundle_mergeable_signers()),
 
             evm_caching_enable: self.evm_caching_enable,
             simulation_use_random_coinbase: self.simulation_use_random_coinbase,
             faster_finalize: self.faster_finalize,
+            order_flow_tracer_manager,
+            order_journal_observer_factory: Box::new(NullOrderJournalObserverFactory {}),
+
+            mempool_detector: Arc::new(MempoolTxsDetector::new()),
         })
     }
 
     pub fn chain_spec(&self) -> eyre::Result<Arc<ChainSpec>> {
-        chain_value_parser(&self.chain)
-    }
-
-    pub fn sbundle_mergeable_signers(&self) -> Vec<Address> {
-        if let Some(sbundle_mergeable_signers) = &self.sbundle_mergeable_signers {
-            if self.sbundle_mergeabe_signers.is_some() {
-                error!("sbundle_mergeable_signers and sbundle_mergeabe_signers found. Will use bundle_mergeable_signers");
-            }
-            sbundle_mergeable_signers.clone()
-        } else if let Some(sbundle_mergeable_signers) = &self.sbundle_mergeabe_signers {
-            warn!("sbundle_mergeable_signers missing but found sbundle_mergeabe_signers. sbundle_mergeabe_signers will be used but this will be deprecated soon");
-            sbundle_mergeable_signers.clone()
-        } else {
-            warn!("Defaulting sbundle_mergeable_signers to empty. We may not comply with order flow rules.");
-            Vec::default()
-        }
+        // Expand env vars/`~` before handing the value to reth. reth's
+        // `parse_genesis` reads path-based chains literally (no shell
+        // expansion), so a `$HOME/...` chain path would otherwise fail to open.
+        // This is a no-op for built-in chain names like "mainnet".
+        let chain = shellexpand::full(&self.chain)
+            .wrap_err("failed to expand chain path")?
+            .into_owned();
+        chain_value_parser(&chain)
     }
 
     /// Open reth db and DB should be opened once per process but it can be cloned and moved to different threads.
@@ -294,6 +306,7 @@ impl BaseConfig {
             self.reth_datadir.as_deref(),
             self.reth_db_path.as_deref(),
             self.reth_static_files_path.as_deref(),
+            self.reth_rocksdb_path.as_deref(),
             self.chain_spec()?,
             false,
             if skip_root_hash {
@@ -333,7 +346,8 @@ impl BaseConfig {
         let version = match self.root_hash_sparse_trie_version.as_str() {
             "v1" => ETHSpareMPTVersion::V1,
             "v2" => ETHSpareMPTVersion::V2,
-            _ => eyre::bail!("root_hash_sparse_trie_version can be v1 or v2"),
+            "vexp" => ETHSpareMPTVersion::VExperimental,
+            _ => eyre::bail!("root_hash_sparse_trie_version can be v1, v2 or vexp"),
         };
         Ok(RootHashContext::new(
             self.root_hash_use_sparse_trie,
@@ -460,88 +474,19 @@ impl BaseConfig {
 
         Ok(path_expanded.parse()?)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnvOrValue<T>(String, std::marker::PhantomData<T>);
-
-impl<T: FromStr> EnvOrValue<T> {
-    pub fn value(&self) -> eyre::Result<String> {
-        let value = &self.0;
-        if value.starts_with(ENV_PREFIX) {
-            let var_name = value.trim_start_matches(ENV_PREFIX);
-            var(var_name).map_err(|_| eyre::eyre!("Env variable: {} not set", var_name))
-        } else {
-            Ok(value.to_string())
-        }
-    }
-}
-
-impl<T> From<&str> for EnvOrValue<T> {
-    fn from(s: &str) -> Self {
-        Self(s.to_string(), std::marker::PhantomData)
-    }
-}
-
-impl<'de, T: FromStr> Deserialize<'de> for EnvOrValue<T> {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(Self(s, std::marker::PhantomData))
-    }
-}
-
-// Helper function to resolve Vec<EnvOrValue<T>> to Vec<T>
-pub fn resolve_env_or_values<T: FromStr>(values: &[EnvOrValue<T>]) -> eyre::Result<Vec<T>> {
-    values
-        .iter()
-        .try_fold(Vec::new(), |mut acc, v| -> eyre::Result<Vec<T>> {
-            let value = v.value()?;
-            if v.0.starts_with(ENV_PREFIX) {
-                // If it's an environment variable, split by comma
-                let parsed: eyre::Result<Vec<T>> = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        T::from_str(s).map_err(|_| eyre::eyre!("Failed to parse value: {}", s))
-                    })
-                    .collect();
-                acc.extend(parsed?);
-            } else {
-                // If it's not an environment variable, just return the single value
-                acc.push(
-                    T::from_str(&value)
-                        .map_err(|_| eyre::eyre!("Failed to parse value: {}", value))?,
-                );
-            }
-            Ok(acc)
-        })
-}
-
-impl<'de, T> DeserializeAs<'de, EnvOrValue<T>> for EnvOrValue<T>
-where
-    T: FromStr,
-    String: Deserialize<'de>,
-{
-    fn deserialize_as<D>(deserializer: D) -> Result<EnvOrValue<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(EnvOrValue(s, std::marker::PhantomData))
+    pub fn max_order_execution_duration_warning(&self) -> Option<Duration> {
+        self.max_order_execution_duration_warning_us
+            .map(Duration::from_micros)
     }
 }
 
 pub const DEFAULT_CL_NODE_URL: &str = "http://127.0.0.1:3500";
 pub const DEFAULT_EL_NODE_IPC_PATH: &str = "/tmp/reth.ipc";
 pub const DEFAULT_INCOMING_BUNDLES_PORT: u16 = 8645;
-pub const DEFAULT_RETH_DB_PATH: &str = "/mnt/data/reth";
 /// This will update every 2.4 hours, super reasonable.
 pub const DEFAULT_BLOCKLIST_URL_MAX_AGE_HOURS: u64 = 24;
 pub const DEFAULT_REQUIRE_NON_EMPTY_BLOCKLIST: bool = false;
+pub const DEFAULT_TIME_TO_KEEP_MEMPOOL_TXS_SECS: u64 = 60;
 
 impl Default for BaseConfig {
     fn default() -> Self {
@@ -553,18 +498,20 @@ impl Default for BaseConfig {
             log_json: false,
             log_level: "info".into(),
             log_color: false,
+            otlp_env_name: None,
             error_storage_path: None,
             coinbase_secret_key: None,
-            flashbots_db: None,
             el_node_ipc_path: None,
             jsonrpc_server_port: DEFAULT_INCOMING_BUNDLES_PORT,
             jsonrpc_server_ip: default_ip(),
+            jsonrpc_server_max_connections: None,
             ignore_cancellable_orders: true,
             ignore_blobs: false,
             chain: "mainnet".to_string(),
-            reth_datadir: Some(DEFAULT_RETH_DB_PATH.parse().unwrap()),
+            reth_datadir: None,
             reth_db_path: None,
             reth_static_files_path: None,
+            reth_rocksdb_path: None,
             blocklist_file_path: None,
             blocklist: None,
             blocklist_url_max_age_hours: None,
@@ -574,6 +521,7 @@ impl Default for BaseConfig {
             root_hash_sparse_trie_version: "v1".to_string(),
             root_hash_compare_sparse_trie: false,
             root_hash_threads: 0,
+            adjust_finalized_blocks: false,
             watchdog_timeout_sec: None,
             backtest_fetch_mempool_data_dir: "/mnt/data/mempool".into(),
             backtest_fetch_eth_rpc_url: "http://127.0.0.1:8545".to_string(),
@@ -585,12 +533,15 @@ impl Default for BaseConfig {
             live_builders: vec!["mgp-ordering".to_string(), "mp-ordering".to_string()],
             simulation_threads: 1,
             simulation_use_random_coinbase: true,
-            sbundle_mergeable_signers: None,
-            sbundle_mergeabe_signers: None,
             require_non_empty_blocklist: Some(DEFAULT_REQUIRE_NON_EMPTY_BLOCKLIST),
             ipc_provider: None,
             evm_caching_enable: false,
             faster_finalize: false,
+            time_to_keep_mempool_txs_secs: DEFAULT_TIME_TO_KEEP_MEMPOOL_TXS_SECS,
+            orderflow_tracing_store_path: None,
+            orderflow_tracing_max_blocks: 0,
+            system_recipient_allowlist: Vec::new(),
+            max_order_execution_duration_warning_us: None,
         }
     }
 }
@@ -615,6 +566,7 @@ pub fn create_provider_factory(
     reth_datadir: Option<&Path>,
     reth_db_path: Option<&Path>,
     reth_static_files_path: Option<&Path>,
+    reth_rocksdb_path: Option<&Path>,
     chain_spec: Arc<ChainSpec>,
     rw: bool,
     root_hash_config: Option<RootHashContext>,
@@ -642,7 +594,7 @@ pub fn create_provider_factory(
         open_reth_db(&reth_db_path)
     }?;
 
-    let reth_static_files_path = match (reth_static_files_path, reth_datadir) {
+    let reth_static_files_path = match (reth_static_files_path, reth_datadir.clone()) {
         (Some(reth_static_files_path), _) => PathBuf::from(reth_static_files_path),
         (None, Some(reth_datadir)) => reth_datadir.join("static_files"),
         (None, None) => {
@@ -650,8 +602,21 @@ pub fn create_provider_factory(
         }
     };
 
-    let provider_factory_reopener =
-        ProviderFactoryReopener::new(db, chain_spec, reth_static_files_path, root_hash_config)?;
+    let reth_rocksdb_path = match (reth_rocksdb_path, reth_datadir) {
+        (Some(reth_rocksdb_path), _) => PathBuf::from(reth_rocksdb_path),
+        (None, Some(reth_datadir)) => reth_datadir.join("rocksdb"),
+        (None, None) => {
+            eyre::bail!("Either reth_rocksdb_path or reth_datadir must be provided")
+        }
+    };
+
+    let provider_factory_reopener = ProviderFactoryReopener::new(
+        db,
+        chain_spec,
+        reth_static_files_path,
+        reth_rocksdb_path,
+        root_hash_config,
+    )?;
 
     if provider_factory_reopener
         .provider_factory_unchecked()
@@ -690,7 +655,10 @@ mod test {
     use reth_db::init_db;
     use reth_db_common::init::init_genesis;
     use reth_node_core::dirs::{DataDirPath, MaybePlatformPath};
-    use reth_provider::{providers::StaticFileProvider, ProviderFactory};
+    use reth_provider::{
+        providers::{RocksDBProvider, StaticFileProvider},
+        ProviderFactory,
+    };
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -721,52 +689,75 @@ mod test {
         // Setup and initialize a temp reth db (with static files)
         let tempdir = TempDir::with_prefix_in("rbuilder-", "/tmp").unwrap();
 
-        let data_dir = MaybePlatformPath::<DataDirPath>::from(tempdir.into_path());
+        let data_dir = MaybePlatformPath::<DataDirPath>::from(tempdir.keep());
         let data_dir = data_dir.unwrap_or_chain_default(Chain::mainnet(), DatadirArgs::default());
 
-        let db = Arc::new(init_db(data_dir.data_dir(), Default::default()).unwrap());
+        // Initialize the db at the same path `create_provider_factory` resolves to
+        // (`<datadir>/db`). reth 1.11's `ProviderFactory::new` reads storage settings on open and
+        // errors on an uninitialized db, so the setup must initialize the exact path under test.
+        let db = Arc::new(init_db(data_dir.db(), Default::default()).unwrap());
         let provider_factory = ProviderFactory::<NodeTypesWithDBAdapter<EthereumNode, _>>::new(
             db,
             SEPOLIA.clone(),
             StaticFileProvider::read_write(data_dir.static_files().as_path()).unwrap(),
-        );
+            // Initialize RocksDB with the default tables so `create_provider_factory` can open it read-only below.
+            RocksDBProvider::builder(data_dir.rocksdb().as_path())
+                .with_default_tables()
+                .build()
+                .unwrap(),
+            crate::utils::reth_task_runtime(),
+        )
+        .unwrap();
         init_genesis(&provider_factory).unwrap();
+        // Release the read-write static-files lock before exercising `create_provider_factory`,
+        // which opens the same path read-only: reth 1.11's storage lock rejects a same-process
+        // re-lock while the setup factory still holds it.
+        drop(provider_factory);
 
         // Create longer-lived PathBuf values
         let data_dir_path = data_dir.data_dir();
         let db_path = data_dir.db();
         let static_files_path = data_dir.static_files();
+        let rocksdb_path = data_dir.rocksdb();
 
         let test_cases = [
-            // use main dir to resolve reth_db and static_files
-            (Some(data_dir_path), None, None, true),
+            // use main dir to resolve reth_db, static_files and rocksdb
+            (Some(data_dir_path), None, None, None, true),
             // use main dir to resolve reth_db and provide static_files
             (
                 Some(data_dir_path),
                 None,
                 Some(static_files_path.clone()),
+                None,
                 true,
             ),
-            // provide both reth_db and static_files
+            // provide reth_db, static_files and rocksdb explicitly
             (
                 None,
                 Some(db_path.as_path()),
                 Some(static_files_path.clone()),
+                Some(rocksdb_path.as_path()),
                 true,
             ),
             // fail to provide main dir to resolve empty static_files
-            (None, Some(db_path.as_path()), None, false),
+            (None, Some(db_path.as_path()), None, None, false),
             // fail to provide main dir to resolve empty reth_db
-            (None, None, Some(static_files_path), false),
+            (None, None, Some(static_files_path), None, false),
         ];
 
-        for (reth_datadir_path, reth_db_path, reth_static_files_path, should_succeed) in
-            test_cases.iter()
+        for (
+            reth_datadir_path,
+            reth_db_path,
+            reth_static_files_path,
+            reth_rocksdb_path,
+            should_succeed,
+        ) in test_cases.iter()
         {
             let result = create_provider_factory(
                 reth_datadir_path.as_deref(),
                 reth_db_path.as_deref(),
                 reth_static_files_path.as_deref(),
+                reth_rocksdb_path.as_deref(),
                 Default::default(),
                 true,
                 None,

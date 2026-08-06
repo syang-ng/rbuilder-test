@@ -7,6 +7,7 @@ pub mod order_intake_store;
 pub mod results_aggregator;
 pub mod simulation_cache;
 pub mod task;
+use alloy_primitives::I256;
 pub use groups::*;
 
 use ahash::HashMap;
@@ -16,13 +17,12 @@ use crossbeam::queue::SegQueue;
 use eyre::Result;
 use itertools::Itertools;
 use results_aggregator::BestResults;
-use reth_provider::StateProvider;
 use serde::Deserialize;
 use simulation_cache::SharedSimulationCache;
 use std::{
     sync::{mpsc as std_mpsc, Arc},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use task::*;
 use time::OffsetDateTime;
@@ -32,9 +32,10 @@ use tracing::{error, trace};
 use crate::{
     building::builders::{
         BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm, BlockBuildingAlgorithmInput,
-        LiveBuilderInput,
+        BuiltBlockIdSource, LiveBuilderInput,
     },
-    provider::StateProviderFactory,
+    live_builder::block_output::bidding_service_interface::CompetitionBidContext,
+    provider::{StateProviderFactory, StateProviderSource},
     utils::elapsed_ms,
 };
 
@@ -49,7 +50,8 @@ pub type ConflictResolutionResultPerGroup = (GroupId, (ResolutionResult, Conflic
 /// ParallelBuilderConfig configures parallel builder.
 /// * `num_threads` - number of threads to use for merging.
 /// * `merge_wait_time_ms` - time to wait for merging to finish before consuming new orders.
-/// * `safe_sorting_only` - Will only use sort modes that don't risk breaking the "best refund for user" since we don't megabundle the bundles (only the sbundles).
+/// * `safe_sorting_only` - Will only use sort modes that don't risk breaking much the "best refund for user"
+///   since random sorting might put the worst kickback first and let a blind backrun win.
 ///   This flag is just to test the algo until we solve every issue.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -57,8 +59,6 @@ pub struct ParallelBuilderConfig {
     pub discard_txs: bool,
     pub num_threads: usize,
     pub safe_sorting_only: bool,
-    #[serde(default)]
-    pub coinbase_payment: bool,
 }
 
 fn get_communication_channels() -> (
@@ -122,20 +122,21 @@ where
         let results_aggregator =
             ResultsAggregator::new(group_result_receiver, Arc::clone(&best_results));
 
-        let block_state = input
-            .provider
-            .history_by_block_hash(input.ctx.attributes.parent)?
-            .into();
+        let source = StateProviderSource::new(
+            Arc::new(input.provider.clone()),
+            input.ctx.attributes.parent,
+        );
 
         let block_building_result_assembler = BlockBuildingResultAssembler::new(
             config,
             Arc::clone(&best_results),
-            block_state,
+            source,
             input.ctx.clone(),
             input.cancel.clone(),
             input.builder_name.clone(),
-            input.sink.can_use_suggested_fee_recipient_as_coinbase(),
             Some(input.sink.clone()),
+            input.built_block_id_source.clone(),
+            input.max_order_execution_duration_warning,
         );
 
         let order_intake_consumer = OrderIntakeStore::new(input.input);
@@ -327,10 +328,10 @@ where
 
     let setup_duration = setup_start.elapsed();
 
-    let block_state: Arc<dyn StateProvider> = input
-        .provider
-        .history_by_block_hash(input.ctx.attributes.parent)?
-        .into();
+    let source = StateProviderSource::new(
+        Arc::new(input.provider.clone()),
+        input.ctx.attributes.parent,
+    );
 
     // Group processing
     let processing_start = Instant::now();
@@ -344,7 +345,7 @@ where
     let results = conflict_resolving_pool.process_groups_backtest(
         groups,
         &input.ctx,
-        block_state.clone(),
+        source.clone(),
         Arc::clone(&simulation_cache),
     );
     let processing_duration = processing_start.elapsed();
@@ -354,11 +355,12 @@ where
     let mut block_building_result_assembler = BlockBuildingResultAssembler::new(
         &config,
         Arc::clone(&best_results),
-        block_state.clone(),
+        source.clone(),
         input.ctx.clone(),
         CancellationToken::new(),
         String::from("backtest_builder"),
-        true,
+        None,
+        Arc::new(BuiltBlockIdSource::new()),
         None,
     );
     let assembler_duration = assembler_start.elapsed();
@@ -376,18 +378,15 @@ where
 
     // Block building
     let building_start = Instant::now();
-    let block_building_helper = block_building_result_assembler
+    let mut block_building_helper = block_building_result_assembler
         .build_backtest_block(best_results, OffsetDateTime::now_utc())?;
 
-    let payout_tx_value = if config.coinbase_payment {
-        None
-    } else {
-        Some(block_building_helper.true_block_value()?)
-    };
+    let payout_tx_value = block_building_helper.true_block_value()?;
     let finalize_block_result = block_building_helper.finalize_block(
         &mut block_building_result_assembler.local_ctx,
         payout_tx_value,
-        None,
+        I256::ZERO,
+        CompetitionBidContext::no_competition_bid(),
     )?;
     let building_duration = building_start.elapsed();
     let total_duration = start_time.elapsed();
@@ -447,10 +446,10 @@ where
 
     let setup_duration = setup_start.elapsed();
 
-    let block_state: Arc<dyn StateProvider> = input
-        .provider
-        .history_by_block_hash(input.ctx.attributes.parent)?
-        .into();
+    let source = StateProviderSource::new(
+        Arc::new(input.provider.clone()),
+        input.ctx.attributes.parent,
+    );
 
     // Group processing
     let processing_start = Instant::now();
@@ -475,7 +474,7 @@ where
     let results = conflict_resolving_pool.process_groups_default_backtest(
         groups,
         &input.ctx,
-        block_state.clone(),
+        source.clone(),
         Arc::clone(&simulation_cache),
     );
     let processing_duration = processing_start.elapsed();
@@ -485,11 +484,12 @@ where
     let mut block_building_result_assembler = BlockBuildingResultAssembler::new(
         &config,
         Arc::clone(&best_results),
-        block_state.clone(),
+        source.clone(),
         input.ctx.clone(),
         CancellationToken::new(),
         String::from("backtest_builder"),
-        true,
+        None,
+        Arc::new(BuiltBlockIdSource::new()),
         None,
     );
     let assembler_duration = assembler_start.elapsed();
@@ -507,18 +507,15 @@ where
 
     // Block building
     let building_start = Instant::now();
-    let block_building_helper = block_building_result_assembler
+    let mut block_building_helper = block_building_result_assembler
         .build_backtest_block(best_results, OffsetDateTime::now_utc())?;
 
-    let payout_tx_value = if config.coinbase_payment {
-        None
-    } else {
-        Some(block_building_helper.true_block_value()?)
-    };
+    let payout_tx_value = block_building_helper.true_block_value()?;
     let finalize_block_result = block_building_helper.finalize_block(
         &mut block_building_result_assembler.local_ctx,
         payout_tx_value,
-        None,
+        I256::ZERO,
+        CompetitionBidContext::no_competition_bid(),
     )?;
     let building_duration = building_start.elapsed();
     let total_duration = start_time.elapsed();
@@ -538,12 +535,21 @@ where
 #[derive(Debug)]
 pub struct ParallelBuildingAlgorithm {
     config: ParallelBuilderConfig,
+    max_order_execution_duration_warning: Option<Duration>,
     name: String,
 }
 
 impl ParallelBuildingAlgorithm {
-    pub fn new(config: ParallelBuilderConfig, name: String) -> Self {
-        Self { config, name }
+    pub fn new(
+        config: ParallelBuilderConfig,
+        max_order_execution_duration_warning: Option<Duration>,
+        name: String,
+    ) -> Self {
+        Self {
+            config,
+            max_order_execution_duration_warning,
+            name,
+        }
     }
 }
 
@@ -563,6 +569,9 @@ where
             sink: input.sink,
             builder_name: self.name.clone(),
             cancel: input.cancel,
+            built_block_cache: input.built_block_cache,
+            built_block_id_source: input.built_block_id_source,
+            max_order_execution_duration_warning: self.max_order_execution_duration_warning,
         };
         run_parallel_builder(live_input, &self.config);
     }

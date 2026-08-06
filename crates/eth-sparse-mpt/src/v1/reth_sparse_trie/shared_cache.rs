@@ -5,9 +5,8 @@ use crate::{
     utils::HashMap,
     v1::sparse_mpt::{AddNodeError, FixedTrie},
 };
-use alloy_primitives::Bytes;
-use alloy_primitives::B256;
-use alloy_trie::Nibbles;
+use alloy_primitives::{Bytes, B256};
+use nybbles::Nibbles;
 
 /// SparseTrieSharedCache is a storage for fetched parts of the ethereum tries
 /// It should be created once for each parent block and can be shared with a different threads.
@@ -147,11 +146,11 @@ impl RethSparseTrieShareCacheInternal {
         multiproof: MultiProof,
     ) -> Result<(), AddNodeError> {
         let mut nodes: Vec<_> = multiproof.account_subtree.into_iter().collect();
-        nodes.sort_by_key(|(p, _)| p.clone());
+        nodes.sort_by_key(|(p, _)| *p);
         self.account_trie.add_nodes(&nodes)?;
         for (account, storge_proofs) in multiproof.storages {
             let mut nodes: Vec<_> = storge_proofs.subtree.into_iter().collect();
-            nodes.sort_by_key(|(p, _)| p.clone());
+            nodes.sort_by_key(|(p, _)| *p);
             let account = Bytes::copy_from_slice(account.as_slice());
             let storage_trie = self.storage_tries.entry(account).or_default();
             storage_trie.add_nodes(&nodes)?;

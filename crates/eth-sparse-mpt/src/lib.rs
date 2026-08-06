@@ -6,14 +6,13 @@
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::type_complexity)]
 
-use std::sync::Arc;
-
-use alloy_primitives::{Address, B256};
-
+use crate::utils::{HashMap, HashSet};
+use alloy_primitives::{Address, Bytes, B256};
 use reth_provider::{
-    providers::ConsistentDbView, BlockReader, DatabaseProviderFactory, ExecutionOutcome,
-    StateCommitmentProvider,
+    providers::ConsistentDbView, BlockReader, DatabaseProviderFactory, StorageSettingsCache,
 };
+use revm::database::BundleState;
+use std::sync::Arc;
 
 #[cfg(any(test, feature = "benchmark-utils"))]
 pub mod test_utils;
@@ -21,6 +20,7 @@ pub mod utils;
 
 pub mod v1;
 pub mod v2;
+pub mod v_experimental;
 
 #[derive(Debug)]
 pub struct ChangedAccountData {
@@ -49,7 +49,7 @@ impl RootHashThreadPool {
     pub fn try_new(threads: usize) -> Result<RootHashThreadPool, rayon::ThreadPoolBuildError> {
         let rayon_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
-            .thread_name(|idx| format!("sparse_mpt:{}", idx))
+            .thread_name(|idx| format!("sparse_mpt:{idx}"))
             .build()?;
         Ok(RootHashThreadPool {
             rayon_pool: Arc::new(rayon_pool),
@@ -68,6 +68,7 @@ impl Default for RootHashThreadPool {
 pub struct SparseTrieSharedCache {
     cache_v1: v1::reth_sparse_trie::SparseTrieSharedCache,
     cache_v2: v2::SharedCacheV2,
+    cache_v_experimental: v_experimental::SharedCacheVExperimental,
 }
 
 impl SparseTrieSharedCache {
@@ -76,20 +77,28 @@ impl SparseTrieSharedCache {
             parent_state_root,
         );
         let mut cache_v2 = v2::SharedCacheV2::default();
-        cache_v2.last_block_hash = parent_block_hash;
-        Self { cache_v1, cache_v2 }
+        cache_v2.parent_state_root = parent_state_root;
+        let mut cache_v_experimental = v_experimental::SharedCacheVExperimental::default();
+        cache_v_experimental.last_block_hash = parent_block_hash;
+        Self {
+            cache_v1,
+            cache_v2,
+            cache_v_experimental,
+        }
     }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct SparseTrieLocalCache {
-    calc: v2::RootHashCalculator,
+    calc_v2: v2::RootHashCalculator,
+    calc_v_experimental: v_experimental::RootHashCalculatorExperimental,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum ETHSpareMPTVersion {
     V1,
     V2,
+    VExperimental,
 }
 
 pub fn prefetch_tries_for_accounts<'a, Provider>(
@@ -100,7 +109,7 @@ pub fn prefetch_tries_for_accounts<'a, Provider>(
 ) -> Result<SparseTrieMetrics, SparseTrieError>
 where
     Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
-    Provider: StateCommitmentProvider,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
 {
     match version {
         ETHSpareMPTVersion::V1 => {
@@ -119,6 +128,11 @@ where
         ETHSpareMPTVersion::V2 => {
             v2::prefetch_proofs(consistent_db_view, &shared_cache.cache_v2, changed_data)
         }
+        ETHSpareMPTVersion::VExperimental => v_experimental::prefetch_proofs(
+            consistent_db_view,
+            &shared_cache.cache_v_experimental,
+            changed_data,
+        ),
     }
 }
 
@@ -141,9 +155,69 @@ impl SparseTrieError {
     }
 }
 
+pub fn calculate_account_proofs_with_sparse_trie<Provider>(
+    consistent_db_view: ConsistentDbView<Provider>,
+    outcome: &BundleState,
+    proof_targets: &HashSet<Address>,
+    shared_cache: &SparseTrieSharedCache,
+    local_cache: &mut SparseTrieLocalCache,
+    thread_pool: &Option<RootHashThreadPool>,
+    version: ETHSpareMPTVersion,
+) -> (
+    Result<HashMap<Address, Vec<Bytes>>, SparseTrieError>,
+    SparseTrieMetrics,
+)
+where
+    Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
+{
+    let calculate = || match version {
+        ETHSpareMPTVersion::V1 => (
+            Err(SparseTrieError::Other(eyre::eyre!(
+                "proof generation not supported in v1"
+            ))),
+            Default::default(),
+        ),
+        ETHSpareMPTVersion::V2 => {
+            let result = local_cache.calc_v2.calculate_root_hash_with_sparse_trie(
+                consistent_db_view,
+                shared_cache.cache_v2.clone(),
+                outcome,
+                &[],
+                proof_targets,
+            );
+            match result {
+                Ok((_, proofs, metrics)) => (Ok(proofs), metrics),
+                Err(err) => (Err(err), Default::default()),
+            }
+        }
+        ETHSpareMPTVersion::VExperimental => {
+            let result = local_cache
+                .calc_v_experimental
+                .calculate_root_hash_with_sparse_trie(
+                    consistent_db_view,
+                    shared_cache.cache_v_experimental.clone(),
+                    outcome,
+                    &[],
+                    proof_targets,
+                );
+            match result {
+                Ok((_, proofs, metrics)) => (Ok(proofs), metrics),
+                Err(err) => (Err(err), Default::default()),
+            }
+        }
+    };
+    if let Some(thread_pool) = thread_pool {
+        thread_pool.rayon_pool.install(calculate)
+    } else {
+        calculate()
+    }
+}
+
 pub fn calculate_root_hash_with_sparse_trie<Provider>(
     consistent_db_view: ConsistentDbView<Provider>,
-    outcome: &ExecutionOutcome,
+    outcome: &BundleState,
+    incremental_change: &[Address],
     shared_cache: &SparseTrieSharedCache,
     local_cache: &mut SparseTrieLocalCache,
     thread_pool: &Option<RootHashThreadPool>,
@@ -151,13 +225,14 @@ pub fn calculate_root_hash_with_sparse_trie<Provider>(
 ) -> (Result<B256, SparseTrieError>, SparseTrieMetrics)
 where
     Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
-    Provider: StateCommitmentProvider,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
 {
     if let Some(thread_pool) = thread_pool {
         thread_pool.rayon_pool.install(|| {
             calculate_root_hash_with_sparse_trie_internal(
                 consistent_db_view,
                 outcome,
+                incremental_change,
                 shared_cache,
                 local_cache,
                 version,
@@ -167,6 +242,7 @@ where
         calculate_root_hash_with_sparse_trie_internal(
             consistent_db_view,
             outcome,
+            incremental_change,
             shared_cache,
             local_cache,
             version,
@@ -176,14 +252,15 @@ where
 
 pub fn calculate_root_hash_with_sparse_trie_internal<Provider>(
     consistent_db_view: ConsistentDbView<Provider>,
-    outcome: &ExecutionOutcome,
+    outcome: &BundleState,
+    incremental_change: &[Address],
     shared_cache: &SparseTrieSharedCache,
     local_cache: &mut SparseTrieLocalCache,
     version: ETHSpareMPTVersion,
 ) -> (Result<B256, SparseTrieError>, SparseTrieMetrics)
 where
     Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
-    Provider: StateCommitmentProvider,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
 {
     match version {
         ETHSpareMPTVersion::V1 => {
@@ -198,13 +275,30 @@ where
             (result, metrics)
         }
         ETHSpareMPTVersion::V2 => {
-            let result = local_cache.calc.calculate_root_hash_with_sparse_trie(
+            let result = local_cache.calc_v2.calculate_root_hash_with_sparse_trie(
                 consistent_db_view,
                 shared_cache.cache_v2.clone(),
                 outcome,
+                incremental_change,
+                &Default::default(),
             );
             match result {
-                Ok((res, metrics)) => (Ok(res), metrics),
+                Ok((res, _, metrics)) => (Ok(res), metrics),
+                Err(err) => (Err(err), Default::default()),
+            }
+        }
+        ETHSpareMPTVersion::VExperimental => {
+            let result = local_cache
+                .calc_v_experimental
+                .calculate_root_hash_with_sparse_trie(
+                    consistent_db_view,
+                    shared_cache.cache_v_experimental.clone(),
+                    outcome,
+                    incremental_change,
+                    &Default::default(),
+                );
+            match result {
+                Ok((res, _, metrics)) => (Ok(res), metrics),
                 Err(err) => (Err(err), Default::default()),
             }
         }

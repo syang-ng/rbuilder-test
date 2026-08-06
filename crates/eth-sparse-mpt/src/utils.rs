@@ -2,10 +2,8 @@ use std::hash::{Hash, Hasher};
 
 use alloy_primitives::{keccak256, Bytes};
 use alloy_rlp::{length_of_length, BufMut, Encodable, Header, EMPTY_STRING_CODE};
-use alloy_trie::{
-    nodes::{ExtensionNodeRef, LeafNodeRef},
-    Nibbles,
-};
+use alloy_trie::nodes::{ExtensionNodeRef, LeafNodeRef};
+use nybbles::Nibbles;
 use reth_trie::RlpNode;
 use rustc_hash::{FxBuildHasher, FxHasher};
 
@@ -31,25 +29,23 @@ pub fn rlp_pointer(rlp_encode: Bytes) -> Bytes {
 }
 
 pub fn concat_path(p1: &Nibbles, p2: &[u8]) -> Nibbles {
-    let mut result = Nibbles::with_capacity(p1.len() + p2.len());
-    result.extend_from_slice_unchecked(p1);
+    let mut result = *p1;
     result.extend_from_slice_unchecked(p2);
     result
 }
 
 pub fn strip_first_nibble_mut(p: &mut Nibbles) -> u8 {
-    let nibble = p[0];
-    let vec = p.as_mut_vec_unchecked();
-    vec.remove(0);
+    let nibble = p.get_unchecked(0);
+    *p = p.slice_unchecked(1, p.len());
     nibble
 }
 
 #[inline]
 pub fn extract_prefix_and_suffix(p1: &Nibbles, p2: &Nibbles) -> (Nibbles, Nibbles, Nibbles) {
     let prefix_len = p1.common_prefix_length(p2);
-    let prefix = Nibbles::from_nibbles_unchecked(&p1[..prefix_len]);
-    let suffix1 = Nibbles::from_nibbles_unchecked(&p1[prefix_len..]);
-    let suffix2 = Nibbles::from_nibbles_unchecked(&p2[prefix_len..]);
+    let prefix = p1.slice_unchecked(0, prefix_len);
+    let suffix1 = p1.slice_unchecked(prefix_len, p1.len());
+    let suffix2 = p2.slice_unchecked(prefix_len, p2.len());
 
     (prefix, suffix1, suffix2)
 }

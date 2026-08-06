@@ -4,14 +4,14 @@
 use super::{
     base_config::BaseConfig,
     block_output::{
-        bid_observer::{BidObserver, NullBidObserver},
-        bidding::{
-            interfaces::BiddingService, true_block_value_bidder::TrueBlockValueBiddingService,
-            wallet_balance_watcher::WalletBalanceWatcher,
+        bidding_service_interface::{
+            BidObserver, BiddingService, LandedBlockInfo, NullBidObserver,
         },
-        block_sealing_bidder_factory::BlockSealingBidderFactory,
-        relay_submit::{OptimisticConfig, RelaySubmitSinkFactory, SubmissionConfig},
+        relay_submit::{RelaySubmitSinkFactory, SubmissionConfig},
+        true_value_bidding_service::NewTrueBlockValueBiddingService,
+        unfinished_block_processing::UnfinishedBuiltBlocksInputFactory,
     },
+    wallet_balance_watcher::WalletBalanceWatcher,
 };
 use crate::{
     beacon_api_client::Client,
@@ -22,65 +22,63 @@ use crate::{
                 default_parallel_build_backtest, parallel_build_backtest, ParallelBuilderConfig, ParallelBuildingAlgorithm,
             },
             BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
-            UnfinishedBlockBuildingSinkFactory,
         },
         order_priority::{
             FullProfitInfoGetter, NonMempoolProfitInfoGetter, OrderLengthThreeMaxProfitPriority,
             OrderLengthThreeMevGasPricePriority, OrderMaxProfitPriority, OrderMevGasPricePriority,
             OrderTypePriority, ProfitInfoGetter,
         },
-        Sorting,
+        PartialBlockExecutionTracer, Sorting,
     },
     live_builder::{
-        base_config::EnvOrValue,
+        base_config::default_ip,
         block_output::{
-            bidding::{
-                block_bid_with_stats::ScrapedBids2BlockBidWithStatsObs,
-                interfaces::{BiddingServiceWinControl, LandedBlockInfo},
-            },
-            relay_submit::BuilderSinkFactory,
+            bidding_service_interface::{BiddingService2BidSender, RelaySet},
+            relay_submit::{AlwaysSubmitPolicy, OptimisticV3Config, RelaySubmissionPolicy},
         },
         cli::LiveBuilderConfig,
         payload_events::MevBoostSlotDataGenerator,
     },
-    mev_boost::{BLSBlockSigner, RelayClient},
-    primitives::mev_boost::{
-        MevBoostRelayBidSubmitter, MevBoostRelaySlotInfoProvider, RelayConfig, RelayMode,
-        RelaySubmitConfig,
+    mev_boost::{
+        bloxroute_grpc,
+        optimistic_v3::{self, OptimisticV3BlockCache},
+        BLSBlockSigner, MevBoostRelayBidSubmitter, MevBoostRelaySlotInfoProvider, RelayClient,
+        RelayConfig, RelaySubmitConfig,
     },
     provider::StateProviderFactory,
     roothash::RootHashContext,
     utils::{build_info::rbuilder_version, ProviderFactoryReopener, Signer},
 };
 use alloy_chains::ChainKind;
-use alloy_primitives::{
-    utils::{format_ether, parse_ether},
-    FixedBytes, B256, U256,
-};
-use bid_scraper::bid_scraper_client::run_nng_subscriber_with_retries;
+use alloy_primitives::{utils::parse_ether, Address, FixedBytes, B256, U256};
+use alloy_rpc_types_beacon::BlsPublicKey;
+use bid_scraper::config::NamedPublisherConfig;
 use ethereum_consensus::{
     builder::compute_builder_domain, crypto::SecretKey, primitives::Version,
     state_transition::Context as ContextEth,
 };
 use eyre::Context;
 use lazy_static::lazy_static;
+use rbuilder_config::EnvOrValue;
+use rbuilder_primitives::mev_boost::{MevBoostRelayID, RelayMode};
 use reth_chainspec::{Chain, ChainSpec, NamedChain};
 use reth_db::DatabaseEnv;
 use reth_node_api::NodeTypesWithDBAdapter;
 use reth_node_ethereum::EthereumNode;
-use reth_primitives::StaticFileSegment;
 use reth_provider::StaticFileProviderFactory;
+use reth_provider::StaticFileSegment;
 use serde::Deserialize;
 use serde_with::{serde_as, OneOrMany};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
-use std::{future::Future, pin::Pin};
+use tokio::{sync::Mutex as TokioMutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use url::Url;
@@ -111,8 +109,29 @@ pub struct BuilderConfig {
     pub builder: SpecificBuilderConfig,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubsidyConfig {
+    pub relay: MevBoostRelayID,
+    pub value: String,
+}
+
+/// TOML configuration for TrueBlockValueBiddingService (deserializable from config files).
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TrueBlockValueBiddingServiceConfigToml {
+    /// When the sample bidder (see TrueBlockValueBiddingService) will start bidding.
+    /// Usually a negative number.
+    pub slot_delta_to_start_bidding_ms: Option<i64>,
+    /// Value added to the bids (see TrueBlockValueBiddingService).
+    pub subsidy: Option<String>,
+    /// Overrides subsidy.
+    #[serde(default)]
+    pub subsidy_overrides: Vec<SubsidyConfig>,
+}
+
 #[serde_as]
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     #[serde(flatten)]
@@ -124,35 +143,61 @@ pub struct Config {
     /// selected builder configurations
     pub builders: Vec<BuilderConfig>,
 
-    /// When the sample bidder (see TrueBlockValueBiddingService) will start bidding.
-    /// Usually a negative number.
-    pub slot_delta_to_start_bidding_ms: Option<i64>,
-    /// Value added to the bids (see TrueBlockValueBiddingService).
-    pub subsidy: Option<String>,
+    #[serde(flatten)]
+    pub true_block_value_bidding_service_config: TrueBlockValueBiddingServiceConfigToml,
 }
 
 const DEFAULT_SLOT_DELTA_TO_START_BIDDING_MS: i64 = -8000;
-const DEFAULT_SCRAPED_BIDS_PUBLISHER_URL: &str = "tcp://0.0.0.0:5555";
+
+/// Parse TrueBlockValueBiddingServiceConfigToml into TrueBlockValueBiddingServiceConfig.
+/// This function converts the TOML config fields (Option<String> subsidy, Vec<SubsidyConfig>, Option<i64>)
+/// into the parsed types (U256, HashMap<MevBoostRelayID, U256>, Duration).
+pub fn parse_true_block_value_bidding_service_config(
+    config: &TrueBlockValueBiddingServiceConfigToml,
+) -> eyre::Result<super::block_output::true_value_bidding_service::TrueBlockValueBiddingServiceConfig>
+{
+    use super::block_output::true_value_bidding_service::TrueBlockValueBiddingServiceConfig;
+    let slot_delta_to_start_bidding = time::Duration::milliseconds(
+        config
+            .slot_delta_to_start_bidding_ms
+            .unwrap_or(DEFAULT_SLOT_DELTA_TO_START_BIDDING_MS),
+    );
+
+    let mut subsidy_overrides = HashMap::default();
+    for subsidy_override in config.subsidy_overrides.iter() {
+        subsidy_overrides.insert(
+            subsidy_override.relay.clone(),
+            parse_ether(&subsidy_override.value)?,
+        );
+    }
+
+    let subsidy = config
+        .subsidy
+        .as_ref()
+        .map(|s| parse_ether(s))
+        .unwrap_or(Ok(U256::ZERO))?;
+
+    Ok(TrueBlockValueBiddingServiceConfig {
+        subsidy,
+        subsidy_overrides,
+        slot_delta_to_start_bidding,
+    })
+}
+const DEFAULT_REGISTRATION_UPDATE_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_ASK_FOR_FILTERING_VALIDATORS: bool = false;
 const DEFAULT_CAN_IGNORE_GAS_LIMIT: bool = false;
 
 #[serde_as]
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct L1Config {
     // Relay Submission configuration
     pub relays: Vec<RelayConfig>,
     pub enabled_relays: Vec<String>,
-
+    /// The interval at which validator registrations should be updated.
+    pub registration_update_interval_ms: Option<u64>,
     /// Secret key that will be used to sign normal submissions to the relay.
     relay_secret_key: Option<EnvOrValue<String>>,
-    /// Secret key that will be used to sign optimistic submissions to the relay.
-    optimistic_relay_secret_key: EnvOrValue<String>,
-    /// When enabled builer will make optimistic submissions to optimistic relays
-    /// influenced by `optimistic_max_bid_value_eth`
-    pub optimistic_enabled: bool,
-    /// Bids above this value will always be submitted in non-optimistic mode.
-    pub optimistic_max_bid_value_eth: String,
 
     /// Name kept singular for backwards compatibility
     #[serde_as(deserialize_as = "OneOrMany<EnvOrValue<String>>")]
@@ -160,8 +205,18 @@ pub struct L1Config {
 
     /// Genesis fork version for the chain. If not provided it will be fetched from the beacon client.
     pub genesis_fork_version: Option<String>,
-    /// Where the bids scraper publishes the bids. Example:"tcp://0.0.0.0:5555"
-    pub scraped_bids_publisher_url: String,
+    /// A bid scraper will be spawned for each NamedPublisherConfig.
+    pub relay_bid_scrapers: Vec<NamedPublisherConfig>,
+
+    /// Optimistic V3 server IP.
+    #[serde(default = "default_ip")]
+    pub optimistic_v3_server_ip: Ipv4Addr,
+    /// Optimistic V3 server port.
+    pub optimistic_v3_server_port: u16,
+    /// Optimistic V3 public URL.
+    pub optimistic_v3_public_url: String,
+    /// The relay pubkey.
+    pub optimistic_v3_relay_pubkeys: HashSet<BlsPublicKey>,
 }
 
 impl Default for L1Config {
@@ -170,19 +225,21 @@ impl Default for L1Config {
             relays: vec![],
             enabled_relays: vec![],
             relay_secret_key: None,
-            optimistic_relay_secret_key: "".into(),
-            optimistic_enabled: false,
-            optimistic_max_bid_value_eth: "0.0".to_string(),
             cl_node_url: vec![EnvOrValue::from("http://127.0.0.1:3500")],
             genesis_fork_version: None,
-            scraped_bids_publisher_url: DEFAULT_SCRAPED_BIDS_PUBLISHER_URL.to_owned(),
+            relay_bid_scrapers: Default::default(),
+            registration_update_interval_ms: None,
+            optimistic_v3_server_ip: default_ip(),
+            optimistic_v3_server_port: 6071,
+            optimistic_v3_public_url: String::new(),
+            optimistic_v3_relay_pubkeys: HashSet::default(),
         }
     }
 }
 
 impl L1Config {
     pub fn resolve_cl_node_urls(&self) -> eyre::Result<Vec<String>> {
-        crate::live_builder::base_config::resolve_env_or_values::<String>(&self.cl_node_url)
+        rbuilder_config::resolve_env_or_values::<String>(&self.cl_node_url)
     }
 
     pub fn beacon_clients(&self) -> eyre::Result<Vec<Client>> {
@@ -234,6 +291,16 @@ impl L1Config {
         Ok(())
     }
 
+    pub fn relays_ids(&self) -> RelaySet {
+        let mut effective_enabled_relays: std::collections::HashSet<MevBoostRelayID> =
+            self.enabled_relays.iter().cloned().collect();
+        effective_enabled_relays.extend(self.relays.iter().map(|r| r.name.clone()));
+        effective_enabled_relays
+            .into_iter()
+            .collect::<Vec<MevBoostRelayID>>()
+            .into()
+    }
+
     pub fn create_relays(
         &self,
     ) -> eyre::Result<(
@@ -246,13 +313,11 @@ impl L1Config {
             relay_configs.insert(relay.name.clone(), relay);
         }
         // For backwards compatibility: add all user-configured relays to enabled_relays
-        let mut effective_enabled_relays: std::collections::HashSet<String> =
-            self.enabled_relays.iter().cloned().collect();
-        effective_enabled_relays.extend(self.relays.iter().map(|r| r.name.clone()));
+        let effective_enabled_relays = self.relays_ids();
         // Create enabled relays
         let mut submitters = Vec::new();
         let mut slot_info_providers = Vec::new();
-        for relay_name in effective_enabled_relays.iter() {
+        for relay_name in effective_enabled_relays.relays().iter() {
             match relay_configs.get(relay_name) {
                 Some(relay_config) => {
                     let url = match relay_config.url.parse() {
@@ -264,12 +329,14 @@ impl L1Config {
                             );
                         }
                     };
-                    let client = RelayClient::from_url(
+                    let mut client = RelayClient::from_url(
                         url,
                         relay_config.authorization_header.clone(),
                         relay_config.builder_id_header.clone(),
                         relay_config.api_token_header.clone(),
                         relay_config.is_bloxroute,
+                        relay_config.bloxroute_rproxy_regions.clone(),
+                        relay_config.bloxroute_rproxy_only,
                         relay_config
                             .ask_for_filtering_validators
                             .unwrap_or(DEFAULT_ASK_FOR_FILTERING_VALIDATORS),
@@ -277,6 +344,14 @@ impl L1Config {
                             .can_ignore_gas_limit
                             .unwrap_or(DEFAULT_CAN_IGNORE_GAS_LIMIT),
                     );
+                    if let Some(grpc_url) = relay_config.grpc_url.clone() {
+                        let grpc_client = Arc::new(TokioMutex::new(
+                            bloxroute_grpc::types::relay_client::RelayClient::new(
+                                tonic::transport::Endpoint::try_from(grpc_url)?.connect_lazy(),
+                            ),
+                        ));
+                        client = client.with_grpc_client(grpc_client);
+                    }
                     Self::create_relay_sub_objects(
                         relay_config,
                         client,
@@ -298,14 +373,10 @@ impl L1Config {
     fn submission_config(
         &self,
         chain_spec: Arc<ChainSpec>,
+        signing_domain: B256,
         bid_observer: Box<dyn BidObserver + Send + Sync>,
+        optimistic_v3_config: Option<OptimisticV3Config>,
     ) -> eyre::Result<SubmissionConfig> {
-        let signing_domain = get_signing_domain(
-            chain_spec.chain,
-            self.beacon_clients()?,
-            self.genesis_fork_version.clone(),
-        )?;
-
         let relay_secret_key = if let Some(secret_key) = &self.relay_secret_key {
             let resolved_key = secret_key.value()?;
             SecretKey::try_from(resolved_key)?
@@ -317,65 +388,119 @@ impl L1Config {
         let signer = BLSBlockSigner::new(relay_secret_key, signing_domain)
             .map_err(|e| eyre::eyre!("Failed to create normal signer: {:?}", e))?;
 
-        let optimistic_signer = if self.optimistic_enabled {
-            BLSBlockSigner::from_string(self.optimistic_relay_secret_key.value()?, signing_domain)
-                .map_err(|e| eyre::eyre!("Failed to create optimistic signer: {:?}", e))?
-        } else {
-            // Placeholder value since it is required for SubmissionConfig. But after https://github.com/flashbots/rbuilder/pull/323
-            // we can return None
-            signer.clone()
-        };
-
-        let optimistic_config = if self.optimistic_enabled {
-            Some(OptimisticConfig {
-                signer: optimistic_signer,
-                max_bid_value: parse_ether(&self.optimistic_max_bid_value_eth)?,
-            })
-        } else {
-            None
-        };
-
         Ok(SubmissionConfig {
             chain_spec,
             signer,
-            optimistic_config,
+            optimistic_v3_config,
             bid_observer,
         })
     }
 
-    /// Creates the RelaySubmitSinkFactory and also returns the associated relays (MevBoostRelaySlotInfoProvider).
+    /// Creates:
+    /// - RelaySubmitSinkFactory
+    /// - The associated relays (MevBoostRelaySlotInfoProvider).
+    /// - A hashmap of adjustment fee payers.
+    /// - JoinHandle for the optimistic V3 server.
+    #[allow(clippy::type_complexity)]
     pub fn create_relays_sealed_sink_factory(
         &self,
         chain_spec: Arc<ChainSpec>,
+        relay_sets: Vec<RelaySet>,
         bid_observer: Box<dyn BidObserver + Send + Sync>,
+        submission_policy: Box<dyn RelaySubmissionPolicy + Send + Sync>,
+        cancellation_token: CancellationToken,
     ) -> eyre::Result<(
-        Box<dyn BuilderSinkFactory>,
+        RelaySubmitSinkFactory,
         Vec<MevBoostRelaySlotInfoProvider>,
+        ahash::HashMap<MevBoostRelayID, Address>,
+        Option<JoinHandle<()>>,
     )> {
-        let submission_config = self.submission_config(chain_spec, bid_observer)?;
+        let signing_domain = get_signing_domain(
+            chain_spec.chain,
+            self.beacon_clients()?,
+            self.genesis_fork_version.clone(),
+        )?;
+
+        let mut optimistic_v3_config = None;
+        let optimistic_v3_server_join_handle = if self
+            .relays
+            .iter()
+            .any(|r| r.submit_config.as_ref().is_some_and(|c| c.optimistic_v3))
+        {
+            let address = SocketAddr::V4(SocketAddrV4::new(
+                self.optimistic_v3_server_ip,
+                self.optimistic_v3_server_port,
+            ));
+            let builder_url = self.optimistic_v3_public_url.clone();
+
+            info!(local = %address, %builder_url, "Optimistic V3 is enabled for at least one relay, spawning server");
+            if self.optimistic_v3_relay_pubkeys.is_empty() {
+                warn!("Optimistic V3 is enabled, but no relay pubkeys have been configured");
+            }
+
+            let optimistic_v3_cache = OptimisticV3BlockCache::default();
+            let optimistic_v3_server_join_handle = optimistic_v3::spawn_server(
+                address,
+                signing_domain,
+                self.optimistic_v3_relay_pubkeys.clone(),
+                optimistic_v3_cache.clone(),
+                cancellation_token,
+            )?;
+
+            optimistic_v3_config = Some(OptimisticV3Config {
+                builder_url: builder_url.into_bytes(),
+                cache: optimistic_v3_cache,
+            });
+            Some(optimistic_v3_server_join_handle)
+        } else {
+            None
+        };
+
+        let submission_config = self.submission_config(
+            chain_spec,
+            signing_domain,
+            bid_observer,
+            optimistic_v3_config,
+        )?;
         info!(
-            "Builder mev boost normal relay pubkey: {:?}",
+            "Builder mev boost relay pubkey: {:?}",
             submission_config.signer.pub_key()
         );
-
-        if let Some(optimitic_config) = submission_config.optimistic_config.as_ref() {
-            info!(
-                "Optimistic mode enabled, relay pubkey {:?}, max_value: {}",
-                optimitic_config.signer.pub_key(),
-                format_ether(optimitic_config.max_bid_value),
-            );
-        };
 
         let (submitters, slot_info_providers) = self.create_relays()?;
         if slot_info_providers.is_empty() {
             eyre::bail!("No slot info providers provided");
         }
 
-        let sink_factory: Box<dyn BuilderSinkFactory> = Box::new(RelaySubmitSinkFactory::new(
+        let sink_factory = RelaySubmitSinkFactory::new(
             submission_config,
             submitters.clone(),
-        ));
-        Ok((sink_factory, slot_info_providers))
+            relay_sets,
+            submission_policy,
+        );
+
+        let adjustment_fee_payers = self
+            .relays
+            .iter()
+            .filter_map(|r| {
+                r.adjustment_fee_payer
+                    .map(|fee_payer| (r.name.clone(), fee_payer))
+            })
+            .collect();
+
+        Ok((
+            sink_factory,
+            slot_info_providers,
+            adjustment_fee_payers,
+            optimistic_v3_server_join_handle,
+        ))
+    }
+
+    pub fn registration_update_interval(&self) -> Duration {
+        Duration::from_millis(
+            self.registration_update_interval_ms
+                .unwrap_or(DEFAULT_REGISTRATION_UPDATE_INTERVAL_MS),
+        )
     }
 }
 
@@ -383,71 +508,78 @@ impl LiveBuilderConfig for Config {
     fn base_config(&self) -> &BaseConfig {
         &self.base_config
     }
+
     async fn new_builder<P>(
         &self,
         provider: P,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) -> eyre::Result<super::LiveBuilder<P, MevBoostSlotDataGenerator>>
+    ) -> eyre::Result<super::LiveBuilder<P>>
     where
         P: StateProviderFactory + Clone + 'static,
     {
-        let subsidy = self.subsidy.clone();
-        let slot_delta_to_start_bidding_ms = self.slot_delta_to_start_bidding_ms;
-        // Create the bidding service factory
-        let bidding_service_factory = |landed_blocks: &[LandedBlockInfo]| {
-            // Clone the data you need for the async block
-            let landed_blocks = landed_blocks.to_vec();
-            // Return a pinned boxed future
-            Box::pin(async move {
-                let subsidy = subsidy
-                    .as_ref()
-                    .map(|s| parse_ether(s))
-                    .unwrap_or(Ok(U256::ZERO))?;
-                let bidding_service: Arc<dyn BiddingService> =
-                    Arc::new(TrueBlockValueBiddingService::new(
-                        &landed_blocks,
-                        time::Duration::milliseconds(
-                            slot_delta_to_start_bidding_ms
-                                .unwrap_or(DEFAULT_SLOT_DELTA_TO_START_BIDDING_MS),
-                        ),
-                        subsidy,
-                    ));
-                Ok(bidding_service)
-            })
-                as Pin<Box<dyn Future<Output = eyre::Result<Arc<dyn BiddingService>>> + Send>>
-        };
+        let abort_token = CancellationToken::new();
+        let parsed_config = parse_true_block_value_bidding_service_config(
+            &self.true_block_value_bidding_service_config,
+        )?;
+        let all_relays_set = self.l1_config.relays_ids();
+        let bidding_service = Arc::new(NewTrueBlockValueBiddingService::new(
+            &parsed_config,
+            all_relays_set.clone(),
+        )?);
 
-        let (sink_factory, slot_info_provider, _) = create_sink_factory_and_relays(
+        let (wallet_balance_watcher, _) =
+            create_wallet_balance_watcher(provider.clone(), &self.base_config).await?;
+
+        let (
+            sink_factory,
+            slot_info_provider,
+            adjustment_fee_payers,
+            optimistic_v3_server_join_handle,
+        ) = create_sink_factory_and_relays(
             &self.base_config,
             &self.l1_config,
-            provider.clone(),
+            bidding_service.relay_sets(),
+            wallet_balance_watcher,
             Box::new(NullBidObserver {}),
-            bidding_service_factory,
+            Box::new(AlwaysSubmitPolicy {}),
+            bidding_service,
             cancellation_token.clone(),
         )
         .await?;
 
-        let live_builder = create_builder_from_sink(
+        let mut live_builder = create_builder_from_sink(
             &self.base_config,
             &self.l1_config,
             provider,
             sink_factory,
             slot_info_provider,
+            adjustment_fee_payers,
             cancellation_token,
+            abort_token.clone(),
         )
         .await?;
-        let builders = create_builders(self.live_builders()?);
+        let builders = create_builders(
+            self.live_builders()?,
+            self.base_config.max_order_execution_duration_warning(),
+        );
+        if let Some(optimistic_v3_server_join_handle) = optimistic_v3_server_join_handle {
+            live_builder.add_critical_task(optimistic_v3_server_join_handle);
+        }
         Ok(live_builder.with_builders(builders))
     }
 
-    fn version_for_telemetry(&self) -> crate::utils::build_info::Version {
+    fn version_for_telemetry(&self) -> rbuilder_utils::build_info::Version {
         rbuilder_version()
     }
 
-    fn build_backtest_block<P>(
+    fn build_backtest_block<
+        P,
+        PartialBlockExecutionTracerType: PartialBlockExecutionTracer + Clone + Send + Sync + 'static,
+    >(
         &self,
         building_algorithm_name: &str,
         input: BacktestSimulateBlockInput<'_, P>,
+        partial_block_execution_tracer: PartialBlockExecutionTracerType,
     ) -> eyre::Result<Block>
     where
         P: StateProviderFactory + Clone + 'static,
@@ -456,11 +588,17 @@ impl LiveBuilderConfig for Config {
         match builder_cfg.builder {
             SpecificBuilderConfig::OrderingBuilder(config) => {
                 if config.ignore_mempool_profit_on_bundles {
-                    build_backtest_block_ordering_builder::<P, NonMempoolProfitInfoGetter>(
-                        config, input,
-                    )
+                    build_backtest_block_ordering_builder::<
+                        P,
+                        NonMempoolProfitInfoGetter,
+                        PartialBlockExecutionTracerType,
+                    >(config, input, partial_block_execution_tracer)
                 } else {
-                    build_backtest_block_ordering_builder::<P, FullProfitInfoGetter>(config, input)
+                    build_backtest_block_ordering_builder::<
+                        P,
+                        FullProfitInfoGetter,
+                        PartialBlockExecutionTracerType,
+                    >(config, input, partial_block_execution_tracer)
                 }
             }
             SpecificBuilderConfig::ParallelBuilder(config) => {
@@ -473,9 +611,14 @@ impl LiveBuilderConfig for Config {
     }
 }
 
-pub fn build_backtest_block_ordering_builder<P, ProfitInfoGetterType: ProfitInfoGetter + 'static>(
+pub fn build_backtest_block_ordering_builder<
+    P,
+    ProfitInfoGetterType: ProfitInfoGetter + 'static,
+    PartialBlockExecutionTracerType: PartialBlockExecutionTracer + Clone + Send + Sync + 'static,
+>(
     config: OrderingBuilderConfig,
     input: BacktestSimulateBlockInput<'_, P>,
+    partial_block_execution_tracer: PartialBlockExecutionTracerType,
 ) -> eyre::Result<Block>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -485,31 +628,36 @@ where
             crate::building::builders::ordering_builder::backtest_simulate_block::<
                 P,
                 OrderMevGasPricePriority<ProfitInfoGetterType>,
-            >(config, input)
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
         }
         Sorting::MaxProfit => {
             crate::building::builders::ordering_builder::backtest_simulate_block::<
                 P,
                 OrderMaxProfitPriority<ProfitInfoGetterType>,
-            >(config, input)
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
         }
         Sorting::TypeMaxProfit => {
             crate::building::builders::ordering_builder::backtest_simulate_block::<
                 P,
                 OrderTypePriority<ProfitInfoGetterType>,
-            >(config, input)
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
         }
         Sorting::LengthThreeMaxProfit => {
             crate::building::builders::ordering_builder::backtest_simulate_block::<
                 P,
                 OrderLengthThreeMaxProfitPriority<ProfitInfoGetterType>,
-            >(config, input)
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
         }
         Sorting::LengthThreeMevGasPrice => {
             crate::building::builders::ordering_builder::backtest_simulate_block::<
                 P,
                 OrderLengthThreeMevGasPricePriority<ProfitInfoGetterType>,
-            >(config, input)
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
         }
     }
 }
@@ -545,9 +693,9 @@ impl Default for Config {
                         sorting: Sorting::MevGasPrice,
                         failed_order_retries: 1,
                         drop_failed_orders: true,
-                        coinbase_payment: false,
                         build_duration_deadline_ms: None,
                         ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
                     }),
                 },
                 BuilderConfig {
@@ -557,9 +705,9 @@ impl Default for Config {
                         sorting: Sorting::MaxProfit,
                         failed_order_retries: 1,
                         drop_failed_orders: true,
-                        coinbase_payment: false,
                         build_duration_deadline_ms: None,
                         ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
                     }),
                 },
                 BuilderConfig {
@@ -569,9 +717,9 @@ impl Default for Config {
                         sorting: Sorting::MaxProfit,
                         failed_order_retries: 1,
                         drop_failed_orders: true,
-                        coinbase_payment: false,
                         build_duration_deadline_ms: Some(30),
                         ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
                     }),
                 },
                 BuilderConfig {
@@ -581,9 +729,9 @@ impl Default for Config {
                         sorting: Sorting::MaxProfit,
                         failed_order_retries: 1,
                         drop_failed_orders: true,
-                        coinbase_payment: true,
                         build_duration_deadline_ms: None,
                         ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
                     }),
                 },
                 BuilderConfig {
@@ -593,9 +741,9 @@ impl Default for Config {
                         sorting: Sorting::MevGasPrice,
                         failed_order_retries: 1,
                         drop_failed_orders: false,
-                        coinbase_payment: false,
                         build_duration_deadline_ms: None,
                         ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
                     }),
                 },
                 BuilderConfig {
@@ -603,7 +751,6 @@ impl Default for Config {
                     builder: SpecificBuilderConfig::ParallelBuilder(ParallelBuilderConfig {
                         discard_txs: true,
                         num_threads: 25,
-                        coinbase_payment: false,
                         safe_sorting_only: true,
                     }),
                 },
@@ -612,13 +759,12 @@ impl Default for Config {
                     builder: SpecificBuilderConfig::DefaultBuilder(ParallelBuilderConfig {
                         discard_txs: true,
                         num_threads: 250,
-                        coinbase_payment: false,
                         safe_sorting_only: true,
                     }),
                 },
             ],
-            slot_delta_to_start_bidding_ms: None,
-            subsidy: None,
+            true_block_value_bidding_service_config:
+                TrueBlockValueBiddingServiceConfigToml::default(),
         }
     }
 }
@@ -628,6 +774,7 @@ pub fn create_provider_factory(
     reth_datadir: Option<&Path>,
     reth_db_path: Option<&Path>,
     reth_static_files_path: Option<&Path>,
+    reth_rocksdb_path: Option<&Path>,
     chain_spec: Arc<ChainSpec>,
     root_hash_config: Option<RootHashContext>,
 ) -> eyre::Result<ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>> {
@@ -647,8 +794,21 @@ pub fn create_provider_factory(
         }
     };
 
-    let provider_factory_reopener =
-        ProviderFactoryReopener::new(db, chain_spec, reth_static_files_path, root_hash_config)?;
+    let reth_rocksdb_path = match (reth_rocksdb_path, reth_datadir) {
+        (Some(reth_rocksdb_path), _) => PathBuf::from(reth_rocksdb_path),
+        (None, Some(reth_datadir)) => reth_datadir.join("rocksdb"),
+        (None, None) => {
+            eyre::bail!("Either reth_rocksdb_path or reth_datadir must be provided")
+        }
+    };
+
+    let provider_factory_reopener = ProviderFactoryReopener::new(
+        db,
+        chain_spec,
+        reth_static_files_path,
+        reth_rocksdb_path,
+        root_hash_config,
+    )?;
 
     if provider_factory_reopener
         .provider_factory_unchecked()
@@ -673,36 +833,62 @@ pub fn coinbase_signer_from_secret_key(secret_key: &str) -> eyre::Result<Signer>
     Ok(Signer::try_from_secret(secret_key)?)
 }
 
-pub fn create_builders<P>(configs: Vec<BuilderConfig>) -> Vec<Arc<dyn BlockBuildingAlgorithm<P>>>
+pub fn create_builders<P>(
+    configs: Vec<BuilderConfig>,
+    max_order_execution_duration_warning: Option<Duration>,
+) -> Vec<Arc<dyn BlockBuildingAlgorithm<P>>>
 where
     P: StateProviderFactory + Clone + 'static,
 {
-    configs.into_iter().map(|cfg| create_builder(cfg)).collect()
+    configs
+        .into_iter()
+        .map(|cfg| create_builder(cfg, max_order_execution_duration_warning))
+        .collect()
 }
 
-fn create_builder<P>(cfg: BuilderConfig) -> Arc<dyn BlockBuildingAlgorithm<P>>
+fn create_builder<P>(
+    cfg: BuilderConfig,
+    max_order_execution_duration_warning: Option<Duration>,
+) -> Arc<dyn BlockBuildingAlgorithm<P>>
 where
     P: StateProviderFactory + Clone + 'static,
 {
     match cfg.builder {
         SpecificBuilderConfig::OrderingBuilder(order_cfg) => {
             if order_cfg.ignore_mempool_profit_on_bundles {
-                create_ordering_builder::<P, NonMempoolProfitInfoGetter>(order_cfg, cfg.name)
+                create_ordering_builder::<P, NonMempoolProfitInfoGetter>(
+                    order_cfg,
+                    max_order_execution_duration_warning,
+                    cfg.name,
+                )
             } else {
-                create_ordering_builder::<P, FullProfitInfoGetter>(order_cfg, cfg.name)
+                create_ordering_builder::<P, FullProfitInfoGetter>(
+                    order_cfg,
+                    max_order_execution_duration_warning,
+                    cfg.name,
+                )
             }
         }
         SpecificBuilderConfig::ParallelBuilder(parallel_cfg) => {
-            Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
-        },
+            Arc::new(ParallelBuildingAlgorithm::new(
+                parallel_cfg,
+                max_order_execution_duration_warning,
+                cfg.name,
+            ))
+        }
         SpecificBuilderConfig::DefaultBuilder(parallel_cfg) => {
-            Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
+            Arc::new(ParallelBuildingAlgorithm::new(
+                parallel_cfg,
+                max_order_execution_duration_warning,
+                cfg.name,
+            ))
         }
     }
 }
 
 fn create_ordering_builder<P, ProfitInfoGetterType: ProfitInfoGetter + 'static>(
     cfg: OrderingBuilderConfig,
+    max_order_execution_duration_warning: Option<Duration>,
     name: String,
 ) -> Arc<dyn BlockBuildingAlgorithm<P>>
 where
@@ -711,19 +897,33 @@ where
     match cfg.sorting {
         Sorting::MevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
             OrderMevGasPricePriority<ProfitInfoGetterType>,
-        >::new(cfg, name)),
+        >::new(
+            cfg, max_order_execution_duration_warning, name
+        )),
         Sorting::MaxProfit => Arc::new(OrderingBuildingAlgorithm::<
             OrderMaxProfitPriority<ProfitInfoGetterType>,
-        >::new(cfg, name)),
+        >::new(
+            cfg, max_order_execution_duration_warning, name
+        )),
         Sorting::TypeMaxProfit => Arc::new(OrderingBuildingAlgorithm::<
             OrderTypePriority<ProfitInfoGetterType>,
-        >::new(cfg, name)),
-        Sorting::LengthThreeMaxProfit => Arc::new(OrderingBuildingAlgorithm::<
-            OrderLengthThreeMaxProfitPriority<ProfitInfoGetterType>,
-        >::new(cfg, name)),
-        Sorting::LengthThreeMevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
-            OrderLengthThreeMevGasPricePriority<ProfitInfoGetterType>,
-        >::new(cfg, name)),
+        >::new(
+            cfg, max_order_execution_duration_warning, name
+        )),
+        Sorting::LengthThreeMaxProfit => {
+            Arc::new(OrderingBuildingAlgorithm::<
+                OrderLengthThreeMaxProfitPriority<ProfitInfoGetterType>,
+            >::new(
+                cfg, max_order_execution_duration_warning, name
+            ))
+        }
+        Sorting::LengthThreeMevGasPrice => {
+            Arc::new(OrderingBuildingAlgorithm::<
+                OrderLengthThreeMevGasPricePriority<ProfitInfoGetterType>,
+            >::new(
+                cfg, max_order_execution_duration_warning, name
+            ))
+        }
     }
 }
 
@@ -735,6 +935,7 @@ fn get_signing_domain(
     let cl_context = match chain.kind() {
         ChainKind::Named(NamedChain::Mainnet) => ContextEth::for_mainnet(),
         ChainKind::Named(NamedChain::Sepolia) => ContextEth::for_sepolia(),
+        ChainKind::Named(NamedChain::Hoodi) => ContextEth::for_hoodi(),
         ChainKind::Named(NamedChain::Goerli) => ContextEth::for_goerli(),
         ChainKind::Named(NamedChain::Holesky) => ContextEth::for_holesky(),
         _ => {
@@ -779,8 +980,9 @@ lazy_static! {
             "flashbots".to_string(),
             RelayConfig {
                 name: "flashbots".to_string(),
-                url: "http://k8s-default-boostrel-9f278153f5-947835446.us-east-2.elb.amazonaws.com"
+                url: "https://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@boost-relay.flashbots.net"
                     .to_string(),
+                grpc_url: None,
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
                     use_ssz_for_submit: true,
@@ -788,6 +990,9 @@ lazy_static! {
                     optimistic: false,
                     interval_between_submissions_ms: Some(250),
                     max_bid_eth: None,
+                    optimistic_v3_max_bid_eth: None,
+                    optimistic_v3: false,
+                    optimistic_v3_bid_adjustment_required: false,
                 }),
                 priority: Some(0),
                 authorization_header: None,
@@ -795,6 +1000,8 @@ lazy_static! {
                 api_token_header: None,
                 adjustment_fee_payer: None,
                 is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                bloxroute_rproxy_only: false,
                 ask_for_filtering_validators: None,
                 can_ignore_gas_limit: None,
             },
@@ -804,6 +1011,7 @@ lazy_static! {
             RelayConfig {
                 name: "ultrasound-us".to_string(),
                 url: "https://relay-builders-us.ultrasound.money".to_string(),
+                grpc_url: None,
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
                     use_ssz_for_submit: true,
@@ -811,6 +1019,9 @@ lazy_static! {
                     optimistic: true,
                     interval_between_submissions_ms: None,
                     max_bid_eth: None,
+                    optimistic_v3_max_bid_eth: None,
+                    optimistic_v3: false,
+                    optimistic_v3_bid_adjustment_required: false,
                 }),
                 priority: Some(0),
                 authorization_header: None,
@@ -818,6 +1029,8 @@ lazy_static! {
                 api_token_header: None,
                 adjustment_fee_payer: None,
                 is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                bloxroute_rproxy_only: false,
                 ask_for_filtering_validators: None,
                 can_ignore_gas_limit: None,
             },
@@ -827,6 +1040,7 @@ lazy_static! {
             RelayConfig {
                 name: "ultrasound-eu".to_string(),
                 url: "https://relay-builders-eu.ultrasound.money".to_string(),
+                grpc_url: None,
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
                     use_ssz_for_submit: true,
@@ -834,6 +1048,9 @@ lazy_static! {
                     optimistic: true,
                     interval_between_submissions_ms: None,
                     max_bid_eth: None,
+                    optimistic_v3_max_bid_eth: None,
+                    optimistic_v3: false,
+                    optimistic_v3_bid_adjustment_required: false,
                 }),
                 priority: Some(0),
                 authorization_header: None,
@@ -841,6 +1058,8 @@ lazy_static! {
                 api_token_header: None,
                 adjustment_fee_payer: None,
                 is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                bloxroute_rproxy_only: false,
                 ask_for_filtering_validators: None,
                 can_ignore_gas_limit: None,
             },
@@ -850,6 +1069,7 @@ lazy_static! {
             RelayConfig {
                 name: "agnostic".to_string(),
                 url: "https://0xa7ab7a996c8584251c8f925da3170bdfd6ebc75d50f5ddc4050a6fdc77f2a3b5fce2cc750d0865e05d7228af97d69561@agnostic-relay.net".to_string(),
+                grpc_url: None,
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
                     use_ssz_for_submit: true,
@@ -857,12 +1077,18 @@ lazy_static! {
                     optimistic: true,
                     interval_between_submissions_ms: None,
                     max_bid_eth: None,
-                }),                priority: Some(0),
+                    optimistic_v3_max_bid_eth: None,
+                    optimistic_v3: false,
+                    optimistic_v3_bid_adjustment_required: false,
+                }),
+                priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
                 adjustment_fee_payer: None,
                 is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                bloxroute_rproxy_only: false,
                 ask_for_filtering_validators: None,
                 can_ignore_gas_limit: None,
             },
@@ -871,6 +1097,7 @@ lazy_static! {
             "playground".to_string(),
             RelayConfig {
                 name: "playground".to_string(),
+                grpc_url: None,
                 url: "http://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@localhost:5555".to_string(),
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
@@ -879,6 +1106,9 @@ lazy_static! {
                     optimistic: false,
                     interval_between_submissions_ms: None,
                     max_bid_eth: None,
+                    optimistic_v3_max_bid_eth: None,
+                    optimistic_v3: false,
+                    optimistic_v3_bid_adjustment_required: false,
                 }),
                 priority: Some(0),
                 authorization_header: None,
@@ -886,6 +1116,8 @@ lazy_static! {
                 api_token_header: None,
                 adjustment_fee_payer: None,
                 is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                bloxroute_rproxy_only: false,
                 ask_for_filtering_validators: None,
                 can_ignore_gas_limit: None,
             },
@@ -894,96 +1126,113 @@ lazy_static! {
     };
 }
 
-/// Creates the end of the building pipeline which takes the UnfinishedBlocks.
-/// Connects BlockSealingBidderFactory-(using BiddingService)->RelaySubmitSinkFactory
-/// Creates the WalletBalanceWatcher needed for subsidies.
-/// Creates the competition bid source to feed the bidding service.
-/// RelaySubmitSinkFactory: submits final blocks to relays
-/// BlockSealingBidderFactory: performs sealing/bidding. Sends bids to the RelaySubmitSinkFactory
-/// Returns also the Vec<MevBoostRelaySlotInfoProvider> as a side effect of parsing the relays.
-#[allow(clippy::type_complexity)]
-pub async fn create_sink_factory_and_relays<P, BiddingServiceFactoryType>(
+pub async fn create_wallet_balance_watcher<P>(
+    provider: P,
+    base_config: &BaseConfig,
+) -> eyre::Result<(WalletBalanceWatcher<P>, Vec<LandedBlockInfo>)>
+where
+    P: StateProviderFactory + Clone + 'static,
+{
+    let address = base_config.coinbase_signer()?.address;
+    Ok(tokio::task::spawn_blocking(move || {
+        WalletBalanceWatcher::new(provider, address, WALLET_INIT_HISTORY_SIZE)
+    })
+    .await??)
+}
+
+/// Returns:
+/// - UnfinishedBuiltBlocksInputFactory
+/// - The associated relays (MevBoostRelaySlotInfoProvider).
+/// - A hashmap of adjustment fee payers.
+/// - JoinHandle for the optimistic V3 server.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_sink_factory_and_relays<P>(
     base_config: &BaseConfig,
     l1_config: &L1Config,
-    provider: P,
+    relay_sets: Vec<RelaySet>,
+    wallet_balance_watcher: WalletBalanceWatcher<P>,
     bid_observer: Box<dyn BidObserver + Send + Sync>,
-    bidding_service_factory: BiddingServiceFactoryType,
+    submission_policy: Box<dyn RelaySubmissionPolicy + Send + Sync>,
+    bidding_service: Arc<dyn BiddingService>,
     cancellation_token: CancellationToken,
 ) -> eyre::Result<(
-    Box<dyn UnfinishedBlockBuildingSinkFactory>,
+    UnfinishedBuiltBlocksInputFactory<P>,
     Vec<MevBoostRelaySlotInfoProvider>,
-    Arc<dyn BiddingServiceWinControl>,
+    ahash::HashMap<MevBoostRelayID, Address>,
+    Option<JoinHandle<()>>,
 )>
 where
     P: StateProviderFactory + Clone + 'static,
-    BiddingServiceFactoryType: FnOnce(
-        &[LandedBlockInfo],
-    ) -> Pin<
-        Box<dyn Future<Output = eyre::Result<Arc<dyn BiddingService>>> + Send>,
-    >,
 {
-    let (sink_sealed_factory, slot_info_provider) =
-        l1_config.create_relays_sealed_sink_factory(base_config.chain_spec()?, bid_observer)?;
-
-    // BlockSealingBidderFactory
-    let (wallet_balance_watcher, wallet_history) = WalletBalanceWatcher::new(
-        provider,
-        base_config.coinbase_signer()?.address,
-        WALLET_INIT_HISTORY_SIZE,
+    let (
+        sink_sealed_factory,
+        slot_info_provider,
+        adjustment_fee_payers,
+        optimistic_v3_server_join_handle,
+    ) = l1_config.create_relays_sealed_sink_factory(
+        base_config.chain_spec()?,
+        relay_sets.clone(),
+        bid_observer,
+        submission_policy,
+        cancellation_token.clone(),
     )?;
 
-    let bidding_service = bidding_service_factory(&wallet_history).await?;
-    let bidding_service_win_control = bidding_service.win_control();
+    if !l1_config.relay_bid_scrapers.is_empty() {
+        let sender = Arc::new(BiddingService2BidSender::new(bidding_service.clone()));
+        bid_scraper::bid_scraper::run(
+            l1_config.relay_bid_scrapers.clone(),
+            sender,
+            cancellation_token.clone(),
+        );
+    }
 
-    // Create a ScrapedBids2BlockBidWithStatsObs that will forward bids from run_nng_subscriber_with_retries to the bidding service.
-    let bidding_service_bids_obs = Arc::new(ScrapedBids2BlockBidWithStatsObs::new(
-        bidding_service.clone(),
-    ));
-    tokio::spawn(run_nng_subscriber_with_retries(
-        bidding_service_bids_obs,
-        cancellation_token.clone(),
-        l1_config.scraped_bids_publisher_url.clone(),
-        Duration::from_secs(BID_SOURCE_TIMEOUT_SECS),
-        Duration::from_secs(BID_SOURCE_WAIT_TIME_SECS),
-    ));
-
-    let sink_factory = Box::new(BlockSealingBidderFactory::new(
+    let sink_factory = UnfinishedBuiltBlocksInputFactory::new(
         bidding_service,
         sink_sealed_factory,
         wallet_balance_watcher,
-    ));
+        base_config.adjust_finalized_blocks,
+        relay_sets,
+    );
 
     Ok((
         sink_factory,
         slot_info_provider,
-        bidding_service_win_control,
+        adjustment_fee_payers,
+        optimistic_v3_server_join_handle,
     ))
 }
 
 /// Take the end of the pipeline (sink_factory) + pre-created slot_info_provider and creates an empty builder (it still needs the with_builders to be called)
+#[allow(clippy::too_many_arguments)]
 pub async fn create_builder_from_sink<P>(
     base_config: &BaseConfig,
     l1_config: &L1Config,
     provider: P,
-    sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
+    sink_factory: UnfinishedBuiltBlocksInputFactory<P>,
     slot_info_provider: Vec<MevBoostRelaySlotInfoProvider>,
+    adjustment_fee_payers: ahash::HashMap<MevBoostRelayID, Address>,
     cancellation_token: CancellationToken,
-) -> eyre::Result<super::LiveBuilder<P, MevBoostSlotDataGenerator>>
+    abort_token: CancellationToken,
+) -> eyre::Result<super::LiveBuilder<P>>
 where
     P: StateProviderFactory,
 {
     let blocklist_provider = base_config
         .blocklist_provider(cancellation_token.clone())
         .await?;
+
     let payload_event = MevBoostSlotDataGenerator::new(
         l1_config.beacon_clients()?,
         slot_info_provider,
+        l1_config.registration_update_interval(),
+        adjustment_fee_payers,
         blocklist_provider.clone(),
         cancellation_token.clone(),
     );
     base_config
         .create_builder_with_provider_factory(
             cancellation_token,
+            abort_token,
             sink_factory,
             payload_event,
             provider,
@@ -995,8 +1244,8 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::live_builder::base_config::load_config_toml_and_env;
     use alloy_primitives::{address, fixed_bytes};
+    use rbuilder_config::load_toml_config;
     use std::env;
     use url::Url;
 
@@ -1011,9 +1260,9 @@ mod test {
     #[test]
     fn test_parse_example_config() {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.push("../../config-live-example.toml");
+        p.push("../../examples/config/rbuilder/config-live-example.toml");
 
-        let config: Config = load_config_toml_and_env(p.clone()).expect("Config load");
+        let config: Config = load_toml_config(p.clone()).expect("Config load");
 
         assert_eq!(
             config
@@ -1031,7 +1280,7 @@ mod test {
 
         env::set_var("CL_NODE_URL", "http://localhost:3500");
 
-        let config: Config = load_config_toml_and_env(p).expect("Config load");
+        let config: Config = load_toml_config(p).expect("Config load");
 
         assert_eq!(
             config
@@ -1049,12 +1298,12 @@ mod test {
             .contains(&"http://localhost:3500".to_string()));
     }
 
-    #[test]
-    fn test_parse_enabled_relays() {
+    #[tokio::test]
+    async fn test_parse_enabled_relays() {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.push("./src/live_builder/testdata/config_with_relay_override.toml");
 
-        let config: Config = load_config_toml_and_env(p.clone()).expect("Config load");
+        let config: Config = load_toml_config(p.clone()).expect("Config load");
 
         let (_, slot_info_providers) = config.l1_config.create_relays().unwrap();
         assert_eq!(slot_info_providers.len(), 1);
@@ -1064,9 +1313,9 @@ mod test {
     #[test]
     fn test_parse_backtest_example_config() {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        p.push("../../config-backtest-example.toml");
+        p.push("../../examples/config/rbuilder/config-backtest-example.toml");
 
-        load_config_toml_and_env::<Config>(p).expect("Config load");
+        load_toml_config::<Config>(p).expect("Config load");
     }
 
     #[test]

@@ -1,10 +1,7 @@
-use crate::{
-    building::evm_inspector::SlotKey,
-    primitives::{OrderId, SimulatedOrder},
-};
 use ahash::{HashMap, HashSet};
 use alloy_primitives::{Address, B256, U256};
 use itertools::Itertools;
+use rbuilder_primitives::{evm_inspector::SlotKey, OrderId, SimulatedOrder};
 use std::sync::Arc;
 
 /// ResolutionResult describes order of certain groups of orders.
@@ -196,7 +193,7 @@ impl ConflictFinder {
                 let mut code_writes: Vec<Address> = used_state
                     .created_contracts
                     .into_iter()
-                    .chain(used_state.destructed_contracts.into_iter())
+                    .chain(used_state.destructed_contracts)
                     .collect();
                 code_writes.sort_unstable();
                 code_writes.dedup();
@@ -535,14 +532,12 @@ mod tests {
 
     use alloy_consensus::TxLegacy;
     use alloy_primitives::{Address, TxHash, B256, U256};
-    use reth::primitives::{Transaction, TransactionSigned};
-    use reth_primitives::Recovered;
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
+    use reth_primitives_traits::Recovered;
 
-    use crate::{
-        building::evm_inspector::{SlotKey, UsedStateTrace},
-        primitives::{
-            MempoolTx, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
-        },
+    use rbuilder_primitives::{
+        evm_inspector::{SlotKey, UsedStateTrace},
+        MempoolTx, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
     };
 
     use super::ConflictFinder;
@@ -628,16 +623,16 @@ mod tests {
                 trace.destructed_contracts.push(*contract_address);
             }
 
-            Arc::new(SimulatedOrder {
-                order: Order::Tx(MempoolTx {
+            Arc::new(SimulatedOrder::new(
+                Arc::new(Order::Tx(MempoolTx {
                     tx_with_blobs: TransactionSignedEcRecoveredWithBlobs::new_no_blobs(
                         self.create_tx(),
                     )
                     .unwrap(),
-                }),
-                used_state_trace: Some(trace),
-                sim_value: SimValue::default(),
-            })
+                })),
+                SimValue::default(),
+                Some(trace),
+            ))
         }
     }
 

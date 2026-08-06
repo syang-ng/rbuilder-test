@@ -4,29 +4,34 @@ use super::{
     OrderErr, PartialBlockFork, ThreadBlockBuildingContext,
 };
 use crate::{
-    building::{BlockBuildingContext, BlockState, CriticalCommitOrderError},
+    building::{
+        cached_reads::CachedDB, order_is_worth_executing, BlockBuildingContext,
+        BlockBuildingSpaceState, BlockState, CriticalCommitOrderError,
+        NullPartialBlockForkExecutionTracer,
+    },
     live_builder::order_input::mempool_txs_detector::MempoolTxsDetector,
-    primitives::{Order, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
     telemetry::{add_order_simulation_time, mark_order_pending_nonce},
     utils::NonceCache,
 };
 use ahash::{HashMap, HashSet};
+use alloy_evm::Database;
 use alloy_primitives::Address;
 use rand::seq::SliceRandom;
+use rbuilder_primitives::{Order, OrderId, SimulatedOrder};
 use reth_errors::ProviderError;
-use reth_provider::StateProvider;
 use std::{
     cmp::{max, min, Ordering},
     collections::hash_map::Entry,
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
     time::{Duration, Instant},
 };
 use tracing::{error, trace};
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum OrderSimResult {
-    Success(SimulatedOrder, Vec<(Address, u64)>),
+    Success(Arc<SimulatedOrder>, Vec<(Address, u64)>),
     Failed(OrderErr),
 }
 
@@ -45,24 +50,47 @@ pub struct NonceKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingOrder {
-    order: Order,
+    order: Arc<Order>,
     unsatisfied_nonces: usize,
 }
 
 pub type SimulationId = u64;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct SimulationRequest {
     pub id: SimulationId,
-    pub order: Order,
-    pub parents: Vec<Order>,
+    pub order: Arc<Order>,
+    pub parents: Vec<Arc<Order>>,
+}
+
+/// SimulationRequest with an extra bool to be able to cancel it externally.
+#[derive(Debug, Clone)]
+pub struct CancellableSimulationRequest {
+    request: SimulationRequest,
+    // If cancelled we don't simulate.
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancellableSimulationRequest {
+    pub fn new(request: SimulationRequest, cancelled: Arc<AtomicBool>) -> Self {
+        Self { request, cancelled }
+    }
+
+    /// If cancelled returns none.
+    pub fn into_request(self) -> Option<SimulationRequest> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            None
+        } else {
+            Some(self.request)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulatedResult {
     pub id: SimulationId,
-    pub simulated_order: SimulatedOrder,
-    pub previous_orders: Vec<Order>,
+    pub simulated_order: Arc<SimulatedOrder>,
+    pub previous_orders: Vec<Arc<Order>>,
     pub nonces_after: Vec<NonceKey>,
     pub simulation_time: Duration,
 }
@@ -86,7 +114,7 @@ pub struct SimTree {
 enum OrderNonceState {
     Invalid,
     PendingNonces(Vec<NonceKey>),
-    Ready(Vec<Order>),
+    Ready(Vec<Arc<Order>>),
 }
 
 impl SimTree {
@@ -101,7 +129,7 @@ impl SimTree {
         }
     }
 
-    fn push_order(&mut self, order: Order) -> Result<(), ProviderError> {
+    fn push_order(&mut self, order: Arc<Order>) -> Result<(), ProviderError> {
         if self.pending_orders.contains_key(&order.id()) {
             return Ok(());
         }
@@ -204,7 +232,7 @@ impl SimTree {
         }
     }
 
-    pub fn push_orders(&mut self, orders: Vec<Order>) -> Result<(), ProviderError> {
+    pub fn push_orders(&mut self, orders: Vec<Arc<Order>>) -> Result<(), ProviderError> {
         for order in orders {
             self.push_order(order)?;
         }
@@ -312,15 +340,15 @@ impl SimTree {
 pub fn simulate_all_orders_with_sim_tree<P>(
     provider: P,
     ctx: &BlockBuildingContext,
-    orders: &[Order],
+    orders: &[Arc<Order>],
     randomize_insertion: bool,
-) -> Result<(Vec<SimulatedOrder>, Vec<OrderErr>), CriticalCommitOrderError>
+) -> Result<(Vec<Arc<SimulatedOrder>>, Vec<OrderErr>), CriticalCommitOrderError>
 where
     P: StateProviderFactory + Clone,
 {
     let nonces = {
         let state = provider.history_by_block_hash(ctx.attributes.parent)?;
-        NonceCache::new(state.into())
+        NonceCache::new(state)
     };
     let mut sim_tree = SimTree::new(nonces);
 
@@ -335,8 +363,8 @@ where
     }
 
     let mut sim_errors = Vec::new();
-    let mut state_for_sim =
-        Arc::<dyn StateProvider>::from(provider.history_by_block_hash(ctx.attributes.parent)?);
+    let initial_provider = provider.history_by_block_hash(ctx.attributes.parent)?;
+    let mut state_for_sim = CachedDB::new(initial_provider, ctx.shared_cached_reads.clone());
     let mut local_ctx = ThreadBlockBuildingContext::default();
     loop {
         // mix new orders into the sim_tree
@@ -358,7 +386,7 @@ where
         let mut sim_results = Vec::new();
         for sim_task in sim_tasks {
             let start_time = Instant::now();
-            let mut block_state = BlockState::new_arc(state_for_sim);
+            let mut block_state = BlockState::new(state_for_sim);
             let sim_result = simulate_order(
                 sim_task.parents.clone(),
                 sim_task.order.clone(),
@@ -366,8 +394,8 @@ where
                 &mut local_ctx,
                 &mut block_state,
             )?;
-            let (_, provider) = block_state.into_parts();
-            state_for_sim = provider;
+            let (_, db) = block_state.into_parts();
+            state_for_sim = db;
             match sim_result.result {
                 OrderSimResult::Failed(err) => {
                     trace!(
@@ -408,13 +436,16 @@ where
 }
 
 /// Prepares context (fork + tracer) and calls simulate_order_using_fork
-pub fn simulate_order(
-    parent_orders: Vec<Order>,
-    order: Order,
+pub fn simulate_order<DB>(
+    parent_orders: Vec<Arc<Order>>,
+    order: Arc<Order>,
     ctx: &BlockBuildingContext,
     local_ctx: &mut ThreadBlockBuildingContext,
-    state: &mut BlockState,
-) -> Result<OrderSimResultWithGas, CriticalCommitOrderError> {
+    state: &mut BlockState<DB>,
+) -> Result<OrderSimResultWithGas, CriticalCommitOrderError>
+where
+    DB: Database<Error = ProviderError>,
+{
     let mut tracer = AccumulatorSimulationTracer::new();
     let mut fork = PartialBlockFork::new(state, ctx, local_ctx).with_tracer(&mut tracer);
     let rollback_point = fork.rollback_point();
@@ -429,26 +460,26 @@ pub fn simulate_order(
 }
 
 /// Simulates order (including parent (those needed to reach proper nonces) orders) using a precreated fork
-pub fn simulate_order_using_fork<Tracer: SimulationTracer>(
-    parent_orders: Vec<Order>,
-    order: Order,
-    fork: &mut PartialBlockFork<'_, '_, '_, '_, Tracer>,
+pub fn simulate_order_using_fork<Tracer: SimulationTracer, DB>(
+    parent_orders: Vec<Arc<Order>>,
+    order: Arc<Order>,
+    fork: &mut PartialBlockFork<'_, '_, '_, '_, Tracer, NullPartialBlockForkExecutionTracer, DB>,
     mempool_tx_detector: &MempoolTxsDetector,
-) -> Result<OrderSimResult, CriticalCommitOrderError> {
+) -> Result<OrderSimResult, CriticalCommitOrderError>
+where
+    DB: Database<Error = ProviderError>,
+{
     let start = Instant::now();
     // simulate parents
-    let mut gas_used = 0;
-    let mut blob_gas_used = 0;
+    let mut space_state = BlockBuildingSpaceState::ZERO;
     // We use empty combined refunds because the value of the bundle will
     // not change from batching.
     let combined_refunds = std::collections::HashMap::default();
-    for parent in parent_orders {
-        let result =
-            fork.commit_order(&parent, gas_used, 0, blob_gas_used, true, &combined_refunds)?;
+    for parent in &parent_orders {
+        let result = fork.commit_order(parent, space_state, true, &combined_refunds)?;
         match result {
             Ok(res) => {
-                gas_used += res.gas_used;
-                blob_gas_used += res.blob_gas_used;
+                space_state.use_space(res.space_used);
             }
             Err(err) => {
                 tracing::trace!(parent_order = ?parent.id(), ?err, "failed to simulate parent order");
@@ -458,20 +489,19 @@ pub fn simulate_order_using_fork<Tracer: SimulationTracer>(
     }
 
     // simulate
-    let result = fork.commit_order(&order, gas_used, 0, blob_gas_used, true, &combined_refunds)?;
+    let result = fork.commit_order(&order, space_state, true, &combined_refunds)?;
     let sim_time = start.elapsed();
     add_order_simulation_time(sim_time, "sim", result.is_ok()); // we count parent sim time + order sim time time here
 
     match result {
         Ok(res) => {
             let sim_value = create_sim_value(&order, &res, mempool_tx_detector);
+            if let Err(err) = order_is_worth_executing(&sim_value) {
+                return Ok(OrderSimResult::Failed(err));
+            }
             let new_nonces = res.nonces_updated.into_iter().collect::<Vec<_>>();
             Ok(OrderSimResult::Success(
-                SimulatedOrder {
-                    order,
-                    sim_value,
-                    used_state_trace: res.used_state_trace,
-                },
+                Arc::new(SimulatedOrder::new(order, sim_value, res.used_state_trace)),
                 new_nonces,
             ))
         }

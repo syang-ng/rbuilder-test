@@ -1,7 +1,6 @@
 use alloy_primitives::utils::format_ether;
 use crossbeam_queue::SegQueue;
 use eyre::Result;
-use reth_provider::StateProvider;
 use std::{
     sync::{mpsc as std_mpsc, Arc},
     thread,
@@ -9,7 +8,6 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
-use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
 use super::{
@@ -17,8 +15,11 @@ use super::{
     simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
     ConflictTask, GroupId, ResolutionResult, TaskPriority,
 };
-use crate::provider::StateProviderFactory;
-use crate::{building::BlockBuildingContext, utils::elapsed_ms};
+use crate::{
+    building::BlockBuildingContext,
+    provider::{StateProviderFactory, StateProviderSource},
+    utils::elapsed_ms,
+};
 
 pub type TaskQueue = Arc<SegQueue<ConflictTask>>;
 
@@ -62,21 +63,19 @@ where
 
     pub fn start(&self) -> eyre::Result<()> {
         let inner_threads = 25;
-        let _ = rayon::ThreadPoolBuilder::new()
+        let _ = ThreadPoolBuilder::new()
             .num_threads(inner_threads)
             .build_global();
-    
+
+        let source =
+            StateProviderSource::new(Arc::new(self.provider.clone()), self.ctx.attributes.parent);
         for _ in 0..self.num_threads {
             let task_queue = self.task_queue.clone();
             let cancellation_token = self.cancellation_token.clone();
             let group_result_sender = self.group_result_sender.clone();
             let simulation_cache = self.simulation_cache.clone();
             let ctx = self.ctx.clone();
-
-            let block_state: Arc<dyn StateProvider> = self
-                .provider
-                .history_by_block_hash(self.ctx.attributes.parent)?
-                .into();
+            let source = source.clone();
             thread::spawn(move || {
                 while !cancellation_token.is_cancelled() {
                     if let Some(task) = task_queue.pop() {
@@ -87,7 +86,7 @@ where
                         if let Ok((task_id, result)) = Self::process_task(
                             task,
                             &ctx,
-                            block_state.clone(),
+                            source.clone(),
                             cancellation_token.clone(),
                             Arc::clone(&simulation_cache),
                         ) {
@@ -120,12 +119,12 @@ where
     fn process_task(
         task: ConflictTask,
         ctx: &BlockBuildingContext,
-        state: Arc<dyn StateProvider>,
+        source: StateProviderSource,
         cancellation_token: CancellationToken,
         simulation_cache: Arc<SharedSimulationCache>,
     ) -> Result<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut merging_context = ResolverContext::new(
-            state,
+            source,
             ctx.clone(),
             cancellation_token.clone(),
             simulation_cache,
@@ -164,7 +163,7 @@ where
         &mut self,
         new_groups: Vec<ConflictGroup>,
         ctx: &BlockBuildingContext,
-        state: Arc<dyn StateProvider>,
+        source: StateProviderSource,
         simulation_cache: Arc<SharedSimulationCache>,
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut results = Vec::new();
@@ -175,7 +174,7 @@ where
                 let result = Self::process_task(
                     task,
                     ctx,
-                    state.clone(),
+                    source.clone(),
                     CancellationToken::new(),
                     simulation_cache,
                 );
@@ -191,7 +190,7 @@ where
         &mut self,
         new_groups: Vec<ConflictGroup>,
         ctx: &BlockBuildingContext,
-        state: Arc<dyn StateProvider>,
+        source: StateProviderSource,
         simulation_cache: Arc<SharedSimulationCache>,
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut results = Vec::new();
@@ -202,7 +201,7 @@ where
                 let result = Self::process_task(
                     task,
                     ctx,
-                    state.clone(),
+                    source.clone(),
                     CancellationToken::new(),
                     simulation_cache,
                 );

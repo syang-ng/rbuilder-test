@@ -1,19 +1,23 @@
 pub mod sim_worker;
 mod simulation_job;
+pub mod simulation_job_tracer;
 
 use crate::{
     building::{
-        sim::{SimTree, SimulatedResult, SimulationRequest},
+        sim::{CancellableSimulationRequest, SimTree, SimulatedResult},
         tx_sim_cache::TxExecutionCache,
         BlockBuildingContext,
     },
-    live_builder::order_input::orderpool::OrdersForBlock,
-    primitives::{OrderId, SimulatedOrder},
+    live_builder::{
+        order_input::orderpool::OrdersForBlock,
+        simulation::simulation_job_tracer::SimulationJobTracer,
+    },
     provider::StateProviderFactory,
     utils::{gen_uid, NonceCache, Signer},
 };
 use ahash::HashMap;
 use parking_lot::Mutex;
+use rbuilder_primitives::{OrderId, SimulatedOrder};
 use simulation_job::SimulationJob;
 use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -32,8 +36,9 @@ type BlockContextId = u64;
 pub struct SimulationContext {
     pub block_ctx: BlockBuildingContext,
     /// Simulation requests come in through this channel.
-    pub requests: flume::Receiver<SimulationRequest>,
+    pub requests: flume::Receiver<CancellableSimulationRequest>,
     /// Simulation results go out through this channel.
+    /// This is also implicitly used as a cancellation token. If this is closed there is no need to simulate anymore.
     pub results: mpsc::Sender<SimulatedResult>,
 }
 
@@ -92,7 +97,7 @@ where
             let provider = result.provider.clone();
             let cancel = global_cancellation.clone();
             let handle = std::thread::Builder::new()
-                .name(format!("sim_thread:{}", i))
+                .name(format!("sim_thread:{i}"))
                 .spawn(move || {
                     sim_worker::run_sim_worker(i, ctx, provider, cancel);
                 })
@@ -112,6 +117,7 @@ where
         ctx: BlockBuildingContext,
         input: OrdersForBlock,
         block_cancellation: CancellationToken,
+        sim_tracer: Arc<dyn SimulationJobTracer>,
     ) -> SlotOrderSimResults {
         let (slot_sim_results_sender, slot_sim_results_receiver) = mpsc::channel(10_000);
 
@@ -120,7 +126,7 @@ where
             let mut ctx = ctx;
             let signer = Signer::random();
             ctx.evm_env.block_env.beneficiary = signer.address;
-            ctx.builder_signer = Some(signer);
+            ctx.builder_signer = signer;
             ctx.tx_execution_cache = TxExecutionCache::new(false).into();
             ctx
         } else {
@@ -130,7 +136,7 @@ where
         let provider = self.provider.clone();
         let current_contexts = Arc::clone(&self.current_contexts);
         let block_context: BlockContextId = gen_uid();
-        let span = info_span!("sim_ctx", block = ctx.evm_env.block_env.number, parent = ?ctx.attributes.parent);
+        let span = info_span!("sim_ctx", block = ctx.block(), parent = ?ctx.attributes.parent);
 
         let handle = tokio::spawn(
             async move {
@@ -145,7 +151,7 @@ where
                             return;
                         }
                     };
-                    NonceCache::new(state.into())
+                    NonceCache::new(state)
                 };
 
                 let sim_tree = SimTree::new(nonces);
@@ -168,6 +174,7 @@ where
                     sim_results_receiver,
                     slot_sim_results_sender,
                     sim_tree,
+                    sim_tracer,
                 );
 
                 simulation_job.run().await;
@@ -198,15 +205,18 @@ mod tests {
     use super::*;
     use crate::{
         building::testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
-        live_builder::order_input::order_sink::OrderPoolCommand,
-        primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs},
+        live_builder::{
+            order_input::order_sink::OrderPoolCommand,
+            simulation::simulation_job_tracer::NullSimulationJobTracer,
+        },
         utils::ProviderFactoryReopener,
     };
     use alloy_primitives::U256;
+    use rbuilder_primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs};
 
     #[tokio::test]
     async fn test_simulate_order_to_coinbase() {
-        let test_context = TestChainState::new(BlockArgs::default().number(11)).unwrap();
+        let test_context = TestChainState::new(BlockArgs::default()).unwrap();
 
         // Create simulation core
         let cancel = CancellationToken::new();
@@ -226,8 +236,8 @@ mod tests {
             test_context.block_building_context().clone(),
             orders_for_block,
             cancel.clone(),
+            Arc::new(NullSimulationJobTracer {}),
         );
-
         // Create a simple tx that sends to coinbase 5 wei.
         let coinbase_profit = 5;
         // max_priority_fee will be 0
@@ -235,7 +245,9 @@ mod tests {
         let tx = test_context.sign_tx(tx_args).unwrap();
         let tx = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx).unwrap();
         order_sender
-            .send(OrderPoolCommand::Insert(Order::Tx(MempoolTx::new(tx))))
+            .send(OrderPoolCommand::Insert(Arc::new(Order::Tx(
+                MempoolTx::new(tx),
+            ))))
             .unwrap();
 
         // We expect to receive the simulation giving a profit of coinbase_profit since that's what we sent directly to coinbase.

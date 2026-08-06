@@ -1,61 +1,60 @@
 use super::{
-    cached_reads::{CachedDB, LocalCachedReads, SharedCachedReads},
     create_payout_tx,
     tracers::SimulationTracer,
     tx_sim_cache::{CachedExecutionResult, EVMRecordingDatabase},
     BlockBuildingContext, EstimatePayoutGasErr, ThreadBlockBuildingContext,
 };
 use crate::{
-    building::{
-        estimate_payout_gas_limit,
-        evm::EvmFactory,
-        evm_inspector::{RBuilderEVMInspector, UsedStateTrace},
-    },
-    primitives::{
-        Bundle, Order, OrderId, RefundConfig, ShareBundle, ShareBundleBody, ShareBundleInner,
-        TransactionSignedEcRecoveredWithBlobs,
-    },
+    building::{estimate_payout_gas_limit, evm::EvmFactory, BlockBuildingSpaceState},
     utils::{constants::BASE_TX_GAS, get_percent},
 };
 use ahash::HashSet;
 use alloy_consensus::{constants::KECCAK_EMPTY, Transaction};
-use alloy_eips::eip4844::DATA_GAS_PER_BLOB;
+use alloy_evm::Database;
 use alloy_primitives::{Address, B256, I256, U256};
-use itertools::Itertools;
-use reth::revm::database::StateProviderDatabase;
+use alloy_rlp::Encodable;
+use rbuilder_primitives::{
+    evm_inspector::{RBuilderEVMInspector, UsedStateTrace},
+    BlockSpace, Bundle, Order, SimValue, TransactionSignedEcRecoveredWithBlobs,
+};
+use reth::consensus_common::validation::MAX_RLP_BLOCK_SIZE;
 use reth_errors::ProviderError;
+use reth_ethereum_primitives::Receipt;
 use reth_evm::{Evm, EvmEnv};
-use reth_primitives::Receipt;
-use reth_provider::{StateProvider, StateProviderBox};
 use revm::{
     context::result::{ExecutionResult, ResultAndState},
     context_interface::result::{EVMError, InvalidTransaction},
-    database::{states::bundle_state::BundleRetention, BundleState, State},
-    Database, DatabaseCommit,
+    database::{bal::EvmDatabaseError, states::bundle_state::BundleRetention, BundleState, State},
+    Database as _, DatabaseCommit,
 };
 use std::{collections::HashMap, sync::Arc};
 use thiserror::Error;
 
+/// revm 34 wraps DB errors in `EvmDatabaseError`; plain account reads never produce a
+/// block-access-list error, so map back to the underlying provider error.
+fn provider_error(err: EvmDatabaseError<ProviderError>) -> ProviderError {
+    match err {
+        EvmDatabaseError::Database(err) => err,
+        EvmDatabaseError::Bal(err) => ProviderError::other(err),
+    }
+}
+
 #[derive(Clone)]
-pub struct BlockState {
-    provider: Arc<dyn StateProvider>,
+pub struct BlockState<DB> {
+    db: DB,
     bundle_state: Option<BundleState>,
 }
 
-impl BlockState {
-    pub fn new(provider: StateProviderBox) -> Self {
-        Self::new_arc(Arc::from(provider))
-    }
-
-    pub fn new_arc(provider: Arc<dyn StateProvider>) -> Self {
+impl<DB> BlockState<DB> {
+    pub fn new(db: DB) -> Self {
         Self {
-            provider,
+            db,
             bundle_state: Some(BundleState::default()),
         }
     }
 
-    pub fn into_provider(self) -> Arc<dyn StateProvider> {
-        self.provider
+    pub fn into_db(self) -> DB {
+        self.db
     }
 
     pub fn with_bundle_state(mut self, bundle_state: BundleState) -> Self {
@@ -63,68 +62,79 @@ impl BlockState {
         self
     }
 
-    pub fn into_parts(self) -> (BundleState, Arc<dyn StateProvider>) {
-        (self.bundle_state.unwrap(), self.provider)
+    pub fn into_parts(self) -> (BundleState, DB) {
+        (self.bundle_state.unwrap(), self.db)
+    }
+
+    pub fn bundle_state(&self) -> &BundleState {
+        self.bundle_state.as_ref().unwrap()
+    }
+
+    pub fn bundle_state_mut(&mut self) -> &mut BundleState {
+        self.bundle_state.as_mut().unwrap()
     }
 
     pub fn clone_bundle(&self) -> BundleState {
         self.bundle_state.clone().unwrap()
     }
 
-    pub fn new_db_ref<'a, 'b, 'c>(
-        &'a mut self,
-        shared_cache_reads: &'b SharedCachedReads,
-        local_cache_reads: &'c mut LocalCachedReads,
-    ) -> BlockStateDBRef<'a, CachedDB<'c, 'b, impl Database<Error = ProviderError> + 'a>> {
-        let state_provider = StateProviderDatabase::new(&self.provider);
-        let cachedb = CachedDB::new(state_provider, local_cache_reads, shared_cache_reads);
+    /// Get accounts that were changed for the last `num_reverts` revert.
+    /// Revert is created after .merge_transitions(BundleRetention::Reverts) is called
+    /// on the EVM database object
+    pub fn get_changes_for_last_reverts(&self, num_reverts: usize) -> Vec<Address> {
+        let mut result = Vec::new();
+        self.bundle_state()
+            .reverts
+            .iter()
+            .rev()
+            .take(num_reverts)
+            .for_each(|r| r.iter().for_each(|c| result.push(c.0)));
+        result.sort();
+        result.dedup();
+        result
+    }
+}
+
+impl<DB> BlockState<DB>
+where
+    DB: Database<Error = ProviderError>,
+{
+    pub fn new_db_ref(&mut self) -> BlockStateDBRef<'_, &mut DB> {
         let bundle_state = self.bundle_state.take().unwrap();
         let db = State::builder()
-            .with_database(cachedb)
+            .with_database(&mut self.db)
             .with_bundle_prestate(bundle_state)
             .with_bundle_update()
             .build();
         BlockStateDBRef::new(db, &mut self.bundle_state)
     }
 
-    pub fn balance(
-        &mut self,
-        address: Address,
-        shared_cache_reads: &SharedCachedReads,
-        local_cache_reads: &mut LocalCachedReads,
-    ) -> Result<U256, ProviderError> {
-        let mut db = self.new_db_ref(shared_cache_reads, local_cache_reads);
+    pub fn balance(&mut self, address: Address) -> Result<U256, ProviderError> {
+        let mut db = self.new_db_ref();
         Ok(db
             .as_mut()
-            .basic(address)?
+            .basic(address)
+            .map_err(provider_error)?
             .map(|acc| acc.balance)
             .unwrap_or_default())
     }
 
-    pub fn nonce(
-        &mut self,
-        address: Address,
-        shared_cache_reads: &SharedCachedReads,
-        local_cache_reads: &mut LocalCachedReads,
-    ) -> Result<u64, ProviderError> {
-        let mut db = self.new_db_ref(shared_cache_reads, local_cache_reads);
+    pub fn nonce(&mut self, address: Address) -> Result<u64, ProviderError> {
+        let mut db = self.new_db_ref();
         Ok(db
             .as_mut()
-            .basic(address)?
+            .basic(address)
+            .map_err(provider_error)?
             .map(|acc| acc.nonce)
             .unwrap_or_default())
     }
 
-    pub fn code_hash(
-        &mut self,
-        address: Address,
-        shared_cache_reads: &SharedCachedReads,
-        local_cache_reads: &mut LocalCachedReads,
-    ) -> Result<B256, ProviderError> {
-        let mut db = self.new_db_ref(shared_cache_reads, local_cache_reads);
+    pub fn code_hash(&mut self, address: Address) -> Result<B256, ProviderError> {
+        let mut db = self.new_db_ref();
         Ok(db
             .as_mut()
-            .basic(address)?
+            .basic(address)
+            .map_err(provider_error)?
             .map(|acc| acc.code_hash)
             .unwrap_or_else(|| KECCAK_EMPTY))
     }
@@ -186,20 +196,24 @@ where
 pub struct TransactionExecutionInfo {
     pub tx: TransactionSignedEcRecoveredWithBlobs,
     pub receipt: Receipt,
-    pub gas_used: u64,
+    pub space_used: BlockSpace,
     /// coinbase balance after tx - before.
     pub coinbase_profit: I256,
 }
 #[derive(Debug, Clone)]
 pub struct TransactionOk {
     pub exec_result: ExecutionResult,
-    pub cumulative_gas_used: u64,
-    pub blob_gas_used: u64,
-    pub cumulative_blob_gas_used: u64,
+    pub cumulative_space_used: BlockSpace,
     pub tx_info: TransactionExecutionInfo,
     /// nonces_updates is nonce after tx was applied.
     /// account nonce was 0, tx was included, nonce is 1. => nonce_updated.1 == 1
     pub nonce_updated: (Address, u64),
+}
+
+impl TransactionOk {
+    pub fn space_used(&self) -> BlockSpace {
+        self.tx_info.space_used
+    }
 }
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
@@ -212,31 +226,37 @@ pub enum TransactionErr {
     GasLeft,
     #[error("Blob Gas left is too low")]
     BlobGasLeft,
+    #[error("Block space (EIP-7934) left is too low")]
+    BlockSpaceLeft,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelayedKickback {
     pub recipient: Address,
     pub payout_value: U256,
     pub payout_tx_fee: U256,
+    pub payout_tx_space_needed: BlockSpace,
+    pub should_pay_in_block: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct BundleOk {
-    pub gas_used: u64,
-    pub cumulative_gas_used: u64,
-    pub blob_gas_used: u64,
-    pub cumulative_blob_gas_used: u64,
+    pub space_used: BlockSpace,
+    pub cumulative_space_used: BlockSpace,
+    /// Landed txs execution info.
     pub tx_infos: Vec<TransactionExecutionInfo>,
     /// nonces_updates has a set of deduplicated final nonces of the txs in the order
     pub nonces_updated: Vec<(Address, u64)>,
     pub paid_kickbacks: Vec<(Address, U256)>,
     /// The refund amount to accrue per recipient and be paid at the end of the block and tx fee value that is deducted from the profit of the first delayed refund bundle for the recipient in the block
     pub delayed_kickback: Option<DelayedKickback>,
-    /// Only for sbundles we accumulate ShareBundleInner::original_order_id that executed ok.
-    /// Its original use is for only one level or orders with original_order_id but if nesting happens the parent order original_order_id goes before its children (pre-order DFS)
-    /// Fully dropped orders (TxRevertBehavior::AllowedExcluded allows it!) are not included.
-    pub original_order_ids: Vec<OrderId>,
+}
+
+impl BundleOk {
+    /// Creates the current space state by adding the reserved block space to the cumulative space used.
+    pub fn space_state(&self, reserved_block_space: BlockSpace) -> BlockBuildingSpaceState {
+        BlockBuildingSpaceState::new(self.cumulative_space_used, reserved_block_space)
+    }
 }
 
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -279,8 +299,6 @@ pub enum BundleErr {
     IncorrectRefundableElement(usize),
     #[error("Incorrect timestamp, min: {min}, max: {max}, block: {block}")]
     IncorrectTimestamp { min: u64, max: u64, block: u64 },
-    #[error("Mev-share without signer")]
-    NoSigner,
 }
 
 #[derive(Debug, Clone)]
@@ -288,13 +306,9 @@ pub struct OrderOk {
     /// Profit used for sorting orders on building algorithms.
     /// Real profit for s/bundles (they fail on negative profit) and capped to 0 for txs with negative profit.
     pub coinbase_profit: U256,
-    pub gas_used: u64,
-    pub cumulative_gas_used: u64,
-    pub blob_gas_used: u64,
-    pub cumulative_blob_gas_used: u64,
+    pub space_used: BlockSpace,
+    pub cumulative_space_used: BlockSpace,
     pub tx_infos: Vec<TransactionExecutionInfo>,
-    /// Patch to get the executed OrderIds for merged sbundles (see: [`BundleOk::original_order_ids`],[`ShareBundleMerger`] )
-    pub original_order_ids: Vec<OrderId>,
     /// nonces_updates has a set of deduplicated final nonces of the txs in the order
     pub nonces_updated: Vec<(Address, u64)>,
     pub paid_kickbacks: Vec<(Address, U256)>,
@@ -308,18 +322,98 @@ pub enum OrderErr {
     Transaction(#[from] TransactionErr),
     #[error("Bundle error: {0}")]
     Bundle(#[from] BundleErr),
+    /// This is not really an error from order execution. We should probably move it away from here.
+    /// It's used after simulation to reject orders with no exclusive profit (only profit from mempool txs)
+    #[error("No exclusive profit")]
+    NoExclusiveProfit,
     #[error("Negative profit: {0}")]
     NegativeProfit(U256),
 }
 
-pub struct PartialBlockFork<'a, 'b, 'c, 'd, Tracer: SimulationTracer> {
+/// Sometimes we want to reject orders that pass simulation but we think are not going to be good for the block.
+pub fn order_is_worth_executing(sim_value: &SimValue) -> Result<(), OrderErr> {
+    if sim_value
+        .non_mempool_profit_info()
+        .coinbase_profit()
+        .is_zero()
+    {
+        Err(OrderErr::NoExclusiveProfit)
+    } else {
+        Ok(())
+    }
+}
+
+/// Tracer for PartialBlockFork execution.
+/// Passing the NullPartialBlockForkExecutionTracer should have 0 overhead (compiler should optimize it out).
+pub trait PartialBlockForkExecutionTracer {
+    fn update_commit_tx_about_to_execute(
+        &mut self,
+        tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
+        space_state: BlockBuildingSpaceState,
+    );
+
+    /// commit_tx parameters redundant with update_commit_tx_about_to_execute but practical....
+    fn update_commit_tx_executed(
+        &mut self,
+        tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
+        space_state: BlockBuildingSpaceState,
+        res: &Result<Result<TransactionOk, TransactionErr>, CriticalCommitOrderError>,
+    );
+}
+
+impl<T: PartialBlockForkExecutionTracer> PartialBlockForkExecutionTracer for &mut T {
+    fn update_commit_tx_about_to_execute(
+        &mut self,
+        tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
+        space_state: BlockBuildingSpaceState,
+    ) {
+        (*self).update_commit_tx_about_to_execute(tx_with_blobs, space_state)
+    }
+    fn update_commit_tx_executed(
+        &mut self,
+        tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
+        space_state: BlockBuildingSpaceState,
+        res: &Result<Result<TransactionOk, TransactionErr>, CriticalCommitOrderError>,
+    ) {
+        (*self).update_commit_tx_executed(tx_with_blobs, space_state, res)
+    }
+}
+
+pub struct NullPartialBlockForkExecutionTracer;
+impl PartialBlockForkExecutionTracer for NullPartialBlockForkExecutionTracer {
+    #[inline]
+    fn update_commit_tx_about_to_execute(
+        &mut self,
+        _tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
+        _space_state: BlockBuildingSpaceState,
+    ) {
+    }
+    #[inline]
+    fn update_commit_tx_executed(
+        &mut self,
+        _tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
+        _space_state: BlockBuildingSpaceState,
+        _res: &Result<Result<TransactionOk, TransactionErr>, CriticalCommitOrderError>,
+    ) {
+    }
+}
+pub struct PartialBlockFork<
+    'a,
+    'b,
+    'c,
+    'd,
+    Tracer: SimulationTracer,
+    PartialBlockForkExecutionTracerType: PartialBlockForkExecutionTracer,
+    DB,
+> {
     pub rollbacks: usize,
     pub ctx: &'c BlockBuildingContext,
-    pub state: &'a mut BlockState,
+    pub state: &'a mut BlockState<DB>,
     pub local_ctx: &'d mut ThreadBlockBuildingContext,
     pub tracer: Option<&'b mut Tracer>,
     /// Temporary state trace used as a scratchpad for tx execution
     tmp_used_state_tracer: UsedStateTrace,
+    partial_block_fork_execution_tracer: PartialBlockForkExecutionTracerType,
 }
 
 pub struct PartialBlockRollobackPoint {
@@ -328,7 +422,7 @@ pub struct PartialBlockRollobackPoint {
 
 #[derive(Debug, Clone)]
 pub struct ReservedPayout {
-    pub gas_limit: u64,
+    pub space_limit: BlockSpace,
     pub tx_value: U256,
     pub total_refundable_value: U256,
     pub base_fee: U256,
@@ -347,21 +441,32 @@ pub enum CriticalCommitOrderError {
     #[error("Reth error: {0}")]
     Reth(#[from] ProviderError),
     #[error("EVM error: {0}")]
-    EVM(#[from] EVMError<ProviderError>),
+    EVM(#[from] EVMError<EvmDatabaseError<ProviderError>>),
+    #[error("EVM database error: {0}")]
+    EvmDatabase(#[from] EvmDatabaseError<ProviderError>),
     /// This could happen if we can't fit a balance in a I256 (unlikely/impossible since the ETH total supply is several orders of magnitude bellow I256::max)
     #[error("BigIntConversionError error: {0}")]
     BigIntConversionError(#[from] alloy_primitives::BigIntConversionError),
 }
 
 /// For all funcs allow_tx_skip means:
-/// If a tx inside a bundle or sbundle fails with TransactionErr (don't confuse this with reverting which is TransactionOk with !.receipt.success)
-/// and it's configured as allowed to revert (for bundles tx in reverting_tx_hashes, for sbundles: TxRevertBehavior != NotAllowed) we continue the
-/// the execution of the bundle/sbundle.
-impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, Tracer> {
+/// If a tx inside a bundle fails with TransactionErr (don't confuse this with reverting which is TransactionOk with !.receipt.success)
+/// and it's configured as allowed to revert (for bundles tx in reverting_tx_hashes) we continue the
+/// the execution of the bundle.
+impl<
+        'a,
+        'b,
+        'c,
+        'd,
+        Tracer: SimulationTracer,
+        PartialBlockForkExecutionTracerType: PartialBlockForkExecutionTracer,
+        DB: Database<Error = ProviderError>,
+    > PartialBlockFork<'a, 'b, 'c, 'd, Tracer, PartialBlockForkExecutionTracerType, DB>
+{
     pub fn with_tracer<NewTracer: SimulationTracer>(
         self,
         tracer: &'b mut NewTracer,
-    ) -> PartialBlockFork<'a, 'b, 'c, 'd, NewTracer> {
+    ) -> PartialBlockFork<'a, 'b, 'c, 'd, NewTracer, PartialBlockForkExecutionTracerType, DB> {
         PartialBlockFork {
             rollbacks: self.rollbacks,
             state: self.state,
@@ -369,6 +474,7 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
             local_ctx: self.local_ctx,
             tracer: Some(tracer),
             tmp_used_state_tracer: self.tmp_used_state_tracer,
+            partial_block_fork_execution_tracer: self.partial_block_fork_execution_tracer,
         }
     }
 
@@ -389,16 +495,7 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
     }
 
     fn coinbase_balance(&mut self) -> Result<U256, ProviderError> {
-        self.state.balance(
-            self.ctx.evm_env.block_env.beneficiary,
-            &self.ctx.shared_cached_reads,
-            &mut self.local_ctx.cached_reads,
-        )
-    }
-
-    /// If current balance < initial balance returns 0.
-    fn saturating_coinbase_delta(&mut self, initial_balance: U256) -> Result<U256, ProviderError> {
-        Ok(self.coinbase_balance()?.saturating_sub(initial_balance))
+        self.state.balance(self.ctx.evm_env.block_env.beneficiary)
     }
 
     /// Helper func that executes f and rollbacks on Ok(Err).
@@ -425,25 +522,58 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         Ok(res)
     }
 
-    /// The state is updated ONLY when we return Ok(Ok)
     pub fn commit_tx(
         &mut self,
         tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
-        mut cumulative_gas_used: u64,
-        gas_reserved: u64,
-        mut cumulative_blob_gas_used: u64,
+        space_state: BlockBuildingSpaceState,
     ) -> Result<Result<TransactionOk, TransactionErr>, CriticalCommitOrderError> {
-        let coinbase_balance_before = I256::try_from(self.coinbase_balance()?)?;
-        // Use blobs.len() instead of checking for tx type just in case in the future some other new txs have blobs
-        let blob_gas_used = tx_with_blobs.blobs_sidecar.blobs.len() as u64 * DATA_GAS_PER_BLOB;
-        if cumulative_blob_gas_used + blob_gas_used > self.ctx.max_blob_gas_per_block() {
-            return Ok(Err(TransactionErr::BlobGasLeft));
+        self.partial_block_fork_execution_tracer
+            .update_commit_tx_about_to_execute(tx_with_blobs, space_state);
+        let res = self.commit_tx_inner(tx_with_blobs, space_state);
+        self.partial_block_fork_execution_tracer
+            .update_commit_tx_executed(tx_with_blobs, space_state, &res);
+        res
+    }
+
+    /// Checks if the tx can fit in the block by checking:
+    /// - Gas left
+    /// - Blob gas left
+    /// - RLP size limit
+    fn can_fit_tx(
+        &self,
+        space_needed: BlockSpace,
+        blob_gas_needed: u64,
+        space_state: BlockBuildingSpaceState,
+    ) -> Result<(), TransactionErr> {
+        let total_consumed_space = space_state.total_consumed_space();
+        if space_needed.rlp_length + total_consumed_space.rlp_length > MAX_RLP_BLOCK_SIZE {
+            return Err(TransactionErr::BlockSpaceLeft);
         }
 
-        let mut db = self.state.new_db_ref(
-            &self.ctx.shared_cached_reads,
-            &mut self.local_ctx.cached_reads,
-        );
+        if space_needed.gas + total_consumed_space.gas > self.ctx.evm_env.block_env.gas_limit {
+            return Err(TransactionErr::GasLeft);
+        }
+
+        if blob_gas_needed + space_state.blob_gas_used() > self.ctx.max_blob_gas_per_block() {
+            return Err(TransactionErr::BlobGasLeft);
+        }
+        Ok(())
+    }
+
+    /// The state is updated ONLY when we return Ok(Ok)
+    fn commit_tx_inner(
+        &mut self,
+        tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
+        mut space_state: BlockBuildingSpaceState,
+    ) -> Result<Result<TransactionOk, TransactionErr>, CriticalCommitOrderError> {
+        let blob_gas_used = tx_with_blobs.blobs_gas_used();
+        if let Err(err) = self.can_fit_tx(tx_with_blobs.space_needed(), blob_gas_used, space_state)
+        {
+            return Ok(Err(err));
+        }
+
+        let coinbase_balance_before = I256::try_from(self.coinbase_balance()?)?;
+        let mut db = self.state.new_db_ref();
         let tx = &tx_with_blobs.internal_tx_unsecure();
         if self.ctx.blocklist.contains(&tx.signer())
             || tx
@@ -452,21 +582,6 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
                 .unwrap_or(false)
         {
             return Ok(Err(TransactionErr::Blocklist));
-        }
-
-        match self
-            .ctx
-            .evm_env
-            .block_env
-            .gas_limit
-            .checked_sub(cumulative_gas_used + gas_reserved)
-        {
-            Some(gas_left) => {
-                if tx.gas_limit() > gas_left {
-                    return Ok(Err(TransactionErr::GasLeft));
-                }
-            }
-            None => return Ok(Err(TransactionErr::GasLeft)),
         }
 
         // evm start
@@ -537,7 +652,7 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         };
 
         if let Some(tracer) = &mut self.tracer {
-            tracer.add_gas_used(res.result.gas_used());
+            tracer.add_gas_used(res.result.tx_gas_used());
             if let (true, Some(t)) = (is_recording_used_state, used_state_trace) {
                 tracer.add_used_state_trace(t)
             }
@@ -550,28 +665,29 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         self.rollbacks += 1;
 
         // add gas used by the transaction to cumulative gas used, before creating the receipt
-        let gas_used = res.result.gas_used();
+        let space_used = BlockSpace::new(
+            res.result.tx_gas_used(),
+            tx_with_blobs.internal_tx_unsecure().length(),
+            blob_gas_used,
+        );
 
-        cumulative_gas_used += gas_used;
-        cumulative_blob_gas_used += blob_gas_used;
+        space_state.use_space(space_used);
 
         let success = res.result.is_success();
         let receipt = Receipt {
             tx_type: tx.tx_type(),
             success,
-            cumulative_gas_used,
+            cumulative_gas_used: space_state.gas_used(),
             logs: res.result.logs().to_vec(),
         };
         let coinbase_balance_after = I256::try_from(self.coinbase_balance()?)?;
         Ok(Ok(TransactionOk {
             exec_result: res.result,
-            blob_gas_used,
-            cumulative_blob_gas_used,
-            cumulative_gas_used,
+            cumulative_space_used: space_state.space_used(),
             tx_info: TransactionExecutionInfo {
                 tx: tx_with_blobs.clone(),
                 receipt,
-                gas_used,
+                space_used,
                 coinbase_profit: coinbase_balance_after - coinbase_balance_before,
             },
             nonce_updated: (tx.signer(), tx.nonce() + 1),
@@ -582,13 +698,11 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
     fn commit_bundle(
         &mut self,
         bundle: &Bundle,
-        cumulative_gas_used: u64,
-        gas_reserved: u64,
-        cumulative_blob_gas_used: u64,
+        space_state: BlockBuildingSpaceState,
         allow_tx_skip: bool,
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
-        let current_block = self.ctx.evm_env.block_env.number;
+        let current_block = self.ctx.block();
         // None is good for any block
         if let Some(block) = bundle.block {
             if block != current_block {
@@ -603,7 +717,7 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         let (min_ts, max_ts, block_ts) = (
             bundle.min_timestamp.unwrap_or(0),
             bundle.max_timestamp.unwrap_or(u64::MAX),
-            self.ctx.evm_env.block_env.timestamp,
+            self.ctx.timestamp_u64(),
         );
         if !(min_ts <= block_ts && block_ts <= max_ts) {
             return Ok(Err(BundleErr::IncorrectTimestamp {
@@ -614,22 +728,13 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         }
 
         self.execute_with_rollback(|s| {
-            s.commit_bundle_no_rollback(
-                bundle,
-                cumulative_gas_used,
-                gas_reserved,
-                cumulative_blob_gas_used,
-                allow_tx_skip,
-                combined_refunds,
-            )
+            s.commit_bundle_no_rollback(bundle, space_state, allow_tx_skip, combined_refunds)
         })
     }
 
     fn accumulate_tx_execution(transaction_ok: TransactionOk, bundle_ok: &mut BundleOk) {
-        bundle_ok.gas_used += transaction_ok.tx_info.gas_used;
-        bundle_ok.cumulative_gas_used = transaction_ok.cumulative_gas_used;
-        bundle_ok.blob_gas_used += transaction_ok.blob_gas_used;
-        bundle_ok.cumulative_blob_gas_used = transaction_ok.cumulative_blob_gas_used;
+        bundle_ok.space_used += transaction_ok.space_used();
+        bundle_ok.cumulative_space_used = transaction_ok.cumulative_space_used;
         bundle_ok.tx_infos.push(transaction_ok.tx_info);
         update_nonce_list(&mut bundle_ok.nonces_updated, transaction_ok.nonce_updated);
     }
@@ -638,16 +743,15 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         &mut self,
         to: Address,
         refundable_value: U256,
-        gas_used: u64,
+        space_used: BlockSpace,
     ) -> Result<ReservedPayout, BundleErr> {
-        let gas_limit =
-            match estimate_payout_gas_limit(to, self.ctx, self.local_ctx, self.state, gas_used) {
-                Ok(gas_limit) => gas_limit,
-                Err(err) => {
-                    return Err(BundleErr::EstimatePayoutGas(err));
-                }
-            };
-        let base_fee = U256::from(self.ctx.evm_env.block_env.basefee) * U256::from(gas_limit);
+        let space_limit = match estimate_payout_gas_limit(to, self.ctx, self.state, space_used) {
+            Ok(space_limit) => space_limit,
+            Err(err) => {
+                return Err(BundleErr::EstimatePayoutGas(err));
+            }
+        };
+        let base_fee = U256::from(self.ctx.evm_env.block_env.basefee) * U256::from(space_limit.gas);
         if base_fee > refundable_value {
             return Err(BundleErr::NotEnoughRefundForGas {
                 to,
@@ -657,7 +761,7 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         }
         let tx_value = refundable_value - base_fee;
         Ok(ReservedPayout {
-            gas_limit,
+            space_limit,
             tx_value,
             base_fee,
             total_refundable_value: refundable_value,
@@ -670,27 +774,19 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         &mut self,
         payout: ReservedPayout,
         to: Address,
-        gas_reserved: u64,
+        reserved_block_space: BlockSpace,
         insert_result: &mut BundleOk,
     ) -> Result<Result<(), BundleErr>, CriticalCommitOrderError> {
-        let builder_signer = if let Some(signer) = self.ctx.builder_signer.as_ref() {
-            signer
-        } else {
-            return Ok(Err(BundleErr::NoSigner));
-        };
+        let builder_signer = &self.ctx.builder_signer;
 
-        let nonce = self.state.nonce(
-            builder_signer.address,
-            &self.ctx.shared_cached_reads,
-            &mut self.local_ctx.cached_reads,
-        )?;
+        let nonce = self.state.nonce(builder_signer.address)?;
         let payout_tx = match create_payout_tx(
             self.ctx.chain_spec.as_ref(),
             self.ctx.evm_env.block_env.basefee,
             builder_signer,
             nonce,
             to,
-            payout.gas_limit,
+            payout.space_limit.gas,
             payout.tx_value,
         ) {
             // payout tx has no blobs so it's safe to unwrap
@@ -699,18 +795,13 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
                 return Ok(Err(BundleErr::PayoutTx(err)));
             }
         };
-        let res = self.commit_tx(
-            &payout_tx,
-            insert_result.cumulative_gas_used,
-            gas_reserved,
-            insert_result.cumulative_blob_gas_used,
-        )?;
+        let res = self.commit_tx(&payout_tx, insert_result.space_state(reserved_block_space))?;
         match res {
             Ok(res) => {
                 if !res.tx_info.receipt.success {
                     return Ok(Err(BundleErr::FailedToCommitPayoutTx {
                         to,
-                        gas_limit: payout.gas_limit,
+                        gas_limit: payout.space_limit.gas,
                         value: payout.tx_value,
                         err: None,
                     }));
@@ -721,7 +812,7 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
             Err(err) => {
                 return Ok(Err(BundleErr::FailedToCommitPayoutTx {
                     to,
-                    gas_limit: payout.gas_limit,
+                    gas_limit: payout.space_limit.gas,
                     value: payout.tx_value,
                     err: Some(err),
                 }));
@@ -733,32 +824,25 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
     fn commit_bundle_no_rollback(
         &mut self,
         bundle: &Bundle,
-        cumulative_gas_used: u64,
-        gas_reserved: u64,
-        cumulative_blob_gas_used: u64,
+        space_state: BlockBuildingSpaceState,
         allow_tx_skip: bool,
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
         let mut refundable_profit = U256::ZERO;
         let mut insert = BundleOk {
-            gas_used: 0,
-            cumulative_gas_used,
-            blob_gas_used: 0,
-            cumulative_blob_gas_used,
+            space_used: BlockSpace::ZERO,
+            cumulative_space_used: space_state.space_used(),
             tx_infos: Vec::new(),
             nonces_updated: Vec::new(),
             paid_kickbacks: Vec::new(),
             delayed_kickback: None,
-            original_order_ids: Vec::new(),
         };
         for tx_with_blobs in &bundle.txs {
             let tx_hash = tx_with_blobs.hash();
             let rollback_point = self.rollback_point();
             let result = self.commit_tx(
                 tx_with_blobs,
-                insert.cumulative_gas_used,
-                gas_reserved,
-                insert.cumulative_blob_gas_used,
+                insert.space_state(space_state.reserved_block_space()),
             )?;
             match result {
                 Ok(res) => {
@@ -790,7 +874,7 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
                 }
             }
         }
-        if insert.gas_used == 0 {
+        if insert.space_used.gas == 0 {
             return Ok(Err(BundleErr::EmptyBundle));
         }
 
@@ -802,6 +886,18 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
             // Calculate the refund value without refund tx cost.
             let refundable_value = get_percent(refundable_profit, refunds_cfg.percent as usize);
 
+            if refunds_cfg.delayed {
+                // The refund value will be delayed to the BuilderNet refund pipeline.
+                insert.delayed_kickback = Some(DelayedKickback {
+                    recipient: refunds_cfg.recipient,
+                    payout_value: refundable_value,
+                    payout_tx_fee: U256::ZERO,
+                    payout_tx_space_needed: BlockSpace::ZERO,
+                    should_pay_in_block: false,
+                });
+                break 'refund;
+            }
+
             if combined_refunds.contains_key(&refunds_cfg.recipient) {
                 // We already determined that refund for this recipient will cost [`BASE_TX_GAS`]
                 // and previously inserted a bundle that is capable of paying this cost.
@@ -810,6 +906,8 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
                     recipient: refunds_cfg.recipient,
                     payout_value: refundable_value,
                     payout_tx_fee: U256::ZERO,
+                    payout_tx_space_needed: BlockSpace::ZERO,
+                    should_pay_in_block: true,
                 });
                 break 'refund;
             }
@@ -818,32 +916,31 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
             let payout = match self.estimate_refund_payout_tx(
                 refunds_cfg.recipient,
                 refundable_value,
-                insert.cumulative_gas_used,
+                insert.cumulative_space_used,
             ) {
                 Ok(payout) => payout,
                 Err(err) => return Ok(Err(err)),
             };
 
-            let gas_limit = self.ctx.evm_env.block_env.gas_limit;
-            if payout.gas_limit == BASE_TX_GAS
-                && gas_limit
-                    .checked_sub(insert.cumulative_gas_used + gas_reserved)
-                    .is_some_and(|remaining| remaining > payout.gas_limit)
+            let space_state = insert.space_state(space_state.reserved_block_space());
+            if payout.space_limit.gas == BASE_TX_GAS
+                && self.can_fit_tx(payout.space_limit, 0, space_state).is_ok()
             {
                 // This refund recipient is eligible for a combined refund at the end of the block.
                 insert.delayed_kickback = Some(DelayedKickback {
                     recipient: refunds_cfg.recipient,
                     payout_value: payout.tx_value,
                     payout_tx_fee: payout.base_fee,
+                    payout_tx_space_needed: payout.space_limit,
+                    should_pay_in_block: true,
                 });
                 break 'refund;
             }
-
             // Refund the recipient immediately.
             if let Err(err) = self.insert_refund_payout_tx(
                 payout,
                 refunds_cfg.recipient,
-                gas_reserved,
+                space_state.reserved_block_space(),
                 &mut insert,
             )? {
                 return Ok(Err(err));
@@ -851,264 +948,6 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
         }
 
         Ok(Ok(insert))
-    }
-
-    /// block check + commit_share_bundle_no_rollback + rollback
-    fn commit_share_bundle(
-        &mut self,
-        bundle: &ShareBundle,
-        cumulative_gas_used: u64,
-        gas_reserved: u64,
-        cumulative_blob_gas_used: u64,
-        allow_tx_skip: bool,
-    ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
-        let current_block = self.ctx.evm_env.block_env.number;
-        if !(bundle.block <= current_block && current_block <= bundle.max_block) {
-            return Ok(Err(BundleErr::TargetBlockIncorrect {
-                block: current_block,
-                target_block: bundle.block,
-                target_max_block: bundle.max_block,
-            }));
-        }
-        self.execute_with_rollback(|s| {
-            s.commit_share_bundle_no_rollback(
-                bundle,
-                cumulative_gas_used,
-                gas_reserved,
-                cumulative_blob_gas_used,
-                allow_tx_skip,
-            )
-        })
-    }
-
-    /// Calls commit_share_bundle_inner to do all the hard work and, if everting goes ok, pays kickbacks
-    fn commit_share_bundle_no_rollback(
-        &mut self,
-        bundle: &ShareBundle,
-        cumulative_gas_used: u64,
-        gas_reserved: u64,
-        cumulative_blob_gas_used: u64,
-        allow_tx_skip: bool,
-    ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
-        let res = self.commit_share_bundle_inner(
-            bundle.inner_bundle(),
-            cumulative_gas_used,
-            gas_reserved,
-            cumulative_blob_gas_used,
-            allow_tx_skip,
-        )?;
-        let res = match res {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(Err(e));
-            }
-        };
-
-        let mut insert = res.bundle_ok;
-
-        // now pay all kickbacks
-        for (to, payout) in res.payouts_promissed.into_iter().sorted_by_key(|(a, _)| *a) {
-            if let Err(err) = self.insert_refund_payout_tx(payout, to, gas_reserved, &mut insert)? {
-                return Ok(Err(err));
-            }
-        }
-        Ok(Ok(insert))
-    }
-
-    /// Only changes the state on Ok(Ok)
-    fn commit_share_bundle_inner(
-        &mut self,
-        bundle: &ShareBundleInner,
-        cumulative_gas_used: u64,
-        gas_reserved: u64,
-        cumulative_blob_gas_used: u64,
-        allow_tx_skip: bool,
-    ) -> Result<Result<ShareBundleCommitResult, BundleErr>, CriticalCommitOrderError> {
-        self.execute_with_rollback(|s| {
-            s.commit_share_bundle_inner_no_rollback(
-                bundle,
-                cumulative_gas_used,
-                gas_reserved,
-                cumulative_blob_gas_used,
-                allow_tx_skip,
-            )
-        })
-    }
-
-    fn commit_share_bundle_inner_no_rollback(
-        &mut self,
-        bundle: &ShareBundleInner,
-        cumulative_gas_used: u64,
-        gas_reserved: u64,
-        cumulative_blob_gas_used: u64,
-        allow_tx_skip: bool,
-    ) -> Result<Result<ShareBundleCommitResult, BundleErr>, CriticalCommitOrderError> {
-        let mut insert = BundleOk {
-            gas_used: 0,
-            cumulative_gas_used,
-            blob_gas_used: 0,
-            cumulative_blob_gas_used,
-            tx_infos: Vec::new(),
-            nonces_updated: Vec::new(),
-            paid_kickbacks: Vec::new(),
-            delayed_kickback: None,
-            original_order_ids: Vec::new(),
-        };
-        let coinbase_balance_before = self.coinbase_balance()?;
-        let refundable_elements = bundle
-            .refund
-            .iter()
-            .map(|r| (r.body_idx, r.percent))
-            .collect::<HashMap<_, _>>();
-        let mut refundable_profit = U256::from(0);
-        let mut inner_payouts = HashMap::new();
-        for (idx, body) in bundle.body.iter().enumerate() {
-            match body {
-                ShareBundleBody::Tx(sbundle_tx) => {
-                    let rollback_point = self.rollback_point();
-                    let tx = &sbundle_tx.tx;
-                    let result = self.commit_tx(
-                        tx,
-                        insert.cumulative_gas_used,
-                        gas_reserved,
-                        insert.cumulative_blob_gas_used,
-                    )?;
-                    match result {
-                        Ok(res) => {
-                            if !res.tx_info.receipt.success {
-                                match sbundle_tx.revert_behavior {
-                                    crate::primitives::TxRevertBehavior::NotAllowed => {
-                                        return Ok(Err(BundleErr::TransactionReverted(tx.hash())));
-                                    }
-                                    crate::primitives::TxRevertBehavior::AllowedIncluded => {}
-                                    crate::primitives::TxRevertBehavior::AllowedExcluded => {
-                                        self.rollback(rollback_point);
-                                        continue;
-                                    }
-                                }
-                            }
-                            if res.tx_info.coinbase_profit.is_positive()
-                                && !refundable_elements.contains_key(&idx)
-                            {
-                                refundable_profit += res.tx_info.coinbase_profit.unsigned_abs();
-                            }
-                            Self::accumulate_tx_execution(res, &mut insert);
-                        }
-                        Err(err) => {
-                            // if optional transaction, skip
-                            if allow_tx_skip && sbundle_tx.revert_behavior.can_revert() {
-                                continue;
-                            } else {
-                                return Ok(Err(BundleErr::InvalidTransaction(tx.hash(), err)));
-                            }
-                        }
-                    }
-                }
-                ShareBundleBody::Bundle(inner_bundle) => {
-                    let inner_res = self.commit_share_bundle_inner(
-                        inner_bundle,
-                        insert.cumulative_gas_used,
-                        gas_reserved,
-                        insert.cumulative_blob_gas_used,
-                        allow_tx_skip,
-                    )?;
-                    match inner_res {
-                        Ok(res) => {
-                            if let Some(original_order_id) = inner_bundle.original_order_id {
-                                if !res.bundle_ok.tx_infos.is_empty() {
-                                    // We only consider this order executed if something was so we exclude 100% dropped bundles.
-                                    insert.original_order_ids.push(original_order_id);
-                                }
-                            }
-                            if res.coinbase_diff_before_payouts > res.total_payouts_promissed
-                                && !refundable_elements.contains_key(&idx)
-                            {
-                                refundable_profit +=
-                                    res.coinbase_diff_before_payouts - res.total_payouts_promissed
-                            }
-                            insert
-                                .original_order_ids
-                                .extend(res.bundle_ok.original_order_ids);
-                            insert.gas_used += res.bundle_ok.gas_used;
-                            insert.cumulative_gas_used = res.bundle_ok.cumulative_gas_used;
-                            insert.blob_gas_used += res.bundle_ok.blob_gas_used;
-                            insert.cumulative_blob_gas_used =
-                                res.bundle_ok.cumulative_blob_gas_used;
-                            insert.tx_infos.extend(res.bundle_ok.tx_infos);
-                            update_nonce_list_with_updates(
-                                &mut insert.nonces_updated,
-                                res.bundle_ok.nonces_updated,
-                            );
-
-                            for (addr, reserve) in res.payouts_promissed {
-                                inner_payouts
-                                    .entry(addr)
-                                    .and_modify(|v| {
-                                        *v += reserve.total_refundable_value;
-                                    })
-                                    .or_insert(reserve.total_refundable_value);
-                            }
-                        }
-                        Err(err) => {
-                            if inner_bundle.can_skip {
-                                continue;
-                            } else {
-                                return Ok(Err(err));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (idx, percent) in refundable_elements {
-            let refund_config =
-                if let Some(config) = bundle.body.get(idx).and_then(|b| b.refund_config()) {
-                    config
-                } else {
-                    return Ok(Err(BundleErr::IncorrectRefundableElement(idx)));
-                };
-
-            let total_value = get_percent(refundable_profit, percent);
-            for RefundConfig { address, percent } in refund_config {
-                let value = get_percent(total_value, percent);
-                inner_payouts
-                    .entry(address)
-                    .and_modify(|v| {
-                        *v += value;
-                    })
-                    .or_insert(value);
-            }
-        }
-
-        // calculate gas limits
-        let mut payouts_promised = HashMap::new();
-        for (to, refundable_value) in inner_payouts.drain() {
-            let payout = match self.estimate_refund_payout_tx(
-                to,
-                refundable_value,
-                insert.cumulative_gas_used,
-            ) {
-                Ok(payout) => payout,
-                Err(err) => return Ok(Err(err)),
-            };
-            payouts_promised.insert(to, payout);
-        }
-
-        let coinbase_diff_before_payouts = self
-            .saturating_coinbase_delta(coinbase_balance_before)
-            .unwrap_or_default();
-        let total_payouts_promissed = payouts_promised
-            .values()
-            .map(|v| v.total_refundable_value)
-            .sum::<U256>();
-
-        Ok(Ok(ShareBundleCommitResult {
-            bundle_ok: insert,
-            coinbase_diff_before_payouts,
-            total_payouts_promissed,
-            payouts_promissed: payouts_promised,
-        }))
     }
 
     fn get_used_state_trace(&mut self) -> Option<UsedStateTrace> {
@@ -1121,60 +960,46 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
     pub fn commit_order(
         &mut self,
         order: &Order,
-        cumulative_gas_used: u64,
-        gas_reserved: u64,
-        cumulative_blob_gas_used: u64,
+        space_state: BlockBuildingSpaceState,
         allow_tx_skip: bool,
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<OrderOk, OrderErr>, CriticalCommitOrderError> {
         self.execute_with_rollback(|s| {
-            s.commit_order_no_rollback(
-                order,
-                cumulative_gas_used,
-                gas_reserved,
-                cumulative_blob_gas_used,
-                allow_tx_skip,
-                combined_refunds,
-            )
+            s.commit_order_no_rollback(order, space_state, allow_tx_skip, combined_refunds)
         })
     }
 
     fn commit_order_no_rollback(
         &mut self,
         order: &Order,
-        cumulative_gas_used: u64,
-        gas_reserved: u64,
-        cumulative_blob_gas_used: u64,
+        space_state: BlockBuildingSpaceState,
         allow_tx_skip: bool,
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<OrderOk, OrderErr>, CriticalCommitOrderError> {
         match order {
             Order::Tx(tx) => {
-                let res = self.commit_tx(
-                    &tx.tx_with_blobs,
-                    cumulative_gas_used,
-                    gas_reserved,
-                    cumulative_blob_gas_used,
-                )?;
+                let res = self.commit_tx(&tx.tx_with_blobs, space_state)?;
                 match res {
                     Ok(ok) => {
-                        let coinbase_profit = if ok.tx_info.coinbase_profit.is_positive() {
+                        let coinbase_profit = if !ok.tx_info.coinbase_profit.is_negative() {
                             ok.tx_info.coinbase_profit.unsigned_abs()
-                        } else {
+                        } else if tx.tx_with_blobs.metadata.is_system {
+                            // This is a system transaction which should not be counted towards the block profit.
                             U256::ZERO
+                        } else {
+                            return Ok(Err(OrderErr::NegativeProfit(
+                                ok.tx_info.coinbase_profit.unsigned_abs(),
+                            )));
                         };
                         Ok(Ok(OrderOk {
                             coinbase_profit,
-                            gas_used: ok.tx_info.gas_used,
-                            cumulative_gas_used: ok.cumulative_gas_used,
-                            blob_gas_used: ok.blob_gas_used,
-                            cumulative_blob_gas_used: ok.cumulative_blob_gas_used,
+                            space_used: ok.space_used(),
+                            cumulative_space_used: ok.cumulative_space_used,
                             tx_infos: vec![ok.tx_info],
                             nonces_updated: vec![ok.nonce_updated],
                             paid_kickbacks: Vec::new(),
                             delayed_kickback: None,
                             used_state_trace: self.get_used_state_trace(),
-                            original_order_ids: Vec::new(),
                         }))
                     }
                     Err(err) => Ok(Err(err.into())),
@@ -1182,25 +1007,8 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
             }
             Order::Bundle(bundle) => {
                 let coinbase_balance_before = self.coinbase_balance()?;
-                let res = self.commit_bundle(
-                    bundle,
-                    cumulative_gas_used,
-                    gas_reserved,
-                    cumulative_blob_gas_used,
-                    allow_tx_skip,
-                    combined_refunds,
-                )?;
-                self.bundle_to_order_result(res, coinbase_balance_before)
-            }
-            Order::ShareBundle(bundle) => {
-                let coinbase_balance_before = self.coinbase_balance()?;
-                let res = self.commit_share_bundle(
-                    bundle,
-                    cumulative_gas_used,
-                    gas_reserved,
-                    cumulative_blob_gas_used,
-                    allow_tx_skip,
-                )?;
+                let res =
+                    self.commit_bundle(bundle, space_state, allow_tx_skip, combined_refunds)?;
                 self.bundle_to_order_result(res, coinbase_balance_before)
             }
         }
@@ -1230,16 +1038,13 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
 
                 Ok(Ok(OrderOk {
                     coinbase_profit,
-                    gas_used: ok.gas_used,
-                    cumulative_gas_used: ok.cumulative_gas_used,
-                    blob_gas_used: ok.blob_gas_used,
-                    cumulative_blob_gas_used: ok.cumulative_blob_gas_used,
+                    space_used: ok.space_used,
+                    cumulative_space_used: ok.cumulative_space_used,
                     tx_infos: ok.tx_infos,
                     nonces_updated: ok.nonces_updated,
                     paid_kickbacks: ok.paid_kickbacks,
                     delayed_kickback: ok.delayed_kickback,
                     used_state_trace: self.get_used_state_trace(),
-                    original_order_ids: ok.original_order_ids,
                 }))
             }
             Err(err) => Ok(Err(err.into())),
@@ -1264,9 +1069,9 @@ impl<'a, 'b, 'c, 'd, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, 'd, 
     }
 }
 
-impl<'a, 'c, 'd> PartialBlockFork<'a, '_, 'c, 'd, ()> {
+impl<'a, 'c, 'd, DB> PartialBlockFork<'a, '_, 'c, 'd, (), NullPartialBlockForkExecutionTracer, DB> {
     pub fn new(
-        state: &'a mut BlockState,
+        state: &'a mut BlockState<DB>,
         ctx: &'c BlockBuildingContext,
         local_ctx: &'d mut ThreadBlockBuildingContext,
     ) -> Self {
@@ -1277,6 +1082,28 @@ impl<'a, 'c, 'd> PartialBlockFork<'a, '_, 'c, 'd, ()> {
             state,
             tracer: None,
             tmp_used_state_tracer: Default::default(),
+            partial_block_fork_execution_tracer: NullPartialBlockForkExecutionTracer {},
+        }
+    }
+}
+
+impl<'a, 'c, 'd, PartialBlockForkExecutionTracerType: PartialBlockForkExecutionTracer, DB>
+    PartialBlockFork<'a, '_, 'c, 'd, (), PartialBlockForkExecutionTracerType, DB>
+{
+    pub fn new_with_execution_tracer(
+        state: &'a mut BlockState<DB>,
+        ctx: &'c BlockBuildingContext,
+        local_ctx: &'d mut ThreadBlockBuildingContext,
+        partial_block_fork_execution_tracer: PartialBlockForkExecutionTracerType,
+    ) -> Self {
+        Self {
+            rollbacks: 0,
+            ctx,
+            local_ctx,
+            state,
+            tracer: None,
+            tmp_used_state_tracer: Default::default(),
+            partial_block_fork_execution_tracer,
         }
     }
 }
@@ -1289,15 +1116,6 @@ fn update_nonce_list(nonces_updated: &mut Vec<(Address, u64)>, new_update: (Addr
         }
     }
     nonces_updated.push(new_update);
-}
-
-fn update_nonce_list_with_updates(
-    nonces_updated: &mut Vec<(Address, u64)>,
-    new_updates: Vec<(Address, u64)>,
-) {
-    for new_update in new_updates {
-        update_nonce_list(nonces_updated, new_update);
-    }
 }
 
 /// This method is used to clearly outline inputs and outputs for the EVM interpreter execution
@@ -1313,7 +1131,7 @@ fn execute_evm<Factory>(
     evm_env: EvmEnv,
     tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
     used_state_tracer: Option<&mut UsedStateTrace>,
-    db: impl Database<Error = ProviderError>,
+    db: impl Database<Error = EvmDatabaseError<ProviderError>>,
     blocklist: &HashSet<Address>,
 ) -> Result<Result<ResultAndState, TransactionErr>, CriticalCommitOrderError>
 where
@@ -1329,9 +1147,10 @@ where
             EVMError::Transaction(tx_err) => {
                 return Ok(Err(TransactionErr::InvalidTransaction(tx_err)))
             }
-            EVMError::Database(_) | EVMError::Header(_) | EVMError::Custom(_) => {
-                return Err(err.into())
-            }
+            EVMError::Database(_)
+            | EVMError::Header(_)
+            | EVMError::Custom(_)
+            | EVMError::CustomAny(_) => return Err(err.into()),
         },
     };
     drop(evm);

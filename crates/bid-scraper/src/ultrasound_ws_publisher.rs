@@ -1,19 +1,17 @@
 use crate::{
-    types::{block_bid_from_update, BlockBid, PublisherType, TopBidUpdate},
+    types::{top_bid_update::parse_message, PublisherType, ScrapedRelayBlockBid},
     ws_publisher::{ConnectionHandler, Service},
 };
-use eyre::{eyre, Context};
+use eyre::Context;
 use futures::stream::{SplitSink, SplitStream};
 use serde::Deserialize;
-use ssz::Decode;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     tungstenite::{http::Request, protocol::Message},
     MaybeTlsStream, WebSocketStream,
 };
-use tracing::debug;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct UltrasoundWsPublisherConfig {
     /// Url to connect to. Example: "ws://relay-builders-eu.ultrasound.money/ws/v1/top_bid"
     pub ultrasound_url: String,
@@ -63,24 +61,13 @@ impl ConnectionHandler for UltrasoundWsConnectionHandler {
         Ok(())
     }
 
-    fn parse(&self, message: Message) -> eyre::Result<Option<BlockBid>> {
-        match message {
-            Message::Binary(data) => {
-                let update = TopBidUpdate::from_ssz_bytes(&data)
-                    .map_err(|_| eyre!("unable to deserialize"))?;
-                debug!("Got message: {:?}", update);
-                let bid = block_bid_from_update(
-                    update,
-                    &self.cfg.relay_name,
-                    &self.name,
-                    PublisherType::UltrasoundWs,
-                );
-                Ok(Some(bid))
-            }
-            _ => {
-                eyre::bail!("Unhandled ultrasound WS message: {:?}", message);
-            }
-        }
+    fn parse(&self, message: Message) -> eyre::Result<Option<ScrapedRelayBlockBid>> {
+        parse_message(
+            message,
+            &self.cfg.relay_name,
+            &self.name,
+            PublisherType::UltrasoundWs,
+        )
     }
 }
 

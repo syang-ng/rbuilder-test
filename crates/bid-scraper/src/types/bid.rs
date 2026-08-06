@@ -19,6 +19,8 @@ pub enum PublisherType {
     BloxrouteWs,
     #[serde(rename = "external_ws")]
     ExternalWs,
+    #[serde(rename = "titan_ws")]
+    TitanWs,
 }
 
 impl PublisherType {
@@ -31,6 +33,7 @@ impl PublisherType {
             PublisherType::UltrasoundWs => true,
             PublisherType::BloxrouteWs => false,
             PublisherType::ExternalWs => true,
+            PublisherType::TitanWs => true,
         }
     }
 }
@@ -42,7 +45,7 @@ impl PublisherType {
 /// `Hash` - we voluntarily omit `seen_time` (metadata that we add) and `relay_time` (not hashable and we don't care about it)
 #[derive(Debug, Clone, Derivative, Serialize, Deserialize)]
 #[derivative(Hash, PartialEq, Eq)]
-pub struct BlockBid {
+pub struct ScrapedRelayBlockBid {
     // time when the bids-publisher saw & sent it.
     #[derivative(PartialEq = "ignore")]
     #[derivative(Hash = "ignore")]
@@ -93,9 +96,9 @@ mod tests {
         }
     }
     // TODO: derive `Arbitrary` instead
-    impl Arbitrary for BlockBid {
+    impl Arbitrary for ScrapedRelayBlockBid {
         type Parameters = ();
-        type Strategy = proptest::strategy::BoxedStrategy<BlockBid>;
+        type Strategy = proptest::strategy::BoxedStrategy<ScrapedRelayBlockBid>;
         fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
             any::<(
                 (
@@ -138,7 +141,7 @@ mod tests {
                     gas_used,
                     optimistic_submission,
                 )| {
-                    BlockBid {
+                    ScrapedRelayBlockBid {
                         seen_time,
                         publisher_name,
                         publisher_type,
@@ -164,7 +167,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn bid_equality((bid, other_bid, other_seen_time) in any::<(BlockBid, BlockBid, f64)>()) {
+        fn bid_equality((bid, other_bid, other_seen_time) in any::<(ScrapedRelayBlockBid, ScrapedRelayBlockBid, f64)>()) {
             let mut equivalent_bid = bid.clone();
             equivalent_bid.seen_time = other_seen_time;
             prop_assert_eq!(&bid, &equivalent_bid);
@@ -173,7 +176,7 @@ mod tests {
         }
 
         #[test]
-        fn bid_hashing((bid, other_bid, other_seen_time, other_relay_time) in any::<(BlockBid, BlockBid, f64, Option<f64>)>()) {
+        fn bid_hashing((bid, other_bid, other_seen_time, other_relay_time) in any::<(ScrapedRelayBlockBid, ScrapedRelayBlockBid, f64, Option<f64>)>()) {
             let mut equivalent_bid = bid.clone();
             equivalent_bid.seen_time = other_seen_time;
             equivalent_bid.relay_time = other_relay_time;

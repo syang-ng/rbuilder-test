@@ -1,12 +1,21 @@
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use crate::{
-    building::sim::{SimTree, SimulatedResult, SimulationRequest},
-    live_builder::order_input::order_sink::OrderPoolCommand,
-    primitives::{Order, OrderId, OrderReplacementKey},
+    building::sim::{CancellableSimulationRequest, SimTree, SimulatedResult},
+    live_builder::{
+        order_input::order_sink::OrderPoolCommand,
+        simulation::simulation_job_tracer::SimulationJobTracer,
+    },
 };
-use ahash::HashSet;
+use ahash::{HashMap, HashSet};
 use alloy_primitives::utils::format_ether;
+use rbuilder_primitives::{BundleReplacementKey, Order, OrderId};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
@@ -29,7 +38,7 @@ pub struct SimulationJob {
     /// Input orders to be simulated
     new_order_sub: mpsc::UnboundedReceiver<OrderPoolCommand>,
     /// Here we send requests to the simulator pool
-    sim_req_sender: flume::Sender<SimulationRequest>,
+    sim_req_sender: flume::Sender<CancellableSimulationRequest>,
     /// Here we receive the results we asked to sim_req_sender
     sim_results_receiver: mpsc::Receiver<SimulatedResult>,
     /// Output of the simulations
@@ -39,15 +48,16 @@ pub struct SimulationJob {
     orders_received: OrderCounter,
     orders_simulated_ok: OrderCounter,
 
-    unique_replacement_key_bundles: HashSet<OrderReplacementKey>,
+    unique_replacement_key_bundles: HashSet<BundleReplacementKey>,
     orders_with_replacement_key: usize,
 
-    unique_replacement_key_bundles_sim_ok: HashSet<OrderReplacementKey>,
+    unique_replacement_key_bundles_sim_ok: HashSet<BundleReplacementKey>,
     orders_with_replacement_key_sim_ok: usize,
 
     /// Orders we got via new_order_sub and are still being processed (they could be inside the SimTree or in the sim queue)
     /// and were not cancelled.
-    in_flight_orders: HashSet<OrderId>,
+    /// When we remove the order we set the associated bool to false (which is checked before simulating)
+    in_flight_orders: HashMap<OrderId, Arc<AtomicBool>>,
 
     /// Orders for which we sent downstream SimulatedOrderCommand::Simulation but not SimulatedOrderCommand::Cancellation.
     /// We store them to avoid generating SimulatedOrderCommand::Cancellation for failed orders since they never generated
@@ -59,16 +69,20 @@ pub struct SimulationJob {
     /// Got first sim result -> add to not_cancelled_simulated_orders.
     /// Got second sim result -> We DON'T send since we see on not_cancelled_simulated_orders that we already did it!
     not_cancelled_sent_simulated_orders: HashSet<OrderId>,
+
+    /// Every send is traced here.
+    sim_tracer: Arc<dyn SimulationJobTracer>,
 }
 
 impl SimulationJob {
     pub fn new(
         block_cancellation: CancellationToken,
         new_order_sub: mpsc::UnboundedReceiver<OrderPoolCommand>,
-        sim_req_sender: flume::Sender<SimulationRequest>,
+        sim_req_sender: flume::Sender<CancellableSimulationRequest>,
         sim_results_receiver: mpsc::Receiver<SimulatedResult>,
         slot_sim_results_sender: mpsc::Sender<SimulatedOrderCommand>,
         sim_tree: SimTree,
+        sim_tracer: Arc<dyn SimulationJobTracer>,
     ) -> Self {
         Self {
             block_cancellation,
@@ -85,6 +99,7 @@ impl SimulationJob {
             unique_replacement_key_bundles_sim_ok: Default::default(),
             in_flight_orders: Default::default(),
             not_cancelled_sent_simulated_orders: Default::default(),
+            sim_tracer,
         }
     }
 
@@ -136,40 +151,41 @@ impl SimulationJob {
         }
     }
 
-    /// Cancelled orders will return false
-    fn order_still_valid(&self, order_id: &OrderId) -> bool {
-        self.in_flight_orders.contains(order_id)
-    }
-
     /// Pops tasks from SimTree and sends them for simulation
     fn send_new_tasks_for_simulation(&mut self) {
         // submit sim tasks loop
         loop {
-            let mut new_sim_request = self.sim_tree.pop_simulation_tasks(1024);
+            let new_sim_request = self.sim_tree.pop_simulation_tasks(1024);
             if new_sim_request.is_empty() {
                 break;
             }
-            // filter out cancelled orders
-            new_sim_request.retain(|s| self.order_still_valid(&s.order.id()));
 
             for sim_request in new_sim_request {
                 let order_id = sim_request.order.id();
-                let delivered = match self.sim_req_sender.try_send(sim_request) {
-                    Ok(()) => true,
-                    Err(flume::TrySendError::Full(_)) => {
-                        warn!("Sim channel is full, dropping order");
-                        false
-                        // @Metric
+                if let Some(cancel_handle) = self.in_flight_orders.get(&order_id) {
+                    let delivered =
+                        match self
+                            .sim_req_sender
+                            .try_send(CancellableSimulationRequest::new(
+                                sim_request,
+                                cancel_handle.clone(),
+                            )) {
+                            Ok(()) => true,
+                            Err(flume::TrySendError::Full(_)) => {
+                                warn!("Sim channel is full, dropping order");
+                                false
+                                // @Metric
+                            }
+                            Err(flume::TrySendError::Disconnected(_)) => {
+                                error!("Sim channel is closed, dropping order");
+                                false
+                                // @Metric
+                            }
+                        };
+                    if !delivered {
+                        // Small bug, if a cancel arrives we are going to propagate it.
+                        self.in_flight_orders.remove(&order_id);
                     }
-                    Err(flume::TrySendError::Disconnected(_)) => {
-                        error!("Sim channel is closed, dropping order");
-                        false
-                        // @Metric
-                    }
-                };
-                if !delivered {
-                    // Small bug, if a cancel arrives we are going to propagate it.
-                    self.in_flight_orders.remove(&order_id);
                 }
             }
         }
@@ -198,21 +214,26 @@ impl SimulationJob {
             if self
                 .in_flight_orders
                 .remove(&sim_result.simulated_order.id())
+                .is_some()
             {
                 valid_simulated_orders.push(sim_result.clone());
                 // Only send if it's the first time.
                 if self
                     .not_cancelled_sent_simulated_orders
                     .insert(sim_result.simulated_order.id())
-                    && self
+                {
+                    if self
                         .slot_sim_results_sender
-                        .send(SimulatedOrderCommand::Simulation(Arc::new(
+                        .send(SimulatedOrderCommand::Simulation(
                             sim_result.simulated_order.clone(),
-                        )))
+                        ))
                         .await
                         .is_err()
-                {
-                    return false; //receiver closed :(
+                    {
+                        return false; //receiver closed :(
+                    } else {
+                        self.sim_tracer.update_simulation_sent(sim_result);
+                    }
                 }
             }
         }
@@ -232,10 +253,15 @@ impl SimulationJob {
     async fn send_cancel(&mut self, id: &OrderId) -> bool {
         // Only send cancel if we sent this id.
         if self.not_cancelled_sent_simulated_orders.remove(id) {
-            self.slot_sim_results_sender
+            let sent = self
+                .slot_sim_results_sender
                 .send(SimulatedOrderCommand::Cancellation(*id))
                 .await
-                .is_ok()
+                .is_ok();
+            if sent {
+                self.sim_tracer.update_cancellation_sent(id);
+            }
+            sent
         } else {
             true
         }
@@ -243,15 +269,17 @@ impl SimulationJob {
 
     /// return if everything went OK
     async fn process_order_cancellation(&mut self, cancellation_id: &OrderId) -> bool {
-        if !self.in_flight_orders.remove(cancellation_id) {
-            // if we removed from in_flight_orders it was never sent so there is no need to cancel
+        if let Some(cancel_handle) = self.in_flight_orders.remove(cancellation_id) {
+            cancel_handle.store(true, Ordering::Relaxed);
+        } else {
+            // Order was not in in_flight_orders (already simulated/sent), so forward the cancellation downstream.
             return self.send_cancel(cancellation_id).await;
         }
         true
     }
 
     /// feeding the sim tree.
-    fn process_new_order(&mut self, order: Order) -> bool {
+    fn process_new_order(&mut self, order: Arc<Order>) -> bool {
         self.orders_received.accumulate(&order);
         if let Some(repl_key) = order.replacement_key() {
             self.unique_replacement_key_bundles.insert(repl_key);
@@ -263,7 +291,8 @@ impl SimulationJob {
             // @Metric
             return false;
         }
-        self.in_flight_orders.insert(order_id);
+        self.in_flight_orders
+            .insert(order_id, Arc::new(AtomicBool::new(false)));
         true
     }
 
@@ -272,7 +301,7 @@ impl SimulationJob {
             match new_commnad {
                 OrderPoolCommand::Insert(order) => {
                     // This is not unrecoverable error, so if it fails, we ignore it and try processing next order
-                    let _success = self.process_new_order(order.clone());
+                    let _success = self.process_new_order(Arc::clone(order));
                 }
                 OrderPoolCommand::Remove(order_id) => {
                     // Returns false if channel is closed,
@@ -292,18 +321,16 @@ impl SimulationJob {
 struct OrderCounter {
     mempool_txs: usize,
     bundles: usize,
-    share_bundles: usize,
 }
 
 impl fmt::Debug for OrderCounter {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "OrderCounter {{ total: {}, mempool_txs: {}, bundles {}, share_bundles {} }}",
+            "OrderCounter {{ total: {}, mempool_txs: {}, bundles {} }}",
             self.total(),
             self.mempool_txs,
             self.bundles,
-            self.share_bundles
         )
     }
 }
@@ -313,10 +340,9 @@ impl OrderCounter {
         match order {
             Order::Tx(_) => self.mempool_txs += 1,
             Order::Bundle(_) => self.bundles += 1,
-            Order::ShareBundle(_) => self.share_bundles += 1,
         }
     }
     fn total(&self) -> usize {
-        self.mempool_txs + self.bundles + self.share_bundles
+        self.mempool_txs + self.bundles
     }
 }

@@ -1,15 +1,42 @@
-use crate::roothash::RootHashError;
+use std::sync::{mpsc, Arc};
+
 use crate::{
     building::ThreadBlockBuildingContext, live_builder::simulation::SimulatedOrderCommand,
+    roothash::RootHashError,
 };
 use alloy_consensus::Header;
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{BlockHash, BlockNumber, B256};
-use reth::providers::ExecutionOutcome;
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, B256};
+use eth_sparse_mpt::utils::{HashMap, HashSet};
 use reth_errors::ProviderResult;
 use reth_provider::StateProviderBox;
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
+use revm::database::BundleState;
+
+/// Opens a [`StateProviderBox`] for a fixed parent block from a shared [`StateProviderFactory`].
+///
+/// This is the unit shared across building threads instead of a single already-opened provider:
+/// the factory handle and the block id are `Send + Sync`, so the source is too, and each consumer
+/// opens its own `Send`-only provider on demand. Pairing the factory with the parent block also
+/// removes the class of bugs where a provider is opened for the wrong block.
+#[derive(Clone)]
+pub struct StateProviderSource {
+    factory: Arc<dyn StateProviderFactory>,
+    parent_hash: BlockHash,
+}
+
+impl StateProviderSource {
+    pub fn new(factory: Arc<dyn StateProviderFactory>, parent_hash: BlockHash) -> Self {
+        Self {
+            factory,
+            parent_hash,
+        }
+    }
+
+    /// Opens a fresh state provider for the configured parent block.
+    pub fn state_provider(&self) -> ProviderResult<StateProviderBox> {
+        self.factory.history_by_block_hash(self.parent_hash)
+    }
+}
 
 pub mod ipc_state_provider;
 pub mod reth_prov;
@@ -45,16 +72,24 @@ pub trait StateProviderFactory: Send + Sync {
 pub trait RootHasher: std::fmt::Debug + Send + Sync {
     /// Must be called once before using.
     /// This is too specific and prone to error (you may forget to call it), maybe it's a better idea to pass this to StateProviderFactory::root_hasher and let each RootHasher decide what to do?
-    fn run_prefetcher(
-        &self,
-        simulated_orders: broadcast::Receiver<SimulatedOrderCommand>,
-        cancel: CancellationToken,
-    );
+    fn run_prefetcher(&self, simulated_orders: mpsc::Receiver<SimulatedOrderCommand>);
 
     /// State root for changes outcome on top of parent block.
+    /// Incermental change is a list of accounts that are changed for the block since the last call to state_root
     fn state_root(
         &self,
-        outcome: &ExecutionOutcome,
+        outcome: &BundleState,
+        incremental_change: &[Address],
         local_ctx: &mut ThreadBlockBuildingContext,
     ) -> Result<B256, RootHashError>;
+
+    /// Generate the account proof for the target address.
+    /// NOTE: Proof targets are required to be loaded in the bundle state of [`ExecutionOutcome`].
+    /// If the accounts are missing from the bundle state, the method will return "KeyNotFound" error.
+    fn account_proofs(
+        &self,
+        outcome: &BundleState,
+        addresses: &HashSet<Address>,
+        local_ctx: &mut ThreadBlockBuildingContext,
+    ) -> Result<HashMap<Address, Vec<Bytes>>, RootHashError>;
 }

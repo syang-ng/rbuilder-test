@@ -3,7 +3,7 @@ use crate::utils::{
     encode_len_extension, encode_len_leaf, encode_null_node, rlp_pointer,
 };
 use alloy_primitives::Bytes;
-use reth_trie::Nibbles;
+use nybbles::Nibbles;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -174,7 +174,7 @@ impl DiffLeafNode {
             let fixed_key = self
                 .fixed
                 .as_ref()
-                .map(|k| k.key.clone())
+                .map(|k| k.key)
                 .expect("leaf incorrect form");
             self.changed_key = Some(fixed_key);
         }
@@ -331,7 +331,7 @@ impl DiffExtensionNode {
             let fixed_key = self
                 .fixed
                 .as_ref()
-                .map(|k| k.key.clone())
+                .map(|k| k.key)
                 .expect("ext incorrect form");
             self.changed_key = Some(fixed_key);
         }

@@ -8,19 +8,20 @@ pub mod relay_epoch_cache;
 use crate::{
     beacon_api_client::Client,
     live_builder::{
+        block_output::bidding_service_interface::SlotBlockId,
         payload_events::{
             payload_source::PayloadSourceMuxer,
             relay_epoch_cache::{RelaysForSlotData, SlotData},
         },
-        SlotSource,
     },
-    primitives::mev_boost::{MevBoostRelayID, MevBoostRelaySlotInfoProvider},
+    mev_boost::{MevBoostRelaySlotInfoProvider, RelaySlotData},
     utils::{format_offset_datetime_rfc3339, timestamp_ms_to_offset_datetime},
 };
+use ahash::HashMap;
 use alloy_eips::{merge::SLOT_DURATION, BlockNumHash};
 use alloy_primitives::{utils::format_ether, Address, B256, U256};
 use alloy_rpc_types_beacon::events::PayloadAttributesEvent;
-use derivative::Derivative;
+use rbuilder_primitives::mev_boost::MevBoostRelayID;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -40,16 +41,14 @@ pub type InternalPayloadId = u64;
 
 /// Data about a slot received from relays.
 /// Contains the important information needed to build and submit the block.
-#[derive(Derivative)]
-#[derivative(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MevBoostSlotData {
     /// The .data.payload_attributes.suggested_fee_recipient is replaced
     pub payload_attributes_event: PayloadAttributesEvent,
     pub suggested_gas_limit: u64,
-    /// List of relays agreeing to the slot_data. It may not contain all the relays (eg: errors, forks, validators registering only to some relays)
-    pub relays: Vec<MevBoostRelayID>,
+    /// Map of relays to the registrations with matching slot data. It may not contain all the relays (eg: errors, forks, validators registering only to some relays)
+    pub relay_registrations: Arc<HashMap<MevBoostRelayID, RelaySlotData>>,
     pub slot_data: SlotData,
-    #[derivative(PartialEq = "ignore", Hash = "ignore")]
     pub payload_id: InternalPayloadId,
 }
 
@@ -80,6 +79,10 @@ impl MevBoostSlotData {
         self.payload_attributes_event.data.proposal_slot
     }
 
+    pub fn slot_block_id(&self) -> SlotBlockId {
+        SlotBlockId::new(self.slot(), self.block(), self.parent_block_hash())
+    }
+
     pub fn fee_recipient(&self) -> Address {
         self.payload_attributes_event
             .data
@@ -94,9 +97,12 @@ impl MevBoostSlotData {
 /// - Call MevBoostSlotDataGenerator::spawn.
 /// - Poll new slots via the returned UnboundedReceiver on spawn.
 /// - If join with spawned task is needed await on the JoinHandle returned by spawn.
+#[derive(Debug)]
 pub struct MevBoostSlotDataGenerator {
     cls: Vec<Client>,
     relays: Vec<MevBoostRelaySlotInfoProvider>,
+    update_interval: Duration,
+    adjustment_fee_payers: HashMap<MevBoostRelayID, Address>,
     blocklist_provider: Arc<dyn BlockListProvider>,
     global_cancellation: CancellationToken,
 }
@@ -105,12 +111,16 @@ impl MevBoostSlotDataGenerator {
     pub fn new(
         cls: Vec<Client>,
         relays: Vec<MevBoostRelaySlotInfoProvider>,
+        update_interval: Duration,
+        adjustment_fee_payers: HashMap<MevBoostRelayID, Address>,
         blocklist_provider: Arc<dyn BlockListProvider>,
         global_cancellation: CancellationToken,
     ) -> Self {
         Self {
             cls,
             relays,
+            update_interval,
+            adjustment_fee_payers,
             blocklist_provider,
             global_cancellation,
         }
@@ -125,7 +135,12 @@ impl MevBoostSlotDataGenerator {
     ///     it, but even with the event being created for every slot, the fee_recipient we get from MEV-Boost might be different so we should always replace it.
     ///     Note that with MEV-boost the validator may change the fee_recipient when registering to the Relays.
     pub fn spawn(self) -> (JoinHandle<()>, mpsc::UnboundedReceiver<MevBoostSlotData>) {
-        let relays = RelaysForSlotData::new(&self.relays);
+        let relays = RelaysForSlotData::spawn_with_interval(
+            self.relays.clone(),
+            self.update_interval,
+            self.adjustment_fee_payers.clone(),
+            self.global_cancellation.clone(),
+        );
 
         // we generate first payload id randomly so logs don't have the same payload id after restarts
         // u32 is used because it will fit into json log as integer and its enough to be unique over long interval
@@ -166,7 +181,7 @@ impl MevBoostSlotDataGenerator {
                     "Payload attributes received from CL client"
                 );
 
-                let (slot_data, relays) = if let Some(res) = relays.slot_data(slot).await {
+                let (slot_data, relay_registrations) = if let Some(res) = relays.slot_data(slot) {
                     res
                 } else {
                     info!(
@@ -180,7 +195,7 @@ impl MevBoostSlotDataGenerator {
                 info!(
                     payload_id,
                     ?slot_data,
-                    ?relays,
+                    ?relay_registrations,
                     "Slot data from relays received"
                 );
 
@@ -194,7 +209,7 @@ impl MevBoostSlotDataGenerator {
                 let mev_boost_slot_data = MevBoostSlotData {
                     payload_attributes_event: correct_event,
                     suggested_gas_limit: slot_data.gas_limit,
-                    relays,
+                    relay_registrations,
                     slot_data,
                     payload_id,
                 };
@@ -222,7 +237,7 @@ impl MevBoostSlotDataGenerator {
                     }
                 }
 
-                if recently_sent_data.contains(&mev_boost_slot_data) {
+                if recently_sent_data.contains(&mev_boost_slot_data.payload_attributes_event) {
                     info!(
                         payload_id,
                         reason = "the same payload was already sent",
@@ -233,7 +248,7 @@ impl MevBoostSlotDataGenerator {
                 if recently_sent_data.len() > RECENTLY_SENT_EVENTS_BUFF {
                     recently_sent_data.pop_front();
                 }
-                recently_sent_data.push_back(mev_boost_slot_data.clone());
+                recently_sent_data.push_back(mev_boost_slot_data.payload_attributes_event.clone());
 
                 report_slot_withdrawals_to_fee_recipients(&mev_boost_slot_data);
 
@@ -253,8 +268,8 @@ impl MevBoostSlotDataGenerator {
     }
 }
 
-impl SlotSource for MevBoostSlotDataGenerator {
-    fn recv_slot_channel(self) -> mpsc::UnboundedReceiver<MevBoostSlotData> {
+impl MevBoostSlotDataGenerator {
+    pub fn recv_slot_channel(self) -> mpsc::UnboundedReceiver<MevBoostSlotData> {
         let (_handle, chan) = self.spawn();
         chan
     }

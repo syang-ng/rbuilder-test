@@ -2,17 +2,15 @@
 
 use std::time::{Duration, Instant};
 
-use crate::primitives::{
-    serialize::{RawTx, TxEncoding},
-    TransactionSignedEcRecoveredWithBlobs,
-};
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Sign, I256, U256};
 use alloy_provider::RootProvider;
-use reth_chainspec::ChainSpec;
-use reth_evm_ethereum::revm_spec_by_timestamp_and_block_number;
-use revm::context::CfgEnv;
+use rbuilder_primitives::{
+    serialize::{RawTx, TxEncoding},
+    TransactionSignedEcRecoveredWithBlobs,
+};
+use reth::tasks::{Runtime, RuntimeBuilder, RuntimeConfig, TokioConfig};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub mod bls;
@@ -20,6 +18,7 @@ pub mod build_info;
 pub mod constants;
 
 mod noncer;
+pub mod sync;
 pub use noncer::NonceCache;
 
 pub mod error_storage;
@@ -31,17 +30,41 @@ pub use provider_factory_reopen::{
     ProviderFactoryReopener, RootHasherImpl,
 };
 
-pub mod reconnect;
+/// Process-wide reth task [`Runtime`] shared by every rbuilder component that needs one
+/// (`ProviderFactory`, `ParallelStateRoot`). Built once on first use and cached: the reth
+/// `Runtime` owns several rayon thread pools, so rebuilding it per call would spawn and tear
+/// down those pools every time. The returned handle is `Arc`-backed, so cloning is cheap.
+///
+/// Attaches to the ambient tokio runtime when first called from within one, otherwise builds a
+/// standalone runtime.
+pub(crate) fn reth_task_runtime() -> Runtime {
+    static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let config = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    RuntimeConfig::default().with_tokio(TokioConfig::ExistingHandle(handle))
+                }
+                Err(_) => RuntimeConfig::default(),
+            };
+            // Invariant: building the process-wide task runtime is a startup operation. If it
+            // fails the builder cannot compute state roots or open the provider factory, so there
+            // is no meaningful way to continue.
+            RuntimeBuilder::new(config)
+                .build()
+                .expect("failed to build the process-wide reth task runtime")
+        })
+        .clone()
+}
 
-mod test_data_generator;
-pub use test_data_generator::TestDataGenerator;
+pub mod reconnect;
 
 mod tx_signer;
 pub use tx_signer::Signer;
 
+pub mod mevblocker;
 pub mod provider_head_state;
 pub mod receipts;
-pub mod tracing;
 
 #[cfg(test)]
 pub mod test_utils;
@@ -68,6 +91,31 @@ pub mod u256decimal_serde_helper {
         let s = String::deserialize(deserializer)?;
         //from_str is robust, can take decimal or other prefixed (eg:"0x" hexa) formats.
         U256::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// de/serializes U256 as decimal value (U256 serde default is hexa). Needed to interact with some JSONs (eg:ProposerPayloadDelivered in relay provider API)
+pub mod i256decimal_serde_helper {
+    use std::str::FromStr;
+
+    use alloy_primitives::I256;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &I256, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        //fmt::Display for I256 uses decimal
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<I256, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        //from_str is robust, can take decimal or other prefixed (eg:"0x" hexa) formats.
+        I256::from_str(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -115,13 +163,6 @@ pub fn timestamp_now_ms() -> u64 {
 
 pub fn gen_uid() -> u64 {
     rand::random()
-}
-
-pub fn default_cfg_env(chain_spec: &ChainSpec, block_timestamp: u64, block_number: u64) -> CfgEnv {
-    let spec = revm_spec_by_timestamp_and_block_number(chain_spec, block_timestamp, block_number);
-    CfgEnv::new()
-        .with_chain_id(chain_spec.chain().id())
-        .with_spec(spec)
 }
 
 pub fn unix_timestamp_now() -> u64 {

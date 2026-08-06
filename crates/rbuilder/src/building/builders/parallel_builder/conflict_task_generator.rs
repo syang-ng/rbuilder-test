@@ -1,10 +1,9 @@
-use crate::primitives::SimulatedOrder;
 use ahash::{HashMap, HashSet};
 use alloy_primitives::{utils::format_ether, U256};
 use crossbeam_queue::SegQueue;
 use itertools::Itertools;
-use revm::bytecode::eof::printer::print;
-use std::{sync::Arc, time::Instant};
+use rbuilder_primitives::SimulatedOrder;
+use std::{cmp::Reverse, sync::Arc, time::Instant};
 use tracing::trace;
 
 use super::{
@@ -55,7 +54,7 @@ impl ConflictTaskGenerator {
     /// * `new_groups` - A vector of new [ConflictGroup]s to process.
     pub fn process_groups(&mut self, new_groups: Vec<ConflictGroup>) {
         let mut sorted_groups = new_groups;
-        sorted_groups.sort_by(|a, b| b.orders.len().cmp(&a.orders.len()));
+        sorted_groups.sort_by_key(|b| Reverse(b.orders.len()));
 
         let mut processed_groups = HashSet::default();
         for new_group in sorted_groups {
@@ -651,16 +650,16 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::{
-        MempoolTx, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
-    };
     use alloy_consensus::TxLegacy;
     use alloy_primitives::{Address, TxHash, B256, U256};
-    use reth::primitives::{Transaction, TransactionSigned};
-    use reth_primitives::Recovered;
+    use rbuilder_primitives::{
+        evm_inspector::{SlotKey, UsedStateTrace},
+        MempoolTx, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
+    };
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
+    use reth_primitives_traits::Recovered;
     use std::sync::Arc;
 
-    use crate::building::evm_inspector::{SlotKey, UsedStateTrace};
     use std::sync::mpsc;
 
     struct DataGenerator {
@@ -719,16 +718,16 @@ mod tests {
 
             let sim_value = SimValue::new_test_no_gas(coinbase_profit, U256::ZERO);
 
-            Arc::new(SimulatedOrder {
-                order: Order::Tx(MempoolTx {
+            Arc::new(SimulatedOrder::new(
+                Arc::new(Order::Tx(MempoolTx {
                     tx_with_blobs: TransactionSignedEcRecoveredWithBlobs::new_no_blobs(
                         self.create_tx(),
                     )
                     .unwrap(),
-                }),
-                used_state_trace: Some(trace),
+                })),
                 sim_value,
-            })
+                Some(trace),
+            ))
         }
     }
 

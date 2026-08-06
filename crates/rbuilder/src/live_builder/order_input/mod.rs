@@ -1,5 +1,6 @@
 //! order_input handles receiving new orders from the ipc mempool subscription and json rpc server
 //!
+pub mod blob_type_order_filter;
 pub mod mempool_txs_detector;
 pub mod order_replacement_manager;
 pub mod order_sink;
@@ -12,27 +13,37 @@ use self::{
     orderpool::{OrderPool, OrderPoolSubscriptionId},
     replaceable_order_sink::ReplaceableOrderSink,
 };
-use crate::primitives::{serialize::CancelShareBundle, BundleReplacementData, Order};
-use crate::provider::StateProviderFactory;
-use crate::telemetry::{set_current_block, set_ordepool_count};
+use crate::{
+    live_builder::base_config::DEFAULT_TIME_TO_KEEP_MEMPOOL_TXS_SECS,
+    provider::StateProviderFactory,
+    telemetry::{set_current_block, set_ordepool_stats},
+};
 use alloy_consensus::Header;
+use alloy_primitives::Address;
+use futures::{stream::FuturesUnordered, StreamExt};
 use jsonrpsee::RpcModule;
 use parking_lot::Mutex;
-use std::{net::Ipv4Addr, path::PathBuf, sync::Arc, time::Duration};
-use std::{path::Path, time::Instant};
+use rbuilder_primitives::{BundleReplacementData, Order};
+use std::{
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    sync::{Arc, Weak},
+    time::{Duration, Instant},
+};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use super::base_config::BaseConfig;
 
-/// Thread safe access to OrderPool to get orderflow
+/// Thread safe access to [`OrderPool`] to get orderflow.
 #[derive(Debug)]
 pub struct OrderPoolSubscriber {
     orderpool: Arc<Mutex<OrderPool>>,
 }
 
 impl OrderPoolSubscriber {
+    /// Subscribe to events from the [`OrderPool`] by adding a sink.
     pub fn add_sink(
         &self,
         block_number: u64,
@@ -41,6 +52,7 @@ impl OrderPoolSubscriber {
         self.orderpool.lock().add_sink(block_number, sink)
     }
 
+    /// Unsubscribe from the [`OrderPool`] by removing a sink.
     pub fn remove_sink(
         &self,
         id: &OrderPoolSubscriptionId,
@@ -48,40 +60,47 @@ impl OrderPoolSubscriber {
         self.orderpool.lock().remove_sink(id)
     }
 
-    /// Returned AutoRemovingOrderPoolSubscriptionId will call remove when dropped
+    /// Subscribe to events from the [`OrderPool`] by adding a sink. The sink
+    /// is automatically removed when the returned id is dropped.
     pub fn add_sink_auto_remove(
         &self,
         block_number: u64,
         sink: Box<dyn ReplaceableOrderSink>,
     ) -> AutoRemovingOrderPoolSubscriptionId {
         AutoRemovingOrderPoolSubscriptionId {
-            orderpool: self.orderpool.clone(),
+            orderpool: Arc::downgrade(&self.orderpool),
             id: self.add_sink(block_number, sink),
         }
     }
 }
 
-/// OrderPoolSubscriptionId that removes on drop.
-/// Call add_sink to get flow and remove_sink to stop it
-/// For easy auto remove we have add_sink_auto_remove
+/// [`OrderPoolSubscriptionId`] that unsubscribes itself on drop. Create this
+/// struct with [`OrderPoolSubscriber::add_sink_auto_remove`].
 pub struct AutoRemovingOrderPoolSubscriptionId {
-    orderpool: Arc<Mutex<OrderPool>>,
+    /// Using [`Weak`] prevents subscriptions from keeping the [`OrderPool`]
+    /// alive. If the [`OrderPool`] has already been dropped, the sink
+    /// no longer needs to be removed at all.
+    orderpool: Weak<Mutex<OrderPool>>,
     id: OrderPoolSubscriptionId,
 }
 
 impl Drop for AutoRemovingOrderPoolSubscriptionId {
     fn drop(&mut self) {
-        self.orderpool.lock().remove_sink(&self.id);
+        if let Some(orderpool) = self.orderpool.upgrade() {
+            orderpool.lock().remove_sink(&self.id);
+        }
     }
 }
 
+/// Source of mempool transactions stream information.
 #[derive(Debug, Clone)]
 pub enum MempoolSource {
     Ipc(PathBuf),
     Ws(String),
 }
 
-/// All the info needed to start all the order related jobs (mempool, rcp, clean)
+/// All the info needed to start all the order related jobs (mempool, rcp,
+/// clean).
 #[derive(Debug, Clone)]
 pub struct OrderInputConfig {
     /// if true - cancellations are disabled.
@@ -101,10 +120,16 @@ pub struct OrderInputConfig {
     results_channel_timeout: Duration,
     /// Size of the bounded channel.
     pub input_channel_buffer_size: usize,
+    /// See [OrderPool::time_to_keep_mempool_txs]
+    time_to_keep_mempool_txs: Duration,
+    /// The address of coinbase signer for identifying system transactions.
+    builder_address: Address,
+    /// The allowlisted recipients for system transactions.
+    system_recipient_allowlist: Vec<Address>,
 }
+
 pub const DEFAULT_SERVE_MAX_CONNECTIONS: u32 = 4096;
-pub const DEFAULT_RESULTS_CHANNEL_TIMEOUT: Duration = Duration::from_millis(50);
-pub const DEFAULT_INPUT_CHANNEL_BUFFER_SIZE: usize = 10_000;
+
 impl OrderInputConfig {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -116,6 +141,9 @@ impl OrderInputConfig {
         serve_max_connections: u32,
         results_channel_timeout: Duration,
         input_channel_buffer_size: usize,
+        time_to_keep_mempool_txs: Duration,
+        builder_address: Address,
+        system_recipient_allowlist: Vec<Address>,
     ) -> Self {
         Self {
             ignore_cancellable_orders,
@@ -126,10 +154,17 @@ impl OrderInputConfig {
             serve_max_connections,
             results_channel_timeout,
             input_channel_buffer_size,
+            time_to_keep_mempool_txs,
+            builder_address,
+            system_recipient_allowlist,
         }
     }
 
     pub fn from_config(config: &BaseConfig) -> eyre::Result<Self> {
+        let serve_max_connections = config
+            .jsonrpc_server_max_connections
+            .unwrap_or(DEFAULT_SERVE_MAX_CONNECTIONS);
+
         let mempool = if let Some(provider) = &config.ipc_provider {
             Some(MempoolSource::Ws(provider.mempool_server_url.clone()))
         } else if let Some(path) = &config.el_node_ipc_path {
@@ -145,9 +180,12 @@ impl OrderInputConfig {
             mempool_source: mempool,
             server_port: config.jsonrpc_server_port,
             server_ip: config.jsonrpc_server_ip,
-            serve_max_connections: 4096,
+            serve_max_connections,
             results_channel_timeout: Duration::from_millis(50),
             input_channel_buffer_size: 10_000,
+            time_to_keep_mempool_txs: Duration::from_secs(config.time_to_keep_mempool_txs_secs),
+            builder_address: config.coinbase_signer().unwrap().address,
+            system_recipient_allowlist: config.system_recipient_allowlist.clone(),
         })
     }
 
@@ -158,9 +196,12 @@ impl OrderInputConfig {
             ignore_cancellable_orders: false,
             ignore_blobs: false,
             input_channel_buffer_size: 10,
-            serve_max_connections: 4096,
+            serve_max_connections: DEFAULT_SERVE_MAX_CONNECTIONS,
             server_ip: Ipv4Addr::new(127, 0, 0, 1),
             server_port: 0,
+            time_to_keep_mempool_txs: Duration::from_secs(DEFAULT_TIME_TO_KEEP_MEMPOOL_TXS_SECS),
+            builder_address: Address::ZERO,
+            system_recipient_allowlist: Vec::new(),
         }
     }
 }
@@ -168,11 +209,10 @@ impl OrderInputConfig {
 /// Commands we can get from RPC or mempool fetcher.
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
+#[allow(clippy::large_enum_variant)]
 pub enum ReplaceableOrderPoolCommand {
     /// New or update order
-    Order(Order),
-    /// Cancellation for sbundle
-    CancelShareBundle(CancelShareBundle),
+    Order(Arc<Order>),
     CancelBundle(BundleReplacementData),
 }
 
@@ -180,7 +220,6 @@ impl ReplaceableOrderPoolCommand {
     pub fn target_block(&self) -> Option<u64> {
         match self {
             ReplaceableOrderPoolCommand::Order(o) => o.target_block(),
-            ReplaceableOrderPoolCommand::CancelShareBundle(c) => Some(c.block),
             ReplaceableOrderPoolCommand::CancelBundle(_) => None,
         }
     }
@@ -192,6 +231,7 @@ impl ReplaceableOrderPoolCommand {
 /// - Clean up task to remove old stuff.
 ///
 /// @Pending reengineering to modularize rpc, extra_rpc here is a patch to upgrade the created rpc server.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_orderpool_jobs<P>(
     config: OrderInputConfig,
     provider_factory: P,
@@ -200,6 +240,7 @@ pub async fn start_orderpool_jobs<P>(
     order_sender: mpsc::Sender<ReplaceableOrderPoolCommand>,
     order_receiver: mpsc::Receiver<ReplaceableOrderPoolCommand>,
     header_receiver: mpsc::Receiver<Header>,
+    mempool_detector: Arc<mempool_txs_detector::MempoolTxsDetector>,
 ) -> eyre::Result<(JoinHandle<()>, OrderPoolSubscriber)>
 where
     P: StateProviderFactory + 'static,
@@ -211,7 +252,10 @@ where
         warn!("ignore_blobs is set to true, some order input is ignored");
     }
 
-    let orderpool = Arc::new(Mutex::new(OrderPool::new()));
+    let orderpool = Arc::new(Mutex::new(OrderPool::new(
+        config.time_to_keep_mempool_txs,
+        mempool_detector.clone(),
+    )));
     let subscriber = OrderPoolSubscriber {
         orderpool: orderpool.clone(),
     };
@@ -231,13 +275,14 @@ where
     )
     .await?;
 
-    let mut handles = vec![clean_job, rpc_server];
+    let mut handles: FuturesUnordered<_> = [clean_job, rpc_server].into_iter().collect();
 
     if config.mempool_source.is_some() {
         info!("Txpool source configured, starting txpool subscription");
         let txpool_fetcher = txpool_fetcher::subscribe_to_txpool_with_blobs(
             config.clone(),
             order_sender.clone(),
+            mempool_detector.clone(),
             global_cancel.clone(),
         )
         .await?;
@@ -273,7 +318,7 @@ where
                             }
                             o.replacement_key().is_some()
                         },
-                        ReplaceableOrderPoolCommand::CancelShareBundle(_)|ReplaceableOrderPoolCommand::CancelBundle(_) => true
+                        ReplaceableOrderPoolCommand::CancelBundle(_) => true
                     };
                     !cancellable_order
                 })
@@ -288,7 +333,7 @@ where
                             }
                             o.has_blobs()
                         },
-                        ReplaceableOrderPoolCommand::CancelShareBundle(_)|ReplaceableOrderPoolCommand::CancelBundle(_) => false
+                        ReplaceableOrderPoolCommand::CancelBundle(_) => false
                     };
                     !has_blobs
                 })
@@ -301,9 +346,8 @@ where
             new_commands.clear();
         }
 
-        for handle in handles {
+        while let Some(handle) = handles.next().await {
             handle
-                .await
                 .map_err(|err| {
                     tracing::error!(?err, "Error while waiting for OrderPoolJobs to finish")
                 })
@@ -361,7 +405,7 @@ where
 
                         let update_time = start.elapsed();
                         let (tx_count, bundle_count) = orderpool.content_count();
-                        set_ordepool_count(tx_count, bundle_count);
+                        set_ordepool_stats(tx_count, bundle_count, orderpool.mempool_txs_size());
                         debug!(
                             current_block,
                             tx_count,

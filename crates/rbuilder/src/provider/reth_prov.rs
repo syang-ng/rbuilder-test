@@ -1,11 +1,13 @@
-use crate::roothash::RootHashContext;
-use crate::utils::RootHasherImpl;
+use crate::{roothash::RootHashContext, utils::RootHasherImpl};
 use alloy_consensus::Header;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{BlockHash, BlockNumber, B256};
 use reth_errors::ProviderResult;
-use reth_provider::{BlockReader, DatabaseProviderFactory, HeaderProvider};
-use reth_provider::{StateCommitmentProvider, StateProviderBox};
+use reth_provider::{
+    BlockNumReader, BlockReader, ChangeSetReader, DBProvider, DatabaseProviderFactory,
+    HeaderProvider, PruneCheckpointReader, StageCheckpointReader, StateProviderBox,
+    StorageChangeSetReader, StorageSettingsCache,
+};
 use tracing::error;
 
 use super::{RootHasher, StateProviderFactory};
@@ -28,10 +30,18 @@ impl<P> StateProviderFactoryFromRethProvider<P> {
 
 impl<P> StateProviderFactory for StateProviderFactoryFromRethProvider<P>
 where
-    P: DatabaseProviderFactory<Provider: BlockReader>
-        + reth_provider::StateProviderFactory
+    P: DatabaseProviderFactory<
+            Provider: BlockReader
+                          + StageCheckpointReader
+                          + PruneCheckpointReader
+                          + ChangeSetReader
+                          + StorageChangeSetReader
+                          + DBProvider
+                          + BlockNumReader
+                          + StorageSettingsCache,
+        > + reth_provider::StateProviderFactory
+        + reth_provider::HashedPostStateProvider
         + HeaderProvider<Header = Header>
-        + StateCommitmentProvider
         + Clone
         + 'static,
 {
@@ -48,7 +58,7 @@ where
     }
 
     fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
-        self.provider.header(block_hash)
+        self.provider.header(*block_hash)
     }
 
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
@@ -68,7 +78,6 @@ where
     }
 
     fn root_hasher(&self, parent_num_hash: BlockNumHash) -> ProviderResult<Box<dyn RootHasher>> {
-        let hasher = self.history_by_block_hash(parent_num_hash.hash)?;
         let parent_state_root = self
             .provider
             .header_by_hash_or_number(parent_num_hash.hash.into())?
@@ -81,7 +90,7 @@ where
             parent_state_root,
             self.root_hash_context.clone(),
             self.provider.clone(),
-            hasher,
+            self.provider.clone(),
         )))
     }
 }

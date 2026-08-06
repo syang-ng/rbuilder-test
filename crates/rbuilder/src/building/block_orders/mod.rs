@@ -1,20 +1,12 @@
-pub mod multi_share_bundle_merger;
 mod prioritized_order_store;
-mod share_bundle_merger;
 
-#[cfg(test)]
-mod order_dumper;
 pub mod order_priority;
-#[cfg(test)]
-mod test_context;
 mod test_data_generator;
 use std::sync::Arc;
 
-use crate::{
-    live_builder::simulation::SimulatedOrderCommand,
-    primitives::{AccountNonce, OrderId, SimulatedOrder},
-};
+use crate::live_builder::simulation::SimulatedOrderCommand;
 use ahash::HashMap;
+use rbuilder_primitives::{AccountNonce, OrderId, SimulatedOrder};
 use reth_errors::ProviderResult;
 use reth_provider::StateProviderBox;
 
@@ -129,7 +121,7 @@ pub fn block_orders_from_sim_orders<OrderPriorityType: OrderPriority>(
 
 #[cfg(test)]
 mod test {
-    use crate::primitives::BundledTxInfo;
+    use rbuilder_primitives::BundledTxInfo;
 
     use super::{
         order_priority::{FullProfitInfoGetter, OrderMaxProfitPriority},

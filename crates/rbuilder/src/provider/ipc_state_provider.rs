@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     fmt::Debug,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{mpsc, Arc},
     time::Duration,
 };
 
@@ -16,9 +16,9 @@ use dashmap::DashMap;
 use quick_cache::sync::Cache;
 use reipc::rpc_provider::RpcProvider;
 use reth_errors::{ProviderError, ProviderResult};
-use reth_primitives::{Account, Bytecode};
+use reth_primitives_traits::{Account, Bytecode};
 use reth_provider::{
-    errors::any::AnyError, AccountReader, BlockHashReader, HashedPostStateProvider,
+    errors::any::AnyError, AccountReader, BlockHashReader, BytecodeReader, HashedPostStateProvider,
     StateProofProvider, StateProvider, StateProviderBox, StateRootProvider, StorageRootProvider,
 };
 use reth_trie::{
@@ -30,12 +30,11 @@ use revm::{
     primitives::HashMap,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 use tracing::{trace, trace_span};
 
 use crate::{
     building::ThreadBlockBuildingContext, live_builder::simulation::SimulatedOrderCommand,
+    roothash::RootHashError,
 };
 
 use super::{RootHasher, StateProviderFactory};
@@ -57,7 +56,7 @@ pub struct IpcStateProviderFactory {
     ipc_provider: RpcProvider,
 
     code_cache: Arc<DashMap<B256, Bytecode>>,
-    state_provider_by_hash: Arc<Cache<BlockHash, Arc<IpcStateProvider>>>,
+    state_provider_by_hash: Arc<Cache<BlockHash, IpcStateProvider>>,
 }
 
 impl IpcStateProviderFactory {
@@ -127,14 +126,16 @@ impl StateProviderFactory for IpcStateProviderFactory {
             return Ok(Box::new(state));
         }
 
-        let state = IpcStateProvider::into_boxed(
+        // `IpcStateProvider` is cheap to clone and shares its per-block caches between clones, so
+        // we keep one in the cache and hand out a clone to preserve the previous sharing semantics.
+        let state = IpcStateProvider::new(
             self.ipc_provider.clone(),
             block.into(),
             self.code_cache.clone(),
         );
 
-        self.state_provider_by_hash.insert(block, *state.clone());
-        Ok(state)
+        self.state_provider_by_hash.insert(block, state.clone());
+        Ok(Box::new(state))
     }
 
     /// Gets block header given block hash
@@ -198,13 +199,13 @@ pub struct IpcStateProvider {
     ipc_provider: RpcProvider,
     block_id: BlockId,
 
-    // Per block cache
-    block_hash_cache: DashMap<u64, BlockHash>,
+    // Per block cache, shared between clones so cloning a provider keeps the warmed-up cache.
+    block_hash_cache: Arc<DashMap<u64, BlockHash>>,
     // Note: It's ok to cache Account (and Storage) even in case of None, this is because StateProvider gives the
     // state for some past block, so if account didn't exist the first time, it cannot magically
     // appear later on
-    account_cache: DashMap<Address, Option<Account>>,
-    storage_cache: DashMap<(Address, StorageKey), Option<StorageValue>>,
+    account_cache: Arc<DashMap<Address, Option<Account>>>,
+    storage_cache: Arc<DashMap<(Address, StorageKey), Option<StorageValue>>>,
 
     // Global cache (cache not related to specific block)
     code_cache: Arc<DashMap<B256, Bytecode>>,
@@ -223,43 +224,23 @@ impl IpcStateProvider {
 
             code_cache,
 
-            block_hash_cache: DashMap::new(),
-            storage_cache: DashMap::new(),
-            account_cache: DashMap::new(),
+            block_hash_cache: Arc::new(DashMap::new()),
+            storage_cache: Arc::new(DashMap::new()),
+            account_cache: Arc::new(DashMap::new()),
         }
     }
 
     /// Crates new instance of state provider on the heap
-    // Box::new(Arc::new(Self)) is required because StateProviderFactory returns Box<dyn StateProvider>
-    // Note: this is known clippy issue: https://github.com/rust-lang/rust-clippy/issues/7472
-    #[allow(clippy::redundant_allocation)]
     fn into_boxed(
         ipc_provider: RpcProvider,
         block_id: BlockId,
         code_cache: Arc<DashMap<B256, Bytecode>>,
-    ) -> Box<Arc<Self>> {
-        Box::new(Arc::new(Self::new(ipc_provider, block_id, code_cache)))
+    ) -> Box<Self> {
+        Box::new(Self::new(ipc_provider, block_id, code_cache))
     }
 }
 
-impl StateProvider for IpcStateProvider {
-    /// Get storage of given account
-    fn storage(
-        &self,
-        account: Address,
-        storage_key: StorageKey,
-    ) -> ProviderResult<Option<StorageValue>> {
-        if let Some(storage) = self.storage_cache.get(&(account, storage_key)) {
-            return Ok(*storage);
-        }
-
-        let key: U256 = storage_key.into();
-        let storage = rpc_call(&self.ipc_provider, "eth_getStorageAt", (account, key))?;
-        self.storage_cache.insert((account, storage_key), storage);
-
-        Ok(storage)
-    }
-
+impl BytecodeReader for IpcStateProvider {
     /// Get account code by its hash
     /// IMPORTANT: Assumes remote provider (node) has RPC call:"rbuilder_getCodeByHash"
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
@@ -284,6 +265,25 @@ impl StateProvider for IpcStateProvider {
         });
 
         Ok(bytecode)
+    }
+}
+
+impl StateProvider for IpcStateProvider {
+    /// Get storage of given account
+    fn storage(
+        &self,
+        account: Address,
+        storage_key: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>> {
+        if let Some(storage) = self.storage_cache.get(&(account, storage_key)) {
+            return Ok(*storage);
+        }
+
+        let key: U256 = storage_key.into();
+        let storage = rpc_call(&self.ipc_provider, "eth_getStorageAt", (account, key))?;
+        self.storage_cache.insert((account, storage_key), storage);
+
+        Ok(storage)
     }
 }
 
@@ -416,7 +416,12 @@ impl StateProofProvider for IpcStateProvider {
         unimplemented!()
     }
 
-    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+    fn witness(
+        &self,
+        _input: TrieInput,
+        _target: HashedPostState,
+        _mode: reth_trie::ExecutionWitnessMode,
+    ) -> ProviderResult<Vec<Bytes>> {
         unimplemented!()
     }
 }
@@ -434,23 +439,28 @@ pub struct StatRootHashCalculator {
 }
 
 impl RootHasher for StatRootHashCalculator {
-    fn run_prefetcher(
-        &self,
-        _simulated_orders: broadcast::Receiver<SimulatedOrderCommand>,
-        _cancel: CancellationToken,
-    ) {
+    fn run_prefetcher(&self, _simulated_orders: mpsc::Receiver<SimulatedOrderCommand>) {
         unimplemented!()
+    }
+
+    fn account_proofs(
+        &self,
+        _outcome: &BundleState,
+        _addresses: &eth_sparse_mpt::utils::HashSet<Address>,
+        _local_ctx: &mut ThreadBlockBuildingContext,
+    ) -> Result<eth_sparse_mpt::utils::HashMap<Address, Vec<Bytes>>, RootHashError> {
+        Err(RootHashError::Other(eyre::eyre!("method not implemented")))
     }
 
     /// Calculates the state root given changed accounts
     /// IMPORTANT: Assumes IPC provider (node) has RPC call:"rbuilder_calculateStateRoot"
     fn state_root(
         &self,
-        outcome: &reth_provider::ExecutionOutcome,
+        outcome: &BundleState,
+        _incremental_change: &[Address],
         _local_ctx: &mut ThreadBlockBuildingContext,
-    ) -> Result<B256, crate::roothash::RootHashError> {
+    ) -> Result<B256, RootHashError> {
         let account_diff: HashMap<Address, AccountDiff> = outcome
-            .bundle
             .state
             .iter()
             .map(|(address, diff)| (*address, diff.clone().into()))
@@ -461,7 +471,7 @@ impl RootHasher for StatRootHashCalculator {
             "rbuilder_calculateStateRoot",
             (BlockId::Hash(self.parent_hash.into()), account_diff),
         )
-        .map_err(|err| crate::roothash::RootHashError::Other(err.into()))?;
+        .map_err(|err| RootHashError::Other(err.into()))?;
 
         Ok(hash)
     }

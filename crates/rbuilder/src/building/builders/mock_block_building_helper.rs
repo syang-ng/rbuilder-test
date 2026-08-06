@@ -1,22 +1,24 @@
-use crate::building::ThreadBlockBuildingContext;
-use crate::live_builder::simulation::SimulatedOrderCommand;
-use crate::primitives::SimValue;
-use crate::provider::RootHasher;
-use crate::roothash::RootHashError;
+use std::sync::mpsc;
+
 use crate::{
     building::{
-        BlockBuildingContext, BuiltBlockTrace, CriticalCommitOrderError, ExecutionError,
-        ExecutionResult,
+        builders::BuiltBlockId, BlockBuildingContext, BuiltBlockTrace, CriticalCommitOrderError,
+        ExecutionError, ExecutionResult, ThreadBlockBuildingContext,
     },
-    primitives::SimulatedOrder,
+    live_builder::{
+        block_output::bidding_service_interface::CompetitionBidContext,
+        simulation::SimulatedOrderCommand,
+    },
+    provider::RootHasher,
+    roothash::RootHashError,
 };
-use alloy_primitives::B256;
-use alloy_primitives::U256;
-use reth::providers::ExecutionOutcome;
-use reth_primitives::SealedBlock;
+use alloy_primitives::{Address, Bytes, B256, I256, U256};
+use eth_sparse_mpt::utils::{HashMap, HashSet};
+use rbuilder_primitives::{order_statistics::OrderStatistics, SimValue, SimulatedOrder};
+use reth_ethereum_primitives::Block as EthereumBlock;
+use reth_primitives_traits::SealedBlock;
+use revm::database::BundleState;
 use time::OffsetDateTime;
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
 use super::{
     block_building_helper::{BlockBuildingHelper, BlockBuildingHelperError, FinalizeBlockResult},
@@ -29,20 +31,18 @@ use super::{
 pub struct MockBlockBuildingHelper {
     built_block_trace: BuiltBlockTrace,
     block_building_context: BlockBuildingContext,
-    can_add_payout_tx: bool,
     builder_name: String,
 }
 
 impl MockBlockBuildingHelper {
-    pub fn new(true_block_value: U256, can_add_payout_tx: bool) -> Self {
+    pub fn new(true_block_value: U256) -> Self {
         let built_block_trace = BuiltBlockTrace {
             true_bid_value: true_block_value,
-            ..Default::default()
+            ..BuiltBlockTrace::new(BuiltBlockId::ZERO, 0)
         };
         Self {
             built_block_trace,
             block_building_context: BlockBuildingContext::dummy_for_testing(),
-            can_add_payout_tx,
             builder_name: "Mock".to_string(),
         }
     }
@@ -60,8 +60,8 @@ impl MockBlockBuildingHelper {
 }
 
 impl BlockBuildingHelper for MockBlockBuildingHelper {
-    fn box_clone(&self) -> Box<dyn BlockBuildingHelper> {
-        Box::new(self.clone())
+    fn try_clone(&self) -> Result<Box<dyn BlockBuildingHelper>, BlockBuildingHelperError> {
+        Ok(Box::new(self.clone()))
     }
 
     fn commit_order(
@@ -81,33 +81,28 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
         self.built_block_trace.orders_closed_at = orders_closed_at;
     }
 
-    fn can_add_payout_tx(&self) -> bool {
-        self.can_add_payout_tx
-    }
-
     fn true_block_value(&self) -> Result<U256, BlockBuildingHelperError> {
         Ok(self.built_block_trace.true_bid_value)
     }
 
     fn finalize_block(
-        mut self: Box<Self>,
+        &mut self,
         _local_ctx: &mut ThreadBlockBuildingContext,
-        payout_tx_value: Option<U256>,
-        seen_competition_bid: Option<U256>,
+        payout_tx_value: U256,
+        subsidy: I256,
+        competition_bid_context: CompetitionBidContext,
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError> {
         self.built_block_trace.update_orders_sealed_at();
-        self.built_block_trace.seen_competition_bid = seen_competition_bid;
-        self.built_block_trace.bid_value = if let Some(payout_tx_value) = payout_tx_value {
-            payout_tx_value
-        } else {
-            self.built_block_trace.true_bid_value
-        };
+        self.built_block_trace.competition_bid_context = competition_bid_context;
+        self.built_block_trace.bid_value = payout_tx_value;
+        self.built_block_trace.subsidy = subsidy;
         let block = Block {
-            trace: self.built_block_trace,
-            sealed_block: SealedBlock::default(),
-            txs_blobs_sidecars: Vec::new(),
             builder_name: "BlockBuildingHelper".to_string(),
+            trace: self.built_block_trace.clone(),
+            sealed_block: SealedBlock::<EthereumBlock>::default(),
+            txs_blobs_sidecars: Vec::new(),
             execution_requests: Default::default(),
+            bid_adjustments: Default::default(),
         };
 
         Ok(FinalizeBlockResult { block })
@@ -124,22 +119,46 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
     fn builder_name(&self) -> &str {
         &self.builder_name
     }
+
+    fn set_filtered_build_statistics(
+        &mut self,
+        considered_orders_statistics: OrderStatistics,
+        failed_orders_statistics: OrderStatistics,
+    ) {
+        self.built_block_trace
+            .set_filtered_build_statistics(considered_orders_statistics, failed_orders_statistics);
+    }
+
+    fn adjust_finalized_block(
+        &mut self,
+        _local_ctx: &mut ThreadBlockBuildingContext,
+        _payout_tx_value: U256,
+        _subsidy: I256,
+        _competition_bid_context: CompetitionBidContext,
+    ) -> Result<FinalizeBlockResult, BlockBuildingHelperError> {
+        unimplemented!()
+    }
 }
 
 #[derive(Debug)]
 pub struct MockRootHasher {}
 
 impl RootHasher for MockRootHasher {
-    fn run_prefetcher(
+    fn run_prefetcher(&self, _simulated_orders: mpsc::Receiver<SimulatedOrderCommand>) {}
+
+    fn account_proofs(
         &self,
-        _simulated_orders: broadcast::Receiver<SimulatedOrderCommand>,
-        _cancel: CancellationToken,
-    ) {
+        _outcome: &BundleState,
+        _addresses: &HashSet<Address>,
+        _local_ctx: &mut ThreadBlockBuildingContext,
+    ) -> Result<HashMap<Address, Vec<Bytes>>, RootHashError> {
+        Ok(Default::default())
     }
 
     fn state_root(
         &self,
-        _outcome: &ExecutionOutcome,
+        _outcome: &BundleState,
+        _incremental_change: &[Address],
         _local_ctx: &mut ThreadBlockBuildingContext,
     ) -> Result<B256, RootHashError> {
         Ok(B256::default())

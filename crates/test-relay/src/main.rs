@@ -3,10 +3,9 @@ use ahash::HashMap;
 use metrics::spawn_metrics_server;
 use rbuilder::{
     beacon_api_client::Client,
-    mev_boost::RelayClient,
-    primitives::mev_boost::MevBoostRelaySlotInfoProvider,
-    utils::tracing::{setup_tracing_subscriber, LoggerConfig},
+    mev_boost::{MevBoostRelaySlotInfoProvider, RelayClient},
 };
+use rbuilder_config::{LoggerConfig, OtlpConfig, TracingConfig};
 use relay::spawn_relay_server;
 use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
@@ -41,11 +40,17 @@ struct Cli {
     log_json: bool,
     #[clap(
         long,
-        help = "Rust log describton",
+        help = "Rust log level filter, consisting of one or more directives separated by commas",
         default_value = "info",
         env = "RUST_LOG"
     )]
     rust_log: String,
+    #[clap(
+        long,
+        help = "OTLP environment name, e.g. 'production', 'staging', etc.",
+        env = "OTLP_ENVIRONMENT"
+    )]
+    otlp_env_name: Option<String>,
     #[clap(
         long,
         help = "URL to validate submitted blocks",
@@ -82,12 +87,17 @@ async fn main() -> eyre::Result<()> {
 
     let global_cancellation = CancellationToken::new();
 
-    let config = LoggerConfig {
+    let tracing_config = TracingConfig::from(LoggerConfig {
         env_filter: cli.rust_log,
         log_json: cli.log_json,
         log_color: false,
-    };
-    setup_tracing_subscriber(config)?;
+    })
+    .maybe_with_otlp(
+        cli.otlp_env_name
+            .as_ref()
+            .map(|name| OtlpConfig::new().with_environment(name.clone())),
+    );
+    let _guard = tracing_config.init_tracing()?;
 
     spawn_metrics_server(cli.metrics_address);
 
@@ -102,7 +112,17 @@ async fn main() -> eyre::Result<()> {
 
     let relay = {
         let url: Url = cli.relay.parse()?;
-        let client = RelayClient::from_url(url, None, None, None, false, false, false);
+        let client = RelayClient::from_url(
+            url,
+            None,
+            None,
+            None,
+            false,
+            Vec::new(),
+            false,
+            false,
+            false,
+        );
         MevBoostRelaySlotInfoProvider::new(client, "relay".to_string())
     };
 

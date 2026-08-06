@@ -2,22 +2,21 @@
 //!
 //! test setup creates fake state with various and block (configurable with BlockArgs)
 //! test setup is used to build orders and commit them
-use crate::{
-    building::{
-        cached_reads::{LocalCachedReads, SharedCachedReads},
-        testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
-        BlockState, ExecutionError, ExecutionResult, OrderErr, PartialBlock,
-        ThreadBlockBuildingContext,
-    },
-    primitives::{
-        order_builder::OrderBuilder, BundleRefund, BundleReplacementData, OrderId, Refund,
-        RefundConfig, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
-    },
+use crate::building::{
+    cached_reads::{CachedDB, SharedCachedReads},
+    testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
+    BlockState, ExecutionError, ExecutionResult, NullPartialBlockExecutionTracer, OrderErr,
+    PartialBlock, ThreadBlockBuildingContext,
 };
 use alloy_primitives::{Address, TxHash};
-use reth_provider::StateProvider;
+use parking_lot::Mutex;
+use rbuilder_primitives::{
+    order_builder::OrderBuilder, BundleRefund, BundleReplacementData, SimulatedOrder,
+    TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
+};
 use revm::database::states::BundleState;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 pub enum NonceValue {
     /// Fixed value
@@ -28,7 +27,7 @@ pub enum NonceValue {
 
 #[derive(Debug)]
 pub struct TestSetup {
-    partial_block: PartialBlock<()>,
+    partial_block: PartialBlock<(), NullPartialBlockExecutionTracer>,
     order_builder: OrderBuilder,
     bundle_state: Option<BundleState>,
     test_chain: TestChainState,
@@ -36,6 +35,9 @@ pub struct TestSetup {
 
 impl TestSetup {
     pub fn gen_test_setup(block_args: BlockArgs) -> eyre::Result<Self> {
+        // this is a hack to work around error on db open when we create many test databases in parallel
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = TEST_LOCK.get_or_init(|| Mutex::new(())).lock();
         Ok(Self {
             partial_block: PartialBlock::new(true),
             order_builder: OrderBuilder::None,
@@ -45,7 +47,7 @@ impl TestSetup {
     }
 
     /// Return a reference to a partial block.
-    pub fn partial_block(&self) -> &PartialBlock<()> {
+    pub fn partial_block(&self) -> &PartialBlock<(), NullPartialBlockExecutionTracer> {
         &self.partial_block
     }
 
@@ -68,13 +70,7 @@ impl TestSetup {
         self.order_builder.start_bundle_builder(target_block);
     }
 
-    pub fn begin_share_bundle_order(&mut self, block: u64, max_block: u64) {
-        self.order_builder
-            .start_share_bundle_builder(block, max_block);
-    }
-
     // Bundle methods
-
     pub fn set_bundle_timestamp(&mut self, min_timestamp: Option<u64>, max_timestamp: Option<u64>) {
         self.order_builder
             .set_bundle_timestamp(min_timestamp, max_timestamp);
@@ -85,32 +81,8 @@ impl TestSetup {
             .set_bundle_replacement_data(replacement_data);
     }
 
-    // Share bundle methods
-
-    pub fn start_inner_bundle(&mut self, can_skip: bool) {
-        self.order_builder.start_inner_bundle(can_skip)
-    }
-
-    pub fn finish_inner_bundle(&mut self) {
-        self.order_builder.finish_inner_bundle()
-    }
-
-    pub fn set_inner_bundle_refund(&mut self, refund: Vec<Refund>) {
-        self.order_builder.set_inner_bundle_refund(refund)
-    }
-
     pub fn set_bundle_refund(&mut self, refund: BundleRefund) {
         self.order_builder.set_bundle_refund(refund)
-    }
-
-    pub fn set_inner_bundle_refund_config(&mut self, refund_config: Vec<RefundConfig>) {
-        self.order_builder
-            .set_inner_bundle_refund_config(refund_config)
-    }
-
-    pub fn set_inner_bundle_original_order_id(&mut self, original_order_id: OrderId) {
-        self.order_builder
-            .set_inner_bundle_original_order_id(original_order_id)
     }
 
     /// Adds a tx that does nothing
@@ -133,7 +105,21 @@ impl TestSetup {
         )
     }
 
-    /// Send value from ->to , uses currentfrom nonce
+    /// Send value from ->to , uses current from nonce
+    pub fn create_dummy_tx(
+        &mut self,
+        from: NamedAddr,
+        to: NamedAddr,
+        value: u64,
+    ) -> eyre::Result<TransactionSignedEcRecoveredWithBlobs> {
+        let args = TxArgs::new(from, self.current_nonce(from)?)
+            .to(to)
+            .value(value);
+        let tx = self.test_chain.sign_tx(args)?;
+        Ok(TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx).unwrap())
+    }
+
+    /// create_dummy_tx +
     pub fn add_dummy_tx(
         &mut self,
         from: NamedAddr,
@@ -141,16 +127,10 @@ impl TestSetup {
         value: u64,
         revert_behavior: TxRevertBehavior,
     ) -> eyre::Result<TxHash> {
-        let args = TxArgs::new(from, self.current_nonce(from)?)
-            .to(to)
-            .value(value);
-        let tx = self.test_chain.sign_tx(args)?;
+        let tx = self.create_dummy_tx(from, to, value)?;
         let tx_hash = *tx.hash();
-        self.order_builder.add_tx(
-            TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx).unwrap(),
-            revert_behavior,
-        );
-        Ok(tx_hash)
+        self.order_builder.add_tx(tx, revert_behavior);
+        Ok(tx_hash.into())
     }
 
     fn add_tx(&mut self, args: TxArgs, revert_behavior: TxRevertBehavior) -> eyre::Result<TxHash> {
@@ -161,6 +141,16 @@ impl TestSetup {
             revert_behavior,
         );
         Ok(tx_hash)
+    }
+
+    /// Allows to add a tx manually built or via create_dummy_tx
+    pub fn add_external_tx(
+        &mut self,
+        tx: TransactionSignedEcRecoveredWithBlobs,
+        revert_behavior: TxRevertBehavior,
+    ) -> eyre::Result<()> {
+        self.order_builder.add_tx(tx, revert_behavior);
+        Ok(())
     }
 
     pub fn add_send_to_coinbase_tx(&mut self, from: NamedAddr, value: u64) -> eyre::Result<TxHash> {
@@ -221,16 +211,15 @@ impl TestSetup {
             current_value,
         )
     }
+    #[allow(clippy::result_large_err)]
     fn try_commit_order(&mut self) -> eyre::Result<Result<ExecutionResult, ExecutionError>> {
-        let state_provider: Arc<dyn StateProvider> =
-            Arc::from(self.test_chain.provider_factory().latest()?);
         let mut local_ctx = ThreadBlockBuildingContext::default();
 
-        let sim_order = SimulatedOrder {
-            order: self.order_builder.build_order(),
-            sim_value: Default::default(),
-            used_state_trace: Default::default(),
-        };
+        let sim_order = SimulatedOrder::new(
+            Arc::new(self.order_builder.build_order()),
+            Default::default(),
+            Default::default(),
+        );
 
         // we commit order twice to test evm caching
         let initial_partial_block = self.partial_block.clone();
@@ -238,8 +227,12 @@ impl TestSetup {
 
         let mut results = Vec::new();
         for _ in 0..2 {
-            let mut block_state = BlockState::new_arc(state_provider.clone())
-                .with_bundle_state(initial_bundle_state.clone());
+            let cached = CachedDB::new(
+                self.test_chain.provider_factory().latest()?,
+                Arc::new(SharedCachedReads::default()),
+            );
+            let mut block_state =
+                BlockState::new(cached).with_bundle_state(initial_bundle_state.clone());
 
             let mut partial_block = initial_partial_block.clone();
 
@@ -274,14 +267,14 @@ impl TestSetup {
     pub fn commit_order_err_check_text(&mut self, expected_error: &str) {
         let res = self.try_commit_order().expect("Failed to commit order");
         match res {
-            Ok(_) => panic!("expected error, result: {:#?}", res),
+            Ok(_) => panic!("expected error, result: {res:#?}"),
             Err(err) => {
                 if !err
                     .to_string()
                     .to_lowercase()
                     .contains(&expected_error.to_lowercase())
                 {
-                    panic!("unexpected error: {}, expected: {}", err, expected_error);
+                    panic!("unexpected error: {err}, expected: {expected_error}");
                 }
             }
         }
@@ -291,45 +284,37 @@ impl TestSetup {
     pub fn commit_order_err_check<F: FnOnce(OrderErr)>(&mut self, err_check: F) {
         let res = self.try_commit_order().expect("Failed to commit order");
         match res {
-            Ok(_) => panic!("expected error,got ok result: {:#?}", res),
+            Ok(_) => panic!("expected error,got ok result: {res:#?}"),
             Err(err) => {
                 if let ExecutionError::OrderError(order_error) = err {
                     err_check(order_error);
                 } else {
-                    panic!("unexpected non OrderErr error: {}", err);
+                    panic!("unexpected non OrderErr error: {err}");
                 }
             }
         }
     }
 
+    fn make_block_state(&self) -> eyre::Result<BlockState<CachedDB>> {
+        let cached = CachedDB::new(
+            self.test_chain.provider_factory().latest()?,
+            Arc::new(SharedCachedReads::default()),
+        );
+        Ok(
+            BlockState::new(cached)
+                .with_bundle_state(self.bundle_state.clone().unwrap_or_default()),
+        )
+    }
+
     pub fn current_nonce(&self, named_addr: NamedAddr) -> eyre::Result<u64> {
-        let mut local_cached_reads = LocalCachedReads::default();
-        let shared_cached_reads = SharedCachedReads::default();
-
-        let state_provider = self.test_chain.provider_factory().latest()?;
-        let mut block_state = BlockState::new(state_provider)
-            .with_bundle_state(self.bundle_state.clone().unwrap_or_default());
-
-        Ok(block_state.nonce(
-            self.test_chain.named_address(named_addr)?,
-            &shared_cached_reads,
-            &mut local_cached_reads,
-        )?)
+        let mut block_state = self.make_block_state()?;
+        Ok(block_state.nonce(self.test_chain.named_address(named_addr)?)?)
     }
 
     pub fn balance(&self, named_addr: NamedAddr) -> eyre::Result<i128> {
-        let mut local_cached_reads = LocalCachedReads::default();
-        let shared_cached_reads = SharedCachedReads::default();
-
-        let state_provider = self.test_chain.provider_factory().latest()?;
-        let mut block_state = BlockState::new(state_provider)
-            .with_bundle_state(self.bundle_state.clone().unwrap_or_default());
+        let mut block_state = self.make_block_state()?;
         Ok(block_state
-            .balance(
-                self.test_chain.named_address(named_addr)?,
-                &shared_cached_reads,
-                &mut local_cached_reads,
-            )?
+            .balance(self.test_chain.named_address(named_addr)?)?
             .to())
     }
 

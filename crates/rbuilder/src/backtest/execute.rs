@@ -1,20 +1,19 @@
 use crate::{
     backtest::BlockData,
     building::{
-        builders::BacktestSimulateBlockInput, multi_share_bundle_merger::MultiShareBundleMerger,
-        sim::simulate_all_orders_with_sim_tree, BlockBuildingContext, BundleErr, OrderErr,
-        SimulatedOrderSink, SimulatedOrderStore, TransactionErr,
+        builders::BacktestSimulateBlockInput, sim::simulate_all_orders_with_sim_tree,
+        BlockBuildingContext, BundleErr, NullPartialBlockExecutionTracer, OrderErr, TransactionErr,
     },
     live_builder::{block_list_provider::BlockList, cli::LiveBuilderConfig},
-    primitives::{OrderId, SimulatedOrder},
     provider::StateProviderFactory,
-    utils::{clean_extradata, Signer},
+    utils::{clean_extradata, mevblocker::get_mevblocker_price, Signer},
 };
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::U256;
+use rbuilder_primitives::{Order, OrderId, SimulatedOrder};
 use reth_chainspec::ChainSpec;
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::sync::Arc;
 
 use super::OrdersWithTimestamp;
 
@@ -70,6 +69,9 @@ where
         block_data.winning_bid_trace.block_number.saturating_sub(1),
         block_data.winning_bid_trace.parent_hash,
     );
+    let mev_blocker_price = get_mevblocker_price(
+        provider.history_by_block_hash(block_data.onchain_block.header.parent_hash)?,
+    )?;
     let ctx = BlockBuildingContext::from_onchain_block(
         block_data.onchain_block.clone(),
         chain_spec.clone(),
@@ -77,40 +79,37 @@ where
         blocklist,
         builder_signer.address,
         block_data.winning_bid_trace.proposer_fee_recipient,
-        Some(builder_signer),
+        builder_signer,
         Arc::from(provider.root_hasher(parent_num_hash)?),
         evm_caching_enable,
+        mev_blocker_price,
     );
     Ok(ctx)
 }
 
+/// @Pending: change available_orders to some struct that allows to tell the difference between
+/// mempool txs and private txs.
 pub fn backtest_prepare_orders_from_building_context<P>(
     ctx: BlockBuildingContext,
     available_orders: Vec<OrdersWithTimestamp>,
     provider: P,
-    sbundle_mergeable_signers: &[Address],
 ) -> eyre::Result<BacktestBlockInput>
 where
     P: StateProviderFactory + Clone + 'static,
 {
-    let orders = available_orders
+    let orders: Vec<Arc<Order>> = available_orders
         .iter()
-        .map(|order| order.order.clone())
-        .collect::<Vec<_>>();
+        .map(|order| Arc::clone(&order.order))
+        .collect();
     for order in &orders {
-        ctx.mempool_tx_detector.add_tx(order);
+        if let Order::Tx(mempool_tx) = order.as_ref() {
+            ctx.mempool_tx_detector
+                .add_tx(mempool_tx.tx_with_blobs.hash());
+        }
     }
 
     let (sim_orders, sim_errors) =
         simulate_all_orders_with_sim_tree(provider, &ctx, &orders, false)?;
-
-    // Apply bundle merging as in live building.
-    let order_store = Rc::new(RefCell::new(SimulatedOrderStore::new()));
-    let mut merger = MultiShareBundleMerger::new(sbundle_mergeable_signers, order_store.clone());
-    for sim_order in sim_orders {
-        merger.insert_order(Arc::new(sim_order));
-    }
-    let sim_orders = order_store.borrow().get_orders();
     Ok(BacktestBlockInput {
         sim_orders,
         sim_errors,
@@ -125,7 +124,6 @@ pub fn backtest_simulate_block<P, ConfigType>(
     builders_names: Vec<String>,
     config: &ConfigType,
     blocklist: BlockList,
-    sbundle_mergeable_signers: &[Address],
 ) -> eyre::Result<BlockBacktestValue>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -140,14 +138,7 @@ where
         config.base_config().evm_caching_enable,
     )?;
 
-    backtest_simulate_block_with_context(
-        ctx,
-        block_data,
-        provider,
-        builders_names,
-        config,
-        sbundle_mergeable_signers,
-    )
+    backtest_simulate_block_with_context(ctx, block_data, provider, builders_names, config)
 }
 
 pub fn backtest_simulate_block_with_context<P, ConfigType>(
@@ -156,7 +147,6 @@ pub fn backtest_simulate_block_with_context<P, ConfigType>(
     provider: P,
     builders_names: Vec<String>,
     config: &ConfigType,
-    sbundle_mergeabe_signers: &[Address],
 ) -> eyre::Result<BlockBacktestValue>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -171,7 +161,6 @@ where
         ctx.clone(),
         block_data.available_orders,
         provider.clone(),
-        sbundle_mergeabe_signers,
     )?;
 
     let filtered_orders_blocklist_count = sim_errors
@@ -216,7 +205,11 @@ where
             provider: provider.clone(),
         };
 
-        let block = config.build_backtest_block(&building_algorithm_name, input)?;
+        let block = config.build_backtest_block(
+            &building_algorithm_name,
+            input,
+            NullPartialBlockExecutionTracer {},
+        )?;
         builder_outputs.push(BacktestBuilderOutput {
             orders_included: block.trace.included_orders.len(),
             builder_name: building_algorithm_name,

@@ -1,10 +1,10 @@
 use alloy_primitives::{B256, U256};
-use reth_primitives::TransactionSigned;
+use reth_ethereum_primitives::TransactionSigned;
 
-use crate::building::{
-    evm_inspector::SlotKey,
-    testing::{evm_inspector_tests::setup::TestSetup, test_chain_state::NamedAddr},
+use crate::building::testing::{
+    evm_inspector_tests::setup::TestSetup, test_chain_state::NamedAddr,
 };
+use rbuilder_primitives::evm_inspector::SlotKey;
 
 pub mod setup;
 
@@ -104,7 +104,7 @@ fn test_read_balance() -> eyre::Result<()> {
 
     let mev_test_contract_addr = test_setup.named_address(NamedAddr::MevTest)?;
     let dummy_addr = test_setup.named_address(NamedAddr::Dummy)?;
-    let tx: reth_primitives::Recovered<TransactionSigned> =
+    let tx: reth_primitives_traits::Recovered<TransactionSigned> =
         test_setup.make_test_read_balance_tx(dummy_addr, 100)?;
     let used_state_trace = test_setup.inspect_tx_without_commit(tx)?;
 
@@ -126,7 +126,7 @@ fn test_ephemeral_contract_destruct() -> eyre::Result<()> {
     let test_setup = TestSetup::new()?;
 
     let refund_addr = test_setup.named_address(NamedAddr::Dummy)?;
-    let tx: reth_primitives::Recovered<TransactionSigned> =
+    let tx: reth_primitives_traits::Recovered<TransactionSigned> =
         test_setup.make_test_ephemeral_contract_destruct_tx(refund_addr, 100)?;
     let used_state_trace = test_setup.inspect_tx_without_commit(tx)?;
 

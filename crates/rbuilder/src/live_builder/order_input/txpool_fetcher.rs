@@ -1,12 +1,13 @@
 use super::{MempoolSource, OrderInputConfig, ReplaceableOrderPoolCommand};
-use crate::{
-    primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs},
-    telemetry::{add_txfetcher_time_to_query, mark_command_received},
-};
+use crate::telemetry::{add_txfetcher_time_to_query, mark_command_received};
 use alloy_primitives::FixedBytes;
 use alloy_provider::{IpcConnect, Provider, ProviderBuilder};
 use futures::StreamExt;
-use std::{pin::pin, time::Instant};
+use rbuilder_primitives::{
+    serialize::TxEncoding, MempoolTx, Order, RawTransactionDecodable,
+    TransactionSignedEcRecoveredWithBlobs,
+};
+use std::{pin::pin, sync::Arc, time::Instant};
 use time::OffsetDateTime;
 use tokio::{
     sync::{mpsc, mpsc::error::SendTimeoutError},
@@ -22,6 +23,7 @@ use tracing::{error, info, trace};
 pub async fn subscribe_to_txpool_with_blobs(
     config: OrderInputConfig,
     results: mpsc::Sender<ReplaceableOrderPoolCommand>,
+    mempool_detector: Arc<super::mempool_txs_detector::MempoolTxsDetector>,
     global_cancel: CancellationToken,
 ) -> eyre::Result<JoinHandle<()>> {
     let mempool = config
@@ -68,20 +70,21 @@ pub async fn subscribe_to_txpool_with_blobs(
                     continue;
                 }
             };
-
             let tx = MempoolTx::new(tx_with_blobs);
             let order = Order::Tx(tx);
             let parse_duration = start.elapsed();
             trace!(order = ?order.id(), parse_duration_mus = parse_duration.as_micros(), "Mempool transaction received with blobs");
             add_txfetcher_time_to_query(parse_duration);
 
-            let orderpool_command = ReplaceableOrderPoolCommand::Order(order);
-            mark_command_received(&orderpool_command, received_at, None);
+            let orderpool_command = ReplaceableOrderPoolCommand::Order(Arc::new(order));
+            mark_command_received(&orderpool_command, received_at);
             match results
                 .send_timeout(orderpool_command, config.results_channel_timeout)
                 .await
             {
-                Ok(()) => {}
+                Ok(()) => {
+                    mempool_detector.add_tx(tx_hash);
+                }
                 Err(SendTimeoutError::Timeout(_)) => {
                     error!("Failed to send txpool tx to results channel, timeout");
                 }
@@ -107,16 +110,17 @@ async fn get_tx_with_blobs(
     let Some(response) = provider.get_raw_transaction_by_hash(tx_hash).await? else {
         return Ok(None);
     };
-    Ok(Some(
-        TransactionSignedEcRecoveredWithBlobs::decode_enveloped_with_real_blobs(response)?,
-    ))
+    let raw_decodable = RawTransactionDecodable::new(response, TxEncoding::WithBlobData);
+    Ok(Some(raw_decodable.decode_enveloped()?))
 }
 
 #[cfg(test)]
 mod test {
 
     use super::*;
-    use alloy_consensus::{SidecarBuilder, SimpleCoder};
+    use alloy_consensus::{
+        BlobTransactionSidecar, BlobTransactionSidecarVariant, SidecarBuilder, SimpleCoder,
+    };
     use alloy_network::{EthereumWallet, TransactionBuilder};
     use alloy_node_bindings::Anvil;
     use alloy_primitives::U256;
@@ -140,6 +144,9 @@ mod test {
                 ..OrderInputConfig::default_e2e()
             },
             sender,
+            Arc::new(
+                crate::live_builder::order_input::mempool_txs_detector::MempoolTxsDetector::new(),
+            ),
             CancellationToken::new(),
         )
         .await
@@ -156,7 +163,8 @@ mod test {
 
         let sidecar: SidecarBuilder<SimpleCoder> =
             SidecarBuilder::from_slice("Blobs are fun!".as_bytes());
-        let sidecar = sidecar.build().unwrap();
+        let sidecar = sidecar.build::<BlobTransactionSidecar>().unwrap();
+        let sidecar = BlobTransactionSidecarVariant::Eip4844(sidecar);
 
         let gas_price = provider.get_gas_price().await.unwrap();
         let eip1559_est = provider.estimate_eip1559_fees().await.unwrap();
@@ -175,15 +183,16 @@ mod test {
         let recv_tx = receiver.recv().await.unwrap();
 
         let tx_with_blobs = match recv_tx {
-            ReplaceableOrderPoolCommand::Order(Order::Tx(MempoolTx { tx_with_blobs })) => {
-                Some(tx_with_blobs)
-            }
+            ReplaceableOrderPoolCommand::Order(order) => match order.as_ref() {
+                Order::Tx(MempoolTx { tx_with_blobs }) => Some(tx_with_blobs.clone()),
+                _ => None,
+            },
             _ => None,
         }
         .unwrap();
 
         assert_eq!(tx_with_blobs.hash(), *pending_tx.tx_hash());
-        assert_eq!(tx_with_blobs.blobs_sidecar.blobs.len(), 1);
+        assert_eq!(tx_with_blobs.blobs_len(), 1);
 
         // send another tx without blobs
         let tx = TransactionRequest::default()
@@ -197,14 +206,15 @@ mod test {
         let recv_tx = receiver.recv().await.unwrap();
 
         let tx_without_blobs = match recv_tx {
-            ReplaceableOrderPoolCommand::Order(Order::Tx(MempoolTx { tx_with_blobs })) => {
-                Some(tx_with_blobs)
-            }
+            ReplaceableOrderPoolCommand::Order(order) => match order.as_ref() {
+                Order::Tx(MempoolTx { tx_with_blobs }) => Some(tx_with_blobs.clone()),
+                _ => None,
+            },
             _ => None,
         }
         .unwrap();
 
         assert_eq!(tx_without_blobs.hash(), *pending_tx.tx_hash());
-        assert_eq!(tx_without_blobs.blobs_sidecar.blobs.len(), 0);
+        assert_eq!(tx_without_blobs.blobs_len(), 0);
     }
 }

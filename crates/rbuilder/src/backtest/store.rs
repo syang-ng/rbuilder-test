@@ -7,20 +7,19 @@ use crate::{
     },
     live_builder::order_input::ReplaceableOrderPoolCommand,
     mev_boost::BuilderBlockReceived,
-    primitives::{
-        serialize::{CancelShareBundle, RawOrder, RawOrderConvertError, TxEncoding},
-        BundleReplacementData, OrderId,
-    },
     utils::timestamp_ms_to_offset_datetime,
 };
 use ahash::{HashMap, HashSet};
 use alloy_primitives::{
     utils::{format_ether, parse_ether, ParseUnits, Unit},
-    I256,
+    Address, B256, I256, U256,
 };
-use alloy_primitives::{Address, B256, U256};
 use lz4_flex::{block::DecompressError, compress_prepend_size, decompress_size_prepended};
 use rayon::prelude::*;
+use rbuilder_primitives::{
+    serialize::{RawOrder, RawOrderConvertError, TxEncoding},
+    BundleReplacementData, OrderId,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteRow},
@@ -30,6 +29,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 /// Version of the data/format on the DB.
@@ -247,7 +247,6 @@ impl HistoricalDataStorage {
                 let raw_order: RawReplaceableOrderPoolCommandWithTimestamp = order.clone().into();
                 let order_id = match &order.command {
                     ReplaceableOrderPoolCommand::Order(order) => Some( order.id().to_string()),
-                    ReplaceableOrderPoolCommand::CancelShareBundle(_) => None,
                     ReplaceableOrderPoolCommand::CancelBundle(_) => None,
                 };
                 let order_json = compress_data(&serde_json::to_vec(&raw_order)?);
@@ -504,9 +503,7 @@ fn order_type(command: &RawReplaceableOrderPoolCommand) -> &'static str {
         RawReplaceableOrderPoolCommand::Order(raw_order) => match raw_order {
             RawOrder::Bundle(_) => "bundle",
             RawOrder::Tx(_) => "tx",
-            RawOrder::ShareBundle(_) => "sbundle",
         },
-        RawReplaceableOrderPoolCommand::CancelShareBundle(_) => "cancel_sbundle",
         RawReplaceableOrderPoolCommand::CancelBundle(_) => "cancel_bundle",
     }
 }
@@ -572,6 +569,7 @@ fn group_rows_into_block_data(
                     ),
                     sealed_at: timestamp_ms_to_offset_datetime(sealed_at_ts_ms as u64),
                     profit,
+                    journal_metadata: None,
                 },
             ))
         })
@@ -631,11 +629,10 @@ fn group_rows_into_block_data(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum RawReplaceableOrderPoolCommand {
     /// New or update order
     Order(RawOrder),
-    /// Cancellation for sbundle
-    CancelShareBundle(CancelShareBundle),
     CancelBundle(BundleReplacementData),
 }
 
@@ -643,10 +640,7 @@ impl From<ReplaceableOrderPoolCommand> for RawReplaceableOrderPoolCommand {
     fn from(command: ReplaceableOrderPoolCommand) -> Self {
         match command {
             ReplaceableOrderPoolCommand::Order(order) => {
-                RawReplaceableOrderPoolCommand::Order(order.into())
-            }
-            ReplaceableOrderPoolCommand::CancelShareBundle(cancel_share_bundle) => {
-                RawReplaceableOrderPoolCommand::CancelShareBundle(cancel_share_bundle)
+                RawReplaceableOrderPoolCommand::Order((*order).clone().into())
             }
             ReplaceableOrderPoolCommand::CancelBundle(replacement_data) => {
                 RawReplaceableOrderPoolCommand::CancelBundle(replacement_data)
@@ -681,10 +675,7 @@ impl RawReplaceableOrderPoolCommandWithTimestamp {
             timestamp_ms: self.timestamp_ms,
             command: match self.command {
                 RawReplaceableOrderPoolCommand::Order(raw_order) => {
-                    ReplaceableOrderPoolCommand::Order(raw_order.decode(encoding)?)
-                }
-                RawReplaceableOrderPoolCommand::CancelShareBundle(cancel_share_bundle) => {
-                    ReplaceableOrderPoolCommand::CancelShareBundle(cancel_share_bundle)
+                    ReplaceableOrderPoolCommand::Order(Arc::new(raw_order.decode(encoding)?))
                 }
                 RawReplaceableOrderPoolCommand::CancelBundle(replacement_data) => {
                     ReplaceableOrderPoolCommand::CancelBundle(replacement_data)
@@ -698,17 +689,16 @@ impl RawReplaceableOrderPoolCommandWithTimestamp {
 mod test {
     use super::*;
     use crate::{
-        backtest::full_slot_block_data::FullSlotBlockData,
-        mev_boost::BuilderBlockReceived,
-        primitives::{
-            serialize::{RawBundle, RawTx},
-            BundleReplacementKey, ShareBundleReplacementKey, LAST_BUNDLE_VERSION,
-        },
+        backtest::full_slot_block_data::FullSlotBlockData, mev_boost::BuilderBlockReceived,
     };
     use alloy_consensus::{EthereumTxEnvelope, Signed, TxEip1559};
     use alloy_primitives::{address, hex, Address, Signature, B256, U256, U64};
     use alloy_rpc_types::{Block, BlockTransactions, Header, Transaction};
-    use reth_primitives::Recovered;
+    use rbuilder_primitives::{
+        serialize::{RawBundle, RawBundleMetadata, RawTx},
+        BundleReplacementKey, LAST_BUNDLE_VERSION,
+    };
+    use reth_primitives_traits::Recovered;
     use time::OffsetDateTime;
     use uuid::uuid;
 
@@ -734,23 +724,28 @@ mod test {
             RawReplaceableOrderPoolCommandWithTimestamp {
                 timestamp_ms: 11,
                 command: RawReplaceableOrderPoolCommand::Order(RawOrder::Bundle(RawBundle {
-                    block_number: Some(U64::from(12)),
                     txs: vec![tx.clone().into()],
-                    reverting_tx_hashes: vec![],
-                    replacement_uuid: Some(uuid::Uuid::from_u128(11)),
-                    signing_address: Some(alloy_primitives::address!(
-                        "0101010101010101010101010101010101010101"
-                    )),
-                    min_timestamp: None,
-                    max_timestamp: Some(100),
-                    replacement_nonce: Some(0),
-                    dropping_tx_hashes: vec![],
-                    uuid: None,
-                    refund_percent: None,
-                    refund_recipient: None,
-                    refund_tx_hashes: None,
-                    first_seen_at: None,
-                    version: Some(RawBundle::encode_version(LAST_BUNDLE_VERSION)),
+                    metadata: RawBundleMetadata {
+                        block_number: Some(U64::from(12)),
+                        reverting_tx_hashes: vec![],
+                        replacement_uuid: Some(uuid::Uuid::from_u128(11)),
+                        signing_address: Some(alloy_primitives::address!(
+                            "0101010101010101010101010101010101010101"
+                        )),
+                        min_timestamp: None,
+                        max_timestamp: Some(100),
+                        replacement_nonce: Some(0),
+                        dropping_tx_hashes: vec![],
+                        uuid: None,
+                        refund_percent: None,
+                        refund_recipient: None,
+                        refund_tx_hashes: None,
+                        delayed_refund: None,
+                        refund_identity: None,
+                        version: Some(RawBundle::encode_version(LAST_BUNDLE_VERSION)),
+                        bundle_hash: None,
+                        disable_cross_region_sharing: false,
+                    },
                 })),
             }
             .decode(TxEncoding::WithBlobData)
@@ -763,16 +758,6 @@ mod test {
                         Some(address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")),
                     ),
                     sequence_number: 876,
-                }),
-            },
-            ReplaceableOrderPoolCommandWithTimestamp {
-                timestamp_ms: 1234,
-                command: ReplaceableOrderPoolCommand::CancelShareBundle(CancelShareBundle {
-                    key: ShareBundleReplacementKey::new(
-                        uuid!("12345678-1234-1234-1234-123456789abc"),
-                        address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
-                    ),
-                    block: 12,
                 }),
             },
         ];
@@ -795,11 +780,14 @@ mod test {
         };
         let onchain_block = create_test_block();
         let built_block_data = BuiltBlockData {
-            included_orders: vec![OrderId::ShareBundle(B256::random())],
+            included_orders: vec![OrderId::Bundle(uuid!(
+                "12345678-1234-1234-1234-123456789abc"
+            ))],
             orders_closed_at: OffsetDateTime::from_unix_timestamp_nanos(1719845355111000000)
                 .unwrap(),
             sealed_at: OffsetDateTime::from_unix_timestamp_nanos(1719845355123000000).unwrap(),
             profit: I256::try_from(42).unwrap(),
+            journal_metadata: None,
         };
         let block_data = FullSlotBlockData::new(
             12,
@@ -868,6 +856,7 @@ mod test {
             block_number: Some(4),
             transaction_index: Some(5),
             effective_gas_price: Some(7),
+            block_timestamp: Some(8),
         }
     }
 }
