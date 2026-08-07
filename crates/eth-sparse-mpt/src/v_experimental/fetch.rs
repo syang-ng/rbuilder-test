@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use crate::{
-    utils::{convert_nibbles_to_reth_nybbles, convert_reth_nybbles_to_nibbles, HashMap},
-    SparseTrieError,
-};
+use crate::{utils::HashMap, SparseTrieError};
 use alloy_primitives::map::B256Set;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -12,7 +9,7 @@ use alloy_primitives::B256;
 use nybbles::Nibbles;
 use reth_provider::{
     providers::ConsistentDbView, BlockHashReader, BlockNumReader, BlockReader, DBProvider,
-    DatabaseProviderFactory,
+    DatabaseProviderFactory, StorageSettingsCache,
 };
 use reth_trie::{
     proof::{Proof, StorageProof},
@@ -39,12 +36,12 @@ impl MissingNodesFetcher {
             .storage_proof_targets
             .entry(*hashed_address)
             .or_default();
-        entry.0.insert(pad_path(node.clone()));
+        entry.0.insert(pad_path(node));
         entry.1.push(node);
     }
 
     pub fn add_missing_account_node(&mut self, node: Nibbles) {
-        self.account_proof_targets.push(pad_path(node.clone()));
+        self.account_proof_targets.push(pad_path(node));
         self.account_proof_requested_nodes.push(node);
     }
 
@@ -56,6 +53,7 @@ impl MissingNodesFetcher {
     ) -> Result<usize, SparseTrieError>
     where
         Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
+        <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
     {
         let fetched_nodes: Arc<Mutex<usize>> = Default::default();
 
@@ -79,27 +77,24 @@ impl MissingNodesFetcher {
                         }
                     }
 
-                    let proof = StorageProof::new_hashed(
-                        DatabaseTrieCursorFactory::new(provider.tx_ref()),
-                        DatabaseHashedCursorFactory::new(provider.tx_ref()),
-                        hashed_address,
-                    );
-                    let storge_multiproof = proof
+                    let storge_multiproof = reth_trie_db::with_adapter!(provider, |A| {
+                        StorageProof::new_hashed(
+                            DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref()),
+                            DatabaseHashedCursorFactory::new(provider.tx_ref()),
+                            hashed_address,
+                        )
                         .storage_multiproof(targets)
-                        .map_err(SparseTrieError::other)?;
+                    })
+                    .map_err(SparseTrieError::other)?;
                     *fetched_nodes.lock() += requested_proofs.len();
                     for requested_proof in requested_proofs {
-                        let proof_for_node = storge_multiproof.subtree.matching_nodes_sorted(
-                            &convert_nibbles_to_reth_nybbles(requested_proof.clone()),
-                        );
-                        let reth_proof_for_node = proof_for_node
-                            .into_iter()
-                            .map(|(k, v)| (convert_reth_nybbles_to_nibbles(k), v))
-                            .collect();
+                        let proof_for_node = storge_multiproof
+                            .subtree
+                            .matching_nodes_sorted(&requested_proof);
                         let proof_store =
                             shared_cache.account_proof_store_hashed_address(&hashed_address);
                         proof_store
-                            .add_proof(requested_proof, reth_proof_for_node)
+                            .add_proof(requested_proof, proof_for_node)
                             .map_err(SparseTrieError::other)?;
                     }
                     Ok(())
@@ -122,26 +117,25 @@ impl MissingNodesFetcher {
             }
         }
 
-        let proof = Proof::new(
-            DatabaseTrieCursorFactory::new(provider.tx_ref()),
-            DatabaseHashedCursorFactory::new(provider.tx_ref()),
-        );
         let targets = MultiProofTargets::accounts(std::mem::take(&mut self.account_proof_targets));
-        let multiproof = proof.multiproof(targets).map_err(SparseTrieError::other)?;
+        let multiproof = reth_trie_db::with_adapter!(provider, |A| {
+            Proof::new(
+                DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref()),
+                DatabaseHashedCursorFactory::new(provider.tx_ref()),
+            )
+            .multiproof(targets)
+        })
+        .map_err(SparseTrieError::other)?;
 
         *fetched_nodes.lock() += self.account_proof_requested_nodes.len();
         for requested_node in self.account_proof_requested_nodes.drain(..) {
             let proof_for_node = multiproof
                 .account_subtree
-                .matching_nodes_sorted(&convert_nibbles_to_reth_nybbles(requested_node.clone()));
+                .matching_nodes_sorted(&requested_node);
 
-            let reth_proof_for_node = proof_for_node
-                .into_iter()
-                .map(|(k, v)| (convert_reth_nybbles_to_nibbles(k), v))
-                .collect();
             shared_cache
                 .account_trie
-                .add_proof(requested_node, reth_proof_for_node)
+                .add_proof(requested_node, proof_for_node)
                 .map_err(SparseTrieError::other)?;
         }
         let fetched_nodes = *fetched_nodes.lock();
@@ -149,8 +143,9 @@ impl MissingNodesFetcher {
     }
 }
 
-fn pad_path(mut path: Nibbles) -> B256 {
-    path.as_mut_vec_unchecked().resize(64, 0);
+fn pad_path(path: Nibbles) -> B256 {
+    // `pack_to` writes left-aligned into the zeroed buffer, leaving trailing
+    // bytes zero, so explicit right-padding to 64 nibbles is unnecessary.
     let mut res = B256::default();
     path.pack_to(res.as_mut_slice());
     res

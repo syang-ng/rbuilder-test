@@ -12,7 +12,10 @@ mod test_data_generator;
 use alloy_consensus::Transaction as _;
 use alloy_eips::{
     eip2718::{Decodable2718, Eip2718Error, Encodable2718},
-    eip4844::{Blob, BlobTransactionSidecar, Bytes48, DATA_GAS_PER_BLOB},
+    eip4844::{
+        Blob, BlobTransactionSidecar, Bytes48, BYTES_PER_BLOB, BYTES_PER_COMMITMENT,
+        BYTES_PER_PROOF, DATA_GAS_PER_BLOB,
+    },
     eip7594::BlobTransactionSidecarVariant,
     Typed2718,
 };
@@ -21,12 +24,8 @@ use alloy_rlp::Encodable as _;
 use derivative::Derivative;
 use evm_inspector::UsedStateTrace;
 use integer_encoding::VarInt;
-use reth_ethereum_primitives::PooledTransactionVariant;
-use reth_primitives::{
-    kzg::{BYTES_PER_BLOB, BYTES_PER_COMMITMENT, BYTES_PER_PROOF},
-    Recovered, Transaction, TransactionSigned,
-};
-use reth_primitives_traits::{InMemorySize, SignedTransaction as _, SignerRecoverable};
+use reth_ethereum_primitives::{PooledTransactionVariant, Transaction, TransactionSigned};
+use reth_primitives_traits::{InMemorySize, Recovered, SignedTransaction as _, SignerRecoverable};
 use reth_transaction_pool::{
     BlobStore, BlobStoreError, EthPooledTransaction, Pool, TransactionOrdering, TransactionPool,
     TransactionValidator,
@@ -51,6 +50,8 @@ pub struct Metadata {
     pub is_system: bool,
     /// Order refund identity.
     pub refund_identity: Option<Address>,
+    /// `RawBundle` field, round-tripped through `Bundle`. Not consumed by rbuilder.
+    pub disable_cross_region_sharing: bool,
 }
 
 impl Default for Metadata {
@@ -71,6 +72,7 @@ impl Metadata {
             received_at_timestamp,
             is_system: false,
             refund_identity: None,
+            disable_cross_region_sharing: false,
         }
     }
 
@@ -95,13 +97,19 @@ impl Metadata {
     pub fn set_refund_identity(&mut self, refund_identity: Option<Address>) {
         self.refund_identity = refund_identity;
     }
+
+    pub fn with_disable_cross_region_sharing(mut self, disable_cross_region_sharing: bool) -> Self {
+        self.disable_cross_region_sharing = disable_cross_region_sharing;
+        self
+    }
 }
 
 impl InMemorySize for Metadata {
     fn size(&self) -> usize {
         mem::size_of::<time::OffsetDateTime>() + // received_at_timestamp
             mem::size_of::<Option<Address>>() + // refund_identity
-            mem::size_of::<bool>() // is_system
+            mem::size_of::<bool>() + // is_system
+            mem::size_of::<bool>() // disable_cross_region_sharing
     }
 }
 
@@ -1214,7 +1222,7 @@ mod tests {
     use super::*;
     use alloy_consensus::TxLegacy;
     use alloy_primitives::{fixed_bytes, Signature};
-    use reth_primitives::{Transaction, TransactionSigned};
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
     use uuid::uuid;
 
     #[test]

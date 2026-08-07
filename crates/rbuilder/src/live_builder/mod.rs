@@ -46,7 +46,8 @@ use reth::transaction_pool::{
     TransactionPool, TransactionValidator,
 };
 use reth_chainspec::ChainSpec;
-use reth_primitives::{Recovered, TransactionSigned};
+use reth_ethereum_primitives::TransactionSigned;
+use reth_primitives_traits::Recovered;
 use std::{
     cmp::min,
     fmt::Debug,
@@ -371,8 +372,8 @@ where
                 mev_blocker_price,
                 payload
                     .relay_registrations
-                    .iter()
-                    .filter_map(|(_, r)| r.adjustment_fee_payer)
+                    .values()
+                    .filter_map(|r| r.adjustment_fee_payer)
                     .collect(),
                 mempool_detector.clone(),
             ) {

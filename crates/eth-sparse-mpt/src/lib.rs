@@ -8,7 +8,9 @@
 
 use crate::utils::{HashMap, HashSet};
 use alloy_primitives::{Address, Bytes, B256};
-use reth_provider::{providers::ConsistentDbView, BlockReader, DatabaseProviderFactory};
+use reth_provider::{
+    providers::ConsistentDbView, BlockReader, DatabaseProviderFactory, StorageSettingsCache,
+};
 use revm::database::BundleState;
 use std::sync::Arc;
 
@@ -75,7 +77,7 @@ impl SparseTrieSharedCache {
             parent_state_root,
         );
         let mut cache_v2 = v2::SharedCacheV2::default();
-        cache_v2.last_block_hash = parent_block_hash;
+        cache_v2.parent_state_root = parent_state_root;
         let mut cache_v_experimental = v_experimental::SharedCacheVExperimental::default();
         cache_v_experimental.last_block_hash = parent_block_hash;
         Self {
@@ -107,6 +109,7 @@ pub fn prefetch_tries_for_accounts<'a, Provider>(
 ) -> Result<SparseTrieMetrics, SparseTrieError>
 where
     Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
 {
     match version {
         ETHSpareMPTVersion::V1 => {
@@ -166,6 +169,7 @@ pub fn calculate_account_proofs_with_sparse_trie<Provider>(
 )
 where
     Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
 {
     let calculate = || match version {
         ETHSpareMPTVersion::V1 => (
@@ -221,6 +225,7 @@ pub fn calculate_root_hash_with_sparse_trie<Provider>(
 ) -> (Result<B256, SparseTrieError>, SparseTrieMetrics)
 where
     Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
 {
     if let Some(thread_pool) = thread_pool {
         thread_pool.rayon_pool.install(|| {
@@ -255,6 +260,7 @@ pub fn calculate_root_hash_with_sparse_trie_internal<Provider>(
 ) -> (Result<B256, SparseTrieError>, SparseTrieMetrics)
 where
     Provider: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync,
+    <Provider as DatabaseProviderFactory>::Provider: StorageSettingsCache,
 {
     match version {
         ETHSpareMPTVersion::V1 => {

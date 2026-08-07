@@ -1,5 +1,6 @@
 use crate::{
     building::{
+        cached_reads::CachedDB,
         sim::{NonceKey, OrderSimResult, SimulatedResult},
         simulate_order, BlockState, ThreadBlockBuildingContext,
     },
@@ -27,7 +28,7 @@ pub fn run_sim_worker<P>(
 ) where
     P: StateProviderFactory,
 {
-    'main: loop {
+    loop {
         if global_cancellation.is_cancelled() {
             return;
         }
@@ -49,69 +50,89 @@ pub fn run_sim_worker<P>(
 
         let mut last_sim_finished = Instant::now();
 
+        // Open one state provider for the whole context and reuse it (and its shared read cache)
+        // across every order.
         let state_provider =
             match provider.history_by_block_hash(current_sim_context.block_ctx.attributes.parent) {
-                Ok(state_provider) => Arc::new(state_provider),
+                Ok(state_provider) => state_provider,
                 Err(err) => {
                     error!(?err, "Error while getting state for block");
-                    continue 'main;
+                    continue;
                 }
             };
-        while let Ok(task) = current_sim_context.requests.recv() {
-            let sim_thread_wait_time = last_sim_finished.elapsed();
-            let sim_start = Instant::now();
+        let mut cached = CachedDB::new(
+            state_provider,
+            current_sim_context.block_ctx.shared_cached_reads.clone(),
+        );
 
-            let order_id = task.order.id();
-            let start_time = Instant::now();
-            let mut block_state = BlockState::new_arc(state_provider.clone());
-            let sim_result = simulate_order(
-                task.parents.clone(),
-                task.order,
-                &current_sim_context.block_ctx,
-                &mut local_ctx,
-                &mut block_state,
-            );
-            let sim_ok = match sim_result {
-                Ok(sim_result) => {
-                    let sim_ok = match sim_result.result {
-                        OrderSimResult::Success(simulated_order, nonces_after) => {
-                            let result = SimulatedResult {
-                                id: task.id,
-                                simulated_order,
-                                previous_orders: task.parents,
-                                nonces_after: nonces_after
-                                    .into_iter()
-                                    .map(|(address, nonce)| NonceKey { address, nonce })
-                                    .collect(),
-                                simulation_time: start_time.elapsed(),
-                            };
-                            current_sim_context
-                                .results
-                                .try_send(result)
-                                .unwrap_or_default();
-                            true
-                        }
-                        OrderSimResult::Failed(_) => false,
-                    };
-                    telemetry::inc_simulated_orders(sim_ok);
-                    telemetry::inc_simulation_gas_used(sim_result.gas_used);
-                    sim_ok
-                }
-                Err(err) => {
-                    error!(?err, ?order_id, "Critical error while simulating order");
-                    // @Metric
-                    break;
-                }
-            };
+        while let Ok(cancellable_task) = current_sim_context.requests.recv() {
+            // Avoid starting sims when the output channel is closed.
+            if current_sim_context.results.is_closed() {
+                break;
+            }
+            if let Some(task) = cancellable_task.into_request() {
+                let sim_thread_wait_time = last_sim_finished.elapsed();
+                let sim_start = Instant::now();
 
-            mark_order_simulation_end(order_id, sim_ok);
-            last_sim_finished = Instant::now();
-            let sim_thread_work_time = sim_start.elapsed();
-            add_sim_thread_utilisation_timings(
-                sim_thread_work_time,
-                sim_thread_wait_time,
-                worker_id,
-            );
+                let order_id = task.order.id();
+                let start_time = Instant::now();
+                let mut block_state = BlockState::new(cached);
+                let sim_result = simulate_order(
+                    task.parents.clone(),
+                    task.order,
+                    &current_sim_context.block_ctx,
+                    &mut local_ctx,
+                    &mut block_state,
+                );
+                // Reclaim the cache (live provider + shared reads) for the next order.
+                cached = block_state.into_db();
+                let sim_ok = match sim_result {
+                    Ok(sim_result) => {
+                        let sim_ok = match sim_result.result {
+                            OrderSimResult::Success(simulated_order, nonces_after) => {
+                                let result = SimulatedResult {
+                                    id: task.id,
+                                    simulated_order,
+                                    previous_orders: task.parents,
+                                    nonces_after: nonces_after
+                                        .into_iter()
+                                        .map(|(address, nonce)| NonceKey { address, nonce })
+                                        .collect(),
+                                    simulation_time: start_time.elapsed(),
+                                };
+                                if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                                    current_sim_context.results.try_send(result)
+                                {
+                                    error!(
+                                        ?order_id,
+                                        "Simulation results channel is full, order dropped"
+                                    );
+                                }
+
+                                true
+                            }
+                            OrderSimResult::Failed(_) => false,
+                        };
+                        telemetry::inc_simulated_orders(sim_ok);
+                        telemetry::inc_simulation_gas_used(sim_result.gas_used);
+                        sim_ok
+                    }
+                    Err(err) => {
+                        error!(?err, ?order_id, "Critical error while simulating order");
+                        // @Metric
+                        break;
+                    }
+                };
+
+                mark_order_simulation_end(order_id, sim_ok);
+                last_sim_finished = Instant::now();
+                let sim_thread_work_time = sim_start.elapsed();
+                add_sim_thread_utilisation_timings(
+                    sim_thread_work_time,
+                    sim_thread_wait_time,
+                    worker_id,
+                );
+            }
         }
     }
 }

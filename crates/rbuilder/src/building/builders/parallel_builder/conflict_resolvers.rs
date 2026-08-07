@@ -5,7 +5,7 @@ use eyre::Result;
 use itertools::Itertools;
 use rand::{seq::SliceRandom, SeedableRng};
 use rayon::prelude::*;
-use reth::providers::StateProvider;
+use reth_errors::ProviderResult;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
@@ -17,9 +17,10 @@ use super::{
 };
 
 use crate::building::{
-    BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock,
-    ThreadBlockBuildingContext,
+    cached_reads::CachedDB, BlockBuildingContext, BlockState, ExecutionError, ExecutionResult,
+    PartialBlock, ThreadBlockBuildingContext,
 };
+use crate::provider::StateProviderSource;
 use rbuilder_primitives::{evm_inspector::UsedStateTrace, OrderId, SimulatedOrder};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,7 +86,7 @@ pub(crate) fn analyze_conflict_graph(orders: &[Arc<SimulatedOrder>]) -> Conflict
 #[derivative(Debug)]
 pub struct ResolverContext {
     #[derivative(Debug = "ignore")]
-    pub state: Arc<dyn StateProvider>,
+    pub source: StateProviderSource,
     pub ctx: BlockBuildingContext,
     pub cancellation_token: CancellationToken,
     pub simulation_cache: Arc<SharedSimulationCache>,
@@ -103,14 +104,14 @@ impl ResolverContext {
     /// * `cache` - Optional cached reads for optimization.
     /// * `simulation_cache` - Shared cache for simulation results.
     pub fn new(
-        state: Arc<dyn StateProvider>,
+        source: StateProviderSource,
         ctx: BlockBuildingContext,
         cancellation_token: CancellationToken,
         simulation_cache: Arc<SharedSimulationCache>,
         graph_study_collector: Option<Arc<parking_lot::Mutex<Vec<DefaultGraphStudyRecord>>>>,
     ) -> Self {
         ResolverContext {
-            state,
+            source,
             ctx,
             cancellation_token,
             simulation_cache,
@@ -185,11 +186,11 @@ impl ResolverContext {
         if sequence_to_try.len() <= 1 {
             for sequence_of_orders in sequence_to_try {
                 let (resolution_result, _state) =
-                    self.process_sequence_of_orders(sequence_of_orders, task, self.state.clone())?;
+                    self.process_sequence_of_orders(sequence_of_orders, task, self.source.clone())?;
                 self.update_best_result(resolution_result, &mut best_resolution_result);
             }
         } else {
-            let state = Arc::clone(&self.state);
+            let source = self.source.clone();
             let ctx = self.ctx.clone();
             let cancellation_token = self.cancellation_token.clone();
             let simulation_cache = Arc::clone(&self.simulation_cache);
@@ -198,7 +199,7 @@ impl ResolverContext {
                 .into_par_iter()
                 .map(|sequence_of_orders| {
                     let mut resolver_ctx = ResolverContext::new(
-                        Arc::clone(&state),
+                        source.clone(),
                         ctx.clone(),
                         cancellation_token.clone(),
                         Arc::clone(&simulation_cache),
@@ -208,7 +209,7 @@ impl ResolverContext {
                         .process_sequence_of_orders(
                             sequence_of_orders,
                             task,
-                            Arc::clone(&resolver_ctx.state),
+                            resolver_ctx.source.clone(),
                         )
                         .map(|(resolution_result, _state)| resolution_result)
                 })
@@ -251,7 +252,7 @@ impl ResolverContext {
             )?;
 
         let (resolution_result, _state) =
-            self.process_sequence_of_orders(sequence_of_orders, task, self.state.clone())?;
+            self.process_sequence_of_orders(sequence_of_orders, task, self.source.clone())?;
         candidate_sequence_count += 1;
         Ok((resolution_result, candidate_sequence_count))
     }
@@ -307,8 +308,8 @@ impl ResolverContext {
         &mut self,
         sequence_of_orders: Vec<usize>,
         task: &ConflictTask,
-        state_provider: Arc<dyn StateProvider>,
-    ) -> Result<(ResolutionResult, BlockState)> {
+        source: StateProviderSource,
+    ) -> Result<(ResolutionResult, BlockState<CachedDB>)> {
         // @todo actually reuse it for the duration of the block
         let mut local_ctx = ThreadBlockBuildingContext::default();
 
@@ -322,8 +323,8 @@ impl ResolverContext {
 
         // Initialize state and partial block
         let mut partial_block = PartialBlock::new(true);
-        let mut state = self.initialize_block_state(state_provider);
-        partial_block.pre_block_call(&self.ctx, &mut local_ctx, &mut state)?;
+        let mut state = self.initialize_block_state(source)?;
+        partial_block.pre_block_call(&self.ctx, &mut state)?;
 
         // Initialize sequenced_order_result
         let mut sequenced_order_result =
@@ -465,21 +466,27 @@ impl ResolverContext {
     }
 
     /// Initializes the block state, using a cached state if available.
-    fn initialize_block_state(&mut self, state_provider: Arc<dyn StateProvider>) -> BlockState {
-        BlockState::new_arc(state_provider)
+    fn initialize_block_state(
+        &mut self,
+        source: StateProviderSource,
+    ) -> ProviderResult<BlockState<CachedDB>> {
+        let cached = CachedDB::new(
+            source.state_provider()?,
+            self.ctx.shared_cached_reads.clone(),
+        );
+        Ok(BlockState::new(cached))
     }
 
     /// Stores the simulation state in the cache.
     fn store_simulation_state(
         &self,
         full_order_ids: &[OrderId],
-        state: &BlockState,
+        state: &BlockState<CachedDB>,
         total_profit: U256,
         per_order_profits: &[(OrderId, U256)],
     ) {
-        let (bundle_state, _) = state.clone().into_parts();
         let cached_simulation_state = CachedSimulationState {
-            bundle_state,
+            bundle_state: state.clone_bundle(),
             total_profit,
             per_order_profits: per_order_profits.to_owned(),
         };
@@ -1034,7 +1041,8 @@ mod tests {
     use alloy_consensus::TxLegacy;
     use alloy_primitives::{Address, TxHash, B256, U256};
     use reth::primitives::TransactionSigned;
-    use reth_primitives::{Recovered, Transaction};
+    use reth_ethereum_primitives::Transaction;
+    use reth_primitives_traits::Recovered;
     use uuid::Uuid;
 
     use super::*;

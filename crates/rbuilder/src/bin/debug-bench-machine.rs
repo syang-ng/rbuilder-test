@@ -11,8 +11,8 @@ use eyre::Context;
 use itertools::Itertools;
 use rbuilder::{
     building::{
-        BlockBuildingContext, BlockBuildingSpaceState, BlockState, FinalizeAdjustmentState,
-        PartialBlock, PartialBlockFork, ThreadBlockBuildingContext,
+        cached_reads::CachedDB, BlockBuildingContext, BlockBuildingSpaceState, BlockState,
+        FinalizeAdjustmentState, PartialBlock, PartialBlockFork, ThreadBlockBuildingContext,
     },
     live_builder::{cli::LiveBuilderConfig, config::Config},
     provider::StateProviderFactory,
@@ -24,7 +24,6 @@ use rbuilder::{
 use rbuilder_config::load_toml_config;
 use rbuilder_primitives::mev_boost::SubmitBlockRequest;
 use reth_primitives_traits::SignerRecoverable;
-use reth_provider::StateProvider;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 use tracing::{debug, info};
 
@@ -104,10 +103,9 @@ async fn main() -> eyre::Result<()> {
         mev_blocker_price,
     );
 
-    let state_provider = Arc::<dyn StateProvider>::from(
-        provider_factory
-            .provider_factory_unchecked()
-            .history_by_block_number(last_block)?,
+    let source = rbuilder::provider::StateProviderSource::new(
+        Arc::new(provider_factory.clone()),
+        parent_num_hash.hash,
     );
 
     let mut build_times_ms = Vec::new();
@@ -122,18 +120,20 @@ async fn main() -> eyre::Result<()> {
         .into_iter()
         .collect();
         let txs = txs.clone();
-        let state_provider = state_provider.clone();
+        let source = source.clone();
         let (build_time, finalize_time) =
             tokio::task::spawn_blocking(move || -> eyre::Result<_> {
                 let mut partial_block = PartialBlock::new(true);
-                let mut state = BlockState::new_arc(state_provider);
+                let cached =
+                    CachedDB::new(source.state_provider()?, ctx.shared_cached_reads.clone());
+                let mut state = BlockState::new(cached);
                 let mut local_ctx = ThreadBlockBuildingContext::default();
 
                 let mut finalize_adjustment_state = FinalizeAdjustmentState::default();
 
                 let build_time = Instant::now();
 
-                partial_block.pre_block_call(&ctx, &mut local_ctx, &mut state)?;
+                partial_block.pre_block_call(&ctx, &mut state)?;
 
                 let mut space_state = BlockBuildingSpaceState::ZERO;
                 for (idx, tx) in txs.into_iter().enumerate() {

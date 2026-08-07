@@ -4,13 +4,14 @@ use std::sync::{
 };
 
 use ahash::RandomState;
+use alloy_evm::Database;
 use alloy_primitives::{Address, B256, I256, U256};
 use dashmap::DashMap;
 use itertools::Itertools;
 use rbuilder_primitives::evm_inspector::UsedStateTrace;
 use result_store::{ActionResult, ExecutionResultStore, NextAction};
 use reth_errors::ProviderError;
-use revm::{context::result::ResultAndState, state::AccountInfo, Database};
+use revm::{context::result::ResultAndState, database::bal::EvmDatabaseError, state::AccountInfo};
 use tracing::info;
 
 use crate::utils::signed_uint_delta;
@@ -222,7 +223,7 @@ impl TxExecutionCache {
 
     pub fn get_cached_result(
         &self,
-        mut db: impl Database<Error = ProviderError>,
+        mut db: impl Database<Error = EvmDatabaseError<ProviderError>>,
         tx_hash: &B256,
         coinbase: &Address,
     ) -> Result<CachingResult, CriticalCommitOrderError> {

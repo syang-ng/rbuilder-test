@@ -1,13 +1,15 @@
 use crate::building::{
-    cached_reads::LocalCachedReads,
+    cached_reads::CachedDB,
     evm::EvmFactory,
     testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TestContracts, TxArgs},
     BlockState,
 };
+
 use alloy_primitives::Address;
 use rbuilder_primitives::evm_inspector::{RBuilderEVMInspector, UsedStateTrace};
+use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::Evm;
-use reth_primitives::{Recovered, TransactionSigned};
+use reth_primitives_traits::Recovered;
 
 #[derive(Debug)]
 pub struct TestSetup {
@@ -86,15 +88,17 @@ impl TestSetup {
     ) -> eyre::Result<UsedStateTrace> {
         let mut used_state_trace = UsedStateTrace::default();
         let mut inspector = RBuilderEVMInspector::new(&tx, Some(&mut used_state_trace));
-        let mut local_cached_reads = LocalCachedReads::default();
 
         // block state
-        let state_provider = self.test_chain.provider_factory().latest()?;
-        let mut block_state = BlockState::new(state_provider);
-        let mut db_ref = block_state.new_db_ref(
-            &self.test_chain.block_building_context().shared_cached_reads,
-            &mut local_cached_reads,
+        let cached = CachedDB::new(
+            self.test_chain.provider_factory().latest()?,
+            self.test_chain
+                .block_building_context()
+                .shared_cached_reads
+                .clone(),
         );
+        let mut block_state = BlockState::new(cached);
+        let mut db_ref = block_state.new_db_ref();
 
         // execute transaction
         {

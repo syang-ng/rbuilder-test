@@ -1,12 +1,14 @@
 use alloy_consensus::{Block, Header};
-use alloy_eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant};
+use alloy_eips::{
+    eip4844::{c_kzg::Blob, Blob as AlloyBlob, BlobTransactionSidecar},
+    eip7594::BlobTransactionSidecarVariant,
+};
 use alloy_primitives::U256;
 use alloy_rpc_types_beacon::relay::SubmitBlockRequest as AlloySubmitBlockRequest;
 use alloy_rpc_types_beacon::BlsPublicKey;
 use criterion::{criterion_group, Criterion};
 use rbuilder::mev_boost::{rpc::TestDataGenerator, sign_block_for_relay, BLSBlockSigner};
 use reth::primitives::SealedBlock;
-use reth_primitives::kzg::Blob;
 use ssz::Encode;
 use std::{fs, path::PathBuf, sync::Arc};
 
@@ -53,15 +55,16 @@ fn bench_mevboost_sign(c: &mut Criterion) {
     let json_value: serde_json::Value =
         serde_json::from_str(&json_content).expect("Failed to deserialize JSON");
 
-    // Extract blob data from JSON and convert it to Blob
-    let blobs: Vec<Blob> = vec![Blob::from_hex(
+    // Extract blob data from JSON and convert it to Blob.
+    let blob = Blob::from_hex(
         json_value
             .get("data")
             .unwrap()
             .as_str()
-            .expect("Data is not a valid string"),
+            .expect("Data is not valid string"),
     )
-    .unwrap()];
+    .unwrap();
+    let blobs: Vec<AlloyBlob> = vec![AlloyBlob::from_slice(blob.as_ref())];
 
     // Generate a BlobTransactionSidecar from the blobs
     let blob = BlobTransactionSidecar::try_from_blobs(blobs).unwrap();

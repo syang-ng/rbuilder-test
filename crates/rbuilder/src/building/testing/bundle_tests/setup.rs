@@ -3,7 +3,7 @@
 //! test setup creates fake state with various and block (configurable with BlockArgs)
 //! test setup is used to build orders and commit them
 use crate::building::{
-    cached_reads::{LocalCachedReads, SharedCachedReads},
+    cached_reads::{CachedDB, SharedCachedReads},
     testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
     BlockState, ExecutionError, ExecutionResult, NullPartialBlockExecutionTracer, OrderErr,
     PartialBlock, ThreadBlockBuildingContext,
@@ -14,7 +14,6 @@ use rbuilder_primitives::{
     order_builder::OrderBuilder, BundleRefund, BundleReplacementData, SimulatedOrder,
     TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
 };
-use reth_provider::StateProvider;
 use revm::database::states::BundleState;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -212,9 +211,8 @@ impl TestSetup {
             current_value,
         )
     }
+    #[allow(clippy::result_large_err)]
     fn try_commit_order(&mut self) -> eyre::Result<Result<ExecutionResult, ExecutionError>> {
-        let state_provider: Arc<dyn StateProvider> =
-            Arc::from(self.test_chain.provider_factory().latest()?);
         let mut local_ctx = ThreadBlockBuildingContext::default();
 
         let sim_order = SimulatedOrder::new(
@@ -229,8 +227,12 @@ impl TestSetup {
 
         let mut results = Vec::new();
         for _ in 0..2 {
-            let mut block_state = BlockState::new_arc(state_provider.clone())
-                .with_bundle_state(initial_bundle_state.clone());
+            let cached = CachedDB::new(
+                self.test_chain.provider_factory().latest()?,
+                Arc::new(SharedCachedReads::default()),
+            );
+            let mut block_state =
+                BlockState::new(cached).with_bundle_state(initial_bundle_state.clone());
 
             let mut partial_block = initial_partial_block.clone();
 
@@ -293,34 +295,26 @@ impl TestSetup {
         }
     }
 
+    fn make_block_state(&self) -> eyre::Result<BlockState<CachedDB>> {
+        let cached = CachedDB::new(
+            self.test_chain.provider_factory().latest()?,
+            Arc::new(SharedCachedReads::default()),
+        );
+        Ok(
+            BlockState::new(cached)
+                .with_bundle_state(self.bundle_state.clone().unwrap_or_default()),
+        )
+    }
+
     pub fn current_nonce(&self, named_addr: NamedAddr) -> eyre::Result<u64> {
-        let mut local_cached_reads = LocalCachedReads::default();
-        let shared_cached_reads = SharedCachedReads::default();
-
-        let state_provider = self.test_chain.provider_factory().latest()?;
-        let mut block_state = BlockState::new(state_provider)
-            .with_bundle_state(self.bundle_state.clone().unwrap_or_default());
-
-        Ok(block_state.nonce(
-            self.test_chain.named_address(named_addr)?,
-            &shared_cached_reads,
-            &mut local_cached_reads,
-        )?)
+        let mut block_state = self.make_block_state()?;
+        Ok(block_state.nonce(self.test_chain.named_address(named_addr)?)?)
     }
 
     pub fn balance(&self, named_addr: NamedAddr) -> eyre::Result<i128> {
-        let mut local_cached_reads = LocalCachedReads::default();
-        let shared_cached_reads = SharedCachedReads::default();
-
-        let state_provider = self.test_chain.provider_factory().latest()?;
-        let mut block_state = BlockState::new(state_provider)
-            .with_bundle_state(self.bundle_state.clone().unwrap_or_default());
+        let mut block_state = self.make_block_state()?;
         Ok(block_state
-            .balance(
-                self.test_chain.named_address(named_addr)?,
-                &shared_cached_reads,
-                &mut local_cached_reads,
-            )?
+            .balance(self.test_chain.named_address(named_addr)?)?
             .to())
     }
 

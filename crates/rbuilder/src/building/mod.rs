@@ -28,11 +28,12 @@ use alloy_eips::{
     eip7840::BlobParams,
     merge::BEACON_NONCE,
 };
-use alloy_evm::{block::system_calls::SystemCaller, env::EvmEnv, eth::eip6110};
+use alloy_evm::{block::system_calls::SystemCaller, env::EvmEnv, eth::eip6110, Database};
 use alloy_primitives::{Address, BlockNumber, Bytes, B256, I256, U256};
 use alloy_rlp::Encodable as _;
 use alloy_rpc_types_beacon::events::PayloadAttributesEvent;
-use cached_reads::{LocalCachedReads, SharedCachedReads};
+use alloy_rpc_types_engine::PayloadAttributes;
+use cached_reads::SharedCachedReads;
 use derive_more::Deref;
 use eth_sparse_mpt::SparseTrieLocalCache;
 use evm::EthCachedEvmFactory;
@@ -42,20 +43,16 @@ use rbuilder_primitives::{
     mev_boost::BidAdjustmentDataV3, BlockSpace, Order, SimValue, SimulatedOrder,
     TransactionSignedEcRecoveredWithBlobs,
 };
-use reth::{
-    payload::PayloadId,
-    primitives::{Block, SealedBlock},
-};
+use reth::payload::PayloadId;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_errors::{BlockExecutionError, BlockValidationError, ProviderError};
+use reth_ethereum_primitives::{Block, BlockBody};
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_evm_ethereum::{revm_spec_by_timestamp_and_block_number, EthEvmConfig};
-use reth_node_api::{EngineApiMessageVersion, PayloadBuilderAttributes};
-use reth_payload_builder::EthPayloadBuilderAttributes;
-use reth_primitives::BlockBody;
-use reth_primitives_traits::{proofs, Block as _};
+use reth_primitives_traits::{proofs, Block as _, SealedBlock};
 use revm::{
-    context_interface::result::InvalidTransaction, database::states::bundle_state::BundleRetention,
+    context_interface::result::InvalidTransaction,
+    database::{states::bundle_state::BundleRetention, DatabaseCommitExt as _},
     primitives::hardfork::SpecId,
 };
 use serde::Deserialize;
@@ -100,6 +97,44 @@ pub use conflict::*;
 
 /// Estimated overhead for the whole block header rlp length
 const BLOCK_HEADER_RLP_OVERHEAD: usize = 1024;
+
+#[derive(Debug, Clone)]
+pub struct EthPayloadBuilderAttributes {
+    pub id: PayloadId,
+    pub parent: B256,
+    pub payload_attributes: PayloadAttributes,
+}
+
+impl EthPayloadBuilderAttributes {
+    pub fn timestamp(&self) -> u64 {
+        self.payload_attributes.timestamp
+    }
+
+    pub fn suggested_fee_recipient(&self) -> Address {
+        self.payload_attributes.suggested_fee_recipient
+    }
+
+    pub fn prev_randao(&self) -> B256 {
+        self.payload_attributes.prev_randao
+    }
+
+    pub fn parent_beacon_block_root(&self) -> Option<B256> {
+        self.payload_attributes.parent_beacon_block_root
+    }
+
+    pub fn withdrawals(&self) -> Withdrawals {
+        Withdrawals::new(
+            self.payload_attributes
+                .withdrawals
+                .clone()
+                .unwrap_or_default(),
+        )
+    }
+
+    pub fn slot_number(&self) -> Option<u64> {
+        self.payload_attributes.slot_number
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct BlockBuildingContext {
@@ -150,12 +185,12 @@ impl BlockBuildingContext {
         adjustment_fee_payers: ahash::HashSet<Address>,
         mempool_tx_detector: Arc<MempoolTxsDetector>,
     ) -> Option<BlockBuildingContext> {
-        let attributes = EthPayloadBuilderAttributes::try_new(
-            attributes.data.parent_block_hash,
-            attributes.data.payload_attributes.clone(),
-            EngineApiMessageVersion::default() as u8,
-        )
-        .expect("PayloadBuilderAttributes::try_new");
+        let payload_attributes = attributes.data.payload_attributes.clone();
+        let attributes = EthPayloadBuilderAttributes {
+            id: PayloadId::new([0u8; 8]),
+            parent: attributes.data.parent_block_hash,
+            payload_attributes,
+        };
         let eth_evm_config = EthEvmConfig::new(chain_spec.clone());
         let gas_limit = calculate_block_gas_limit(
             parent.gas_limit,
@@ -171,19 +206,21 @@ impl BlockBuildingContext {
                     suggested_fee_recipient: attributes.suggested_fee_recipient(),
                     prev_randao: attributes.prev_randao(),
                     gas_limit,
-                    withdrawals: Some(attributes.withdrawals.clone()),
-                    parent_beacon_block_root: attributes.parent_beacon_block_root,
+                    withdrawals: Some(attributes.withdrawals()),
+                    parent_beacon_block_root: attributes.parent_beacon_block_root(),
+                    extra_data: extra_data.clone().into(),
+                    slot_number: attributes.slot_number(),
                 },
             )
             .ok()?;
         evm_env.cfg_env.tx_chain_id_check = true;
         evm_env.block_env.beneficiary = signer.address;
 
-        let excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp) {
+        let excess_blob_gas = if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp()) {
             if chain_spec.is_cancun_active_at_timestamp(parent.timestamp) {
                 parent.next_block_excess_blob_gas(
                     chain_spec
-                        .blob_params_at_timestamp(attributes.timestamp)
+                        .blob_params_at_timestamp(attributes.timestamp())
                         .unwrap_or(BlobParams::cancun()),
                 )
             } else {
@@ -270,11 +307,14 @@ impl BlockBuildingContext {
         let attributes = EthPayloadBuilderAttributes {
             id: PayloadId::new([0u8; 8]),
             parent: onchain_block.header.parent_hash,
-            timestamp: timestamp_as_u64(&onchain_block),
-            suggested_fee_recipient,
-            prev_randao: onchain_block.header.mix_hash,
-            withdrawals,
-            parent_beacon_block_root: onchain_block.header.parent_beacon_block_root,
+            payload_attributes: PayloadAttributes {
+                timestamp: timestamp_as_u64(&onchain_block),
+                prev_randao: onchain_block.header.mix_hash,
+                suggested_fee_recipient,
+                withdrawals: Some(withdrawals.into_inner()),
+                parent_beacon_block_root: onchain_block.header.parent_beacon_block_root,
+                slot_number: onchain_block.header.slot_number,
+            },
         };
         let spec_id = spec_id.unwrap_or_else(|| {
             // we use current block data instead of the parent block data to determine fork
@@ -332,12 +372,12 @@ impl BlockBuildingContext {
     }
 
     pub fn timestamp(&self) -> OffsetDateTime {
-        OffsetDateTime::from_unix_timestamp(self.attributes.timestamp as i64)
+        OffsetDateTime::from_unix_timestamp(self.attributes.timestamp() as i64)
             .expect("Payload attributes timestamp")
     }
 
     pub fn timestamp_u64(&self) -> u64 {
-        self.attributes.timestamp
+        self.attributes.timestamp()
     }
 
     pub fn block(&self) -> u64 {
@@ -353,7 +393,6 @@ impl BlockBuildingContext {
 /// Caches shared between threads should go to BlockBuildingContext.
 #[derive(Debug, Clone, Default)]
 pub struct ThreadBlockBuildingContext {
-    pub cached_reads: LocalCachedReads,
     pub bloom_cache: ReceiptsDataCache,
     pub tx_root_cache: TransactionRootCache,
     pub root_hash_calculator: SparseTrieLocalCache,
@@ -609,7 +648,7 @@ impl ExecutionError {
 
 pub struct FinalizeResult {
     /// Sealed block.
-    pub sealed_block: SealedBlock,
+    pub sealed_block: SealedBlock<Block>,
     // sidecars for all txs in SealedBlock
     pub txs_blob_sidecars: Vec<Arc<BlobTransactionSidecarVariant>>,
     /// The Pectra execution requests for this bid.
@@ -693,14 +732,17 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         self.space_state.free_reserved_block_space();
     }
 
-    pub fn commit_order(
+    pub fn commit_order<DB>(
         &mut self,
         order: &SimulatedOrder,
         ctx: &BlockBuildingContext,
         local_ctx: &mut ThreadBlockBuildingContext,
-        state: &mut BlockState,
+        state: &mut BlockState<DB>,
         result_filter: &dyn Fn(&SimValue) -> Result<(), ExecutionError>,
-    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
+    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError>
+    where
+        DB: Database<Error = ProviderError>,
+    {
         self.partial_block_execution_tracer
             .update_commit_order_about_to_execute(order);
         let res = self.commit_order_inner(order, ctx, local_ctx, state, result_filter);
@@ -712,14 +754,17 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
     /// result_filter: little hack to allow "cancel" the execution depending no the SimValue result. Ideally it would be nicer to split commit_order
     ///     in 2 parts, one that executes but does not apply (returns state changes) and then another one that applies the changes.
     ///     You can always pass &|_| Ok(()) if you don't need the filter.
-    fn commit_order_inner(
+    fn commit_order_inner<DB>(
         &mut self,
         order: &SimulatedOrder,
         ctx: &BlockBuildingContext,
         local_ctx: &mut ThreadBlockBuildingContext,
-        state: &mut BlockState,
+        state: &mut BlockState<DB>,
         result_filter: &dyn Fn(&SimValue) -> Result<(), ExecutionError>,
-    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
+    ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError>
+    where
+        DB: Database<Error = ProviderError>,
+    {
         let mut fork = PartialBlockFork::new_with_execution_tracer(
             state,
             ctx,
@@ -802,24 +847,23 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
     /// Inserts payout tx to ctx.attributes.suggested_fee_recipient (should be called at the end of the block)
     /// Returns the paid value (block profit after subtracting the burned basefee of the payout tx)
     #[allow(clippy::too_many_arguments)]
-    pub fn insert_refunds_and_proposer_payout_tx(
+    pub fn insert_refunds_and_proposer_payout_tx<DB>(
         &mut self,
         gas_limit: u64,
         value: U256,
         ctx: &BlockBuildingContext,
         local_ctx: &mut ThreadBlockBuildingContext,
-        state: &mut BlockState,
+        state: &mut BlockState<DB>,
         adjust_finalized_block: bool,
         finalize_revert_state: &mut FinalizeRevertStateCurrentIteration,
-    ) -> Result<(), InsertPayoutTxErr> {
+    ) -> Result<(), InsertPayoutTxErr>
+    where
+        DB: Database<Error = ProviderError>,
+    {
         let builder_signer = &ctx.builder_signer;
         self.free_reserved_block_space();
         let mut nonce = state
-            .nonce(
-                builder_signer.address,
-                &ctx.shared_cached_reads,
-                &mut local_ctx.cached_reads,
-            )
+            .nonce(builder_signer.address)
             .map_err(CriticalCommitOrderError::Reth)?;
 
         let mut fork = PartialBlockFork::new(state, ctx, local_ctx).with_tracer(&mut self.tracer);
@@ -828,11 +872,7 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
             for (refund_recipient, refund_amount) in &self.combined_refunds {
                 let refund_recipient_code_hash = fork
                     .state
-                    .code_hash(
-                        *refund_recipient,
-                        &ctx.shared_cached_reads,
-                        &mut fork.local_ctx.cached_reads,
-                    )
+                    .code_hash(*refund_recipient)
                     .map_err(CriticalCommitOrderError::Reth)?;
                 if refund_recipient_code_hash != KECCAK_EMPTY {
                     error!(%refund_recipient_code_hash, %refund_recipient, %refund_amount, "Refund recipient has code, skipping refund");
@@ -867,7 +907,7 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
             ctx.evm_env.block_env.basefee,
             builder_signer,
             nonce,
-            ctx.attributes.suggested_fee_recipient,
+            ctx.attributes.suggested_fee_recipient(),
             gas_limit,
             value,
         )?;
@@ -887,10 +927,10 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         Ok(())
     }
 
-    pub fn adjust_finalize_block_revert_to_prefinalized_state(
+    pub fn adjust_finalize_block_revert_to_prefinalized_state<DB>(
         &mut self,
         finalize_revert_state: FinalizeRevertStateCurrentIteration,
-        block_state: &mut BlockState,
+        block_state: &mut BlockState<DB>,
     ) {
         self.space_state
             .free_used_state(finalize_revert_state.last_tx_block_space);
@@ -901,14 +941,16 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
     }
 
     /// returns (requests, withdrawals_root)
-    pub fn process_requests(
+    pub fn process_requests<DB>(
         &self,
-        state: &mut BlockState,
+        state: &mut BlockState<DB>,
         ctx: &BlockBuildingContext,
-        local_ctx: &mut ThreadBlockBuildingContext,
         finalize_revert_state: &mut FinalizeRevertStateCurrentIteration,
-    ) -> Result<(Option<Requests>, Option<B256>), FinalizeError> {
-        let mut db = state.new_db_ref(&ctx.shared_cached_reads, &mut local_ctx.cached_reads);
+    ) -> Result<(Option<Requests>, Option<B256>), FinalizeError>
+    where
+        DB: Database<Error = ProviderError>,
+    {
+        let mut db = state.new_db_ref();
 
         // Apply and gather execution requests
         let requests = if ctx
@@ -939,10 +981,11 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         // Apply withdrawals
         let withdrawals_root = if ctx
             .chain_spec
-            .is_shanghai_active_at_timestamp(ctx.attributes.timestamp)
+            .is_shanghai_active_at_timestamp(ctx.attributes.timestamp())
         {
+            let withdrawals = ctx.attributes.withdrawals();
             let mut balance_increments = HashMap::<Address, u128>::default();
-            for withdrawal in &ctx.attributes.withdrawals {
+            for withdrawal in &withdrawals {
                 if withdrawal.amount > 0 {
                     *balance_increments.entry(withdrawal.address).or_default() +=
                         withdrawal.amount_wei().to::<u128>();
@@ -953,9 +996,7 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
                 .map_err(|_| {
                     BlockExecutionError::Validation(BlockValidationError::IncrementBalanceFailed)
                 })?;
-            Some(proofs::calculate_withdrawals_root(
-                &ctx.attributes.withdrawals,
-            ))
+            Some(proofs::calculate_withdrawals_root(&withdrawals))
         } else {
             None
         };
@@ -968,23 +1009,22 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
     }
 
     /// Mostly based on reth's (v1.2) default_ethereum_payload_builder.
-    pub fn finalize(
+    pub fn finalize<DB>(
         &mut self,
-        state: &mut BlockState,
+        state: &mut BlockState<DB>,
         ctx: &BlockBuildingContext,
         local_ctx: &mut ThreadBlockBuildingContext,
         adjust_finalize_block: bool,
         finalize_adjustment_state: &mut FinalizeAdjustmentState,
-    ) -> Result<FinalizeResult, FinalizeError> {
+    ) -> Result<FinalizeResult, FinalizeError>
+    where
+        DB: Database<Error = ProviderError>,
+    {
         let start = Instant::now();
 
         let step_start = Instant::now();
-        let (requests, withdrawals_root) = self.process_requests(
-            state,
-            ctx,
-            local_ctx,
-            &mut finalize_adjustment_state.revert_state,
-        )?;
+        let (requests, withdrawals_root) =
+            self.process_requests(state, ctx, &mut finalize_adjustment_state.revert_state)?;
         let block_number = ctx.block();
 
         let request_processsing_time_ms = elapsed_ms(step_start);
@@ -1055,12 +1095,12 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         let mut txs_blob_sidecars: Vec<Arc<BlobTransactionSidecarVariant>> = Vec::new();
         let (excess_blob_gas, blob_gas_used) = if ctx
             .chain_spec
-            .is_cancun_active_at_timestamp(ctx.attributes.timestamp)
+            .is_cancun_active_at_timestamp(ctx.attributes.timestamp())
         {
             // We should NEVER get the wrong sidecar types but we double check here just in case....
             let valid_blobs_count = if ctx
                 .chain_spec
-                .is_osaka_active_at_timestamp(ctx.attributes.timestamp)
+                .is_osaka_active_at_timestamp(ctx.attributes.timestamp())
             {
                 |side_car: &BlobTransactionSidecarVariant| {
                     side_car.as_eip7594().map_or(0, |sc| sc.blobs.len())
@@ -1092,8 +1132,8 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
             receipts_root,
             withdrawals_root,
             logs_bloom,
-            timestamp: ctx.attributes.timestamp,
-            mix_hash: ctx.attributes.prev_randao,
+            timestamp: ctx.attributes.timestamp(),
+            mix_hash: ctx.attributes.prev_randao(),
             nonce: BEACON_NONCE.into(),
             base_fee_per_gas: Some(ctx.evm_env.block_env.basefee),
             number: block_number,
@@ -1101,16 +1141,18 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
             difficulty: U256::ZERO,
             gas_used: self.space_state.gas_used(),
             extra_data: ctx.extra_data.clone().into(),
-            parent_beacon_block_root: ctx.attributes.parent_beacon_block_root,
+            parent_beacon_block_root: ctx.attributes.parent_beacon_block_root(),
             blob_gas_used,
             excess_blob_gas,
             requests_hash,
+            block_access_list_hash: None,
+            slot_number: ctx.attributes.slot_number(),
         };
 
         let withdrawals = ctx
             .chain_spec
-            .is_shanghai_active_at_timestamp(ctx.attributes.timestamp)
-            .then(|| ctx.attributes.withdrawals.clone());
+            .is_shanghai_active_at_timestamp(ctx.attributes.timestamp())
+            .then(|| ctx.attributes.withdrawals());
 
         // seal the block
         let block = Block {
@@ -1198,20 +1240,22 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
     }
 
     /// Standard pre block ETH stuff + space allocation for rlp length
-    pub fn pre_block_call(
+    pub fn pre_block_call<DB>(
         &mut self,
         ctx: &BlockBuildingContext,
-        local_ctx: &mut ThreadBlockBuildingContext,
-        state: &mut BlockState,
-    ) -> eyre::Result<()> {
+        state: &mut BlockState<DB>,
+    ) -> eyre::Result<()>
+    where
+        DB: Database<Error = ProviderError>,
+    {
         // We "pre-use" the RLP overhead for the withdrawals and the block header.
         self.space_state.use_space(BlockSpace::new(
             0,
-            ctx.attributes.withdrawals.length() + BLOCK_HEADER_RLP_OVERHEAD,
+            ctx.attributes.withdrawals().length() + BLOCK_HEADER_RLP_OVERHEAD,
             0,
         ));
 
-        let mut db = state.new_db_ref(&ctx.shared_cached_reads, &mut local_ctx.cached_reads);
+        let mut db = state.new_db_ref();
         let mut system_caller = SystemCaller::new(ctx.chain_spec.clone());
         let mut evm = EthEvmConfig::new(ctx.chain_spec.clone())
             .evm_with_env(db.as_mut(), ctx.evm_env.clone());

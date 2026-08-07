@@ -4,7 +4,7 @@ pub mod simulation_job_tracer;
 
 use crate::{
     building::{
-        sim::{SimTree, SimulatedResult, SimulationRequest},
+        sim::{CancellableSimulationRequest, SimTree, SimulatedResult},
         tx_sim_cache::TxExecutionCache,
         BlockBuildingContext,
     },
@@ -36,8 +36,9 @@ type BlockContextId = u64;
 pub struct SimulationContext {
     pub block_ctx: BlockBuildingContext,
     /// Simulation requests come in through this channel.
-    pub requests: flume::Receiver<SimulationRequest>,
+    pub requests: flume::Receiver<CancellableSimulationRequest>,
     /// Simulation results go out through this channel.
+    /// This is also implicitly used as a cancellation token. If this is closed there is no need to simulate anymore.
     pub results: mpsc::Sender<SimulatedResult>,
 }
 
@@ -150,7 +151,7 @@ where
                             return;
                         }
                     };
-                    NonceCache::new(state.into())
+                    NonceCache::new(state)
                 };
 
                 let sim_tree = SimTree::new(nonces);
