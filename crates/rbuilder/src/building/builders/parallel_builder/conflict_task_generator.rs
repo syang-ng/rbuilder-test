@@ -533,7 +533,7 @@ pub fn get_default_tasks_for_group(group: &ConflictGroup, priority: TaskPriority
 
         // println!("generating random sample for group {} {}", percentage, percentage_contracts);
         let new_group = match selected_orders.len() {
-            len if len <= 8 => ConflictGroup {
+            len if len < 8 => ConflictGroup {
                 id: group.id,
                 orders: Arc::new(selected_orders),
                 conflicting_group_ids: group.conflicting_group_ids.clone(),
