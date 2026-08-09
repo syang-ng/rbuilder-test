@@ -7,7 +7,7 @@
 //! backtest-build-block --config /home/happy_programmer/config.toml --builders mgp-ordering --builders mp-ordering 19380913 --show-orders --show-missing
 
 use ahash::HashMap;
-use alloy_primitives::utils::format_ether;
+use alloy_primitives::{utils::format_ether, BlockHash};
 use rbuilder_config::load_toml_config;
 use rbuilder_primitives::OrderId;
 use reth_db::DatabaseEnv;
@@ -123,11 +123,17 @@ impl<ConfigType: LiveBuilderConfig>
         self.config.base_config().create_reth_provider_factory(true)
     }
 
-    fn create_block_building_context(&self) -> eyre::Result<BlockBuildingContext> {
+    fn parent_hash(&self) -> BlockHash {
+        self.block_data.onchain_block.header.parent_hash
+    }
+
+    fn create_block_building_context(
+        &self,
+        provider: Arc<dyn StateProviderFactory>,
+    ) -> eyre::Result<BlockBuildingContext> {
         let signer = self.config.base_config().coinbase_signer()?;
-        let state_provider = self
-            .create_provider_factory()?
-            .history_by_block_hash(self.block_data.onchain_block.header.parent_hash)?;
+        let state_provider =
+            provider.history_by_block_hash(self.block_data.onchain_block.header.parent_hash)?;
         let mev_blocker_price = get_mevblocker_price(state_provider)?;
         Ok(BlockBuildingContext::from_onchain_block(
             self.block_data.onchain_block.clone(),
@@ -143,10 +149,7 @@ impl<ConfigType: LiveBuilderConfig>
         ))
     }
 
-    fn print_custom_stats(
-        &self,
-        provider: ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
-    ) -> eyre::Result<()> {
+    fn print_custom_stats(&self, provider: Arc<dyn StateProviderFactory>) -> eyre::Result<()> {
         if self.sim_landed_block {
             let tx_sim_results = sim_historical_block(
                 provider,

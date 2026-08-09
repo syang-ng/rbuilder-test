@@ -1,7 +1,11 @@
 use crate::{
     building::{builders::mock_block_building_helper::MockRootHasher, ThreadBlockBuildingContext},
     live_builder::simulation::SimulatedOrderCommand,
-    provider::{RootHasher, StateProviderFactory},
+    provider::{
+        record_provider_consistency_check, record_provider_health_scan,
+        state_provider_factory_from_provider_factory::StateProviderFactoryFromProviderFactory,
+        RootHasher, StateProviderFactory,
+    },
     roothash::{
         calculate_account_proofs, calculate_state_root, run_trie_prefetcher, RootHashContext,
         RootHashError,
@@ -130,6 +134,7 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> ProviderFactoryReopener<N> 
         let Some(reopen_paths) = &self.reopen_paths else {
             return Ok(self.provider_factory_unchecked());
         };
+        record_provider_consistency_check();
 
         let best_block_number = self
             .provider_factory_unchecked()
@@ -138,7 +143,7 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> ProviderFactoryReopener<N> 
         let mut provider_factory = self.provider_factory.lock();
 
         match check_block_hash_reader_health(best_block_number, provider_factory.deref_mut()) {
-            Ok(()) => {}
+            Ok(()) => return Ok(provider_factory.clone()),
             Err(err) => {
                 debug!(?err, "Provider factory is inconsistent, reopening");
                 inc_provider_reopen_counter();
@@ -265,6 +270,7 @@ pub fn check_block_hash_reader_health<R: BlockHashReader>(
     last_block_number: u64,
     reader: &R,
 ) -> Result<(), HistoricalBlockError> {
+    record_provider_health_scan();
     // evm must have access to block hashes of 256 of the previous blocks
     let blocks_to_check = last_block_number.min(256);
     for i in 0..blocks_to_check {
@@ -286,6 +292,18 @@ impl<N: NodeTypesWithDB + ProviderNodeTypes + Clone> StateProviderFactory
 where
     N::Primitives: NodePrimitives<BlockHeader = Header>,
 {
+    fn prepare_for_parent(
+        &self,
+        _parent_hash: BlockHash,
+    ) -> ProviderResult<Option<Arc<dyn StateProviderFactory>>> {
+        let provider = self
+            .check_consistency_and_reopen_if_needed()
+            .map_err(|e| ProviderError::Database(DatabaseError::Other(e.to_string())))?;
+        Ok(Some(Arc::new(
+            StateProviderFactoryFromProviderFactory::new(provider, self.root_hash_config.clone()),
+        )))
+    }
+
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         let provider = self
             .check_consistency_and_reopen_if_needed()

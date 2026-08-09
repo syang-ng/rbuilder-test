@@ -32,7 +32,8 @@ pub struct ConflictResolvingPool<P> {
     group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
     cancellation_token: CancellationToken,
     ctx: BlockBuildingContext,
-    provider: P,
+    _provider: P,
+    source: StateProviderSource,
     simulation_cache: Arc<SharedSimulationCache>,
     num_threads: usize,
     safe_sorting_only: bool,
@@ -51,6 +52,7 @@ where
         cancellation_token: CancellationToken,
         ctx: BlockBuildingContext,
         provider: P,
+        source: StateProviderSource,
         simulation_cache: Arc<SharedSimulationCache>,
     ) -> Self {
         Self {
@@ -59,22 +61,21 @@ where
             safe_sorting_only,
             cancellation_token,
             ctx,
-            provider,
+            _provider: provider,
+            source,
             simulation_cache,
             num_threads,
         }
     }
 
     pub fn start(&self) -> eyre::Result<()> {
-        let source =
-            StateProviderSource::new(Arc::new(self.provider.clone()), self.ctx.attributes.parent);
         for _ in 0..self.num_threads {
             let task_queue = self.task_queue.clone();
             let cancellation_token = self.cancellation_token.clone();
             let group_result_sender = self.group_result_sender.clone();
             let simulation_cache = self.simulation_cache.clone();
             let ctx = self.ctx.clone();
-            let source = source.clone();
+            let source = self.source.clone();
             thread::spawn(move || {
                 while !cancellation_token.is_cancelled() {
                     if let Some(task) = task_queue.pop() {
@@ -164,21 +165,17 @@ where
     pub fn process_groups_backtest(
         &mut self,
         new_groups: Vec<ConflictGroup>,
-        ctx: &BlockBuildingContext,
-        source: StateProviderSource,
-        simulation_cache: Arc<SharedSimulationCache>,
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut results = Vec::new();
         for new_group in new_groups {
             let tasks = get_tasks_for_group(&new_group, TaskPriority::High, self.safe_sorting_only);
             for task in tasks {
-                let simulation_cache = Arc::clone(&simulation_cache);
                 let result = Self::process_task(
                     task,
-                    ctx,
-                    source.clone(),
+                    &self.ctx,
+                    self.source.clone(),
                     CancellationToken::new(),
-                    simulation_cache,
+                    Arc::clone(&self.simulation_cache),
                     None,
                 );
                 if let Ok(result) = result {
@@ -192,9 +189,6 @@ where
     pub fn process_groups_default_backtest(
         &mut self,
         new_groups: Vec<ConflictGroup>,
-        ctx: &BlockBuildingContext,
-        source: StateProviderSource,
-        simulation_cache: Arc<SharedSimulationCache>,
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
         let graph_study_collector = current_default_graph_study_collector();
         let mut results = Vec::new();
@@ -203,10 +197,10 @@ where
             for task in tasks {
                 let result = Self::process_task(
                     task,
-                    ctx,
-                    source.clone(),
+                    &self.ctx,
+                    self.source.clone(),
                     CancellationToken::new(),
-                    Arc::clone(&simulation_cache),
+                    Arc::clone(&self.simulation_cache),
                     graph_study_collector.clone(),
                 );
                 if let Ok(result) = result {

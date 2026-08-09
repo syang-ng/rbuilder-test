@@ -180,7 +180,8 @@ mod tests {
         LAST_BUNDLE_VERSION,
     };
     use reth::primitives::TransactionSigned;
-    use reth_primitives::{Recovered, Transaction};
+    use reth_ethereum_primitives::Transaction;
+    use reth_primitives_traits::Recovered;
     use uuid::Uuid;
 
     use super::*;

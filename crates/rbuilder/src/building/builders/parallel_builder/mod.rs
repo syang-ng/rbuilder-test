@@ -109,6 +109,11 @@ where
             group_result_sender_for_task_generator,
         );
 
+        let source = StateProviderSource::new_prepared(
+            Arc::new(input.provider.clone()),
+            input.ctx.attributes.parent,
+        )?;
+
         let conflict_resolving_pool = ConflictResolvingPool::new(
             config.num_threads,
             Arc::clone(&task_queue),
@@ -117,21 +122,17 @@ where
             input.cancel.clone(),
             input.ctx.clone(),
             input.provider.clone(),
+            source.clone(),
             Arc::clone(&simulation_cache),
         );
 
         let results_aggregator =
             ResultsAggregator::new(group_result_receiver, Arc::clone(&best_results));
 
-        let source = StateProviderSource::new(
-            Arc::new(input.provider.clone()),
-            input.ctx.attributes.parent,
-        );
-
         let block_building_result_assembler = BlockBuildingResultAssembler::new(
             config,
             Arc::clone(&best_results),
-            source,
+            source.clone(),
             input.ctx.clone(),
             input.cancel.clone(),
             input.builder_name.clone(),
@@ -316,6 +317,11 @@ where
     // Worker pool and conflict manager creation
     let setup_start = Instant::now();
 
+    let source = StateProviderSource::new_prepared(
+        Arc::new(input.provider.clone()),
+        input.ctx.attributes.parent,
+    )?;
+
     let mut conflict_resolving_pool = ConflictResolvingPool::new(
         config.num_threads,
         Arc::clone(&task_queue),
@@ -324,25 +330,16 @@ where
         CancellationToken::new(),
         input.ctx.clone(),
         input.provider.clone(),
+        source.clone(),
         Arc::clone(&simulation_cache),
     );
 
     let setup_duration = setup_start.elapsed();
 
-    let source = StateProviderSource::new(
-        Arc::new(input.provider.clone()),
-        input.ctx.attributes.parent,
-    );
-
     // Group processing
     let processing_start = Instant::now();
     let groups = conflict_finder.get_order_groups();
-    let results = conflict_resolving_pool.process_groups_backtest(
-        groups,
-        &input.ctx,
-        source.clone(),
-        Arc::clone(&simulation_cache),
-    );
+    let results = conflict_resolving_pool.process_groups_backtest(groups);
     let processing_duration = processing_start.elapsed();
 
     // Block building result assembler creation
@@ -385,6 +382,11 @@ where
     )?;
     let building_duration = building_start.elapsed();
     let total_duration = start_time.elapsed();
+
+    if crate::provider::benchmark_metrics_enabled() {
+        let (full_hits, partial_hits, ..) = simulation_cache.stats();
+        println!("[boost-perf] cache_full_hits={full_hits} cache_partial_hits={partial_hits}");
+    }
 
     trace!("Initialization time: {:?}", init_duration);
     trace!("Setup time: {:?}", setup_duration);
@@ -427,6 +429,11 @@ where
     // Worker pool and conflict manager creation
     let setup_start = Instant::now();
 
+    let source = StateProviderSource::new_prepared(
+        Arc::new(input.provider.clone()),
+        input.ctx.attributes.parent,
+    )?;
+
     let mut conflict_resolving_pool = ConflictResolvingPool::new(
         config.num_threads,
         Arc::clone(&task_queue),
@@ -435,25 +442,16 @@ where
         CancellationToken::new(),
         input.ctx.clone(),
         input.provider.clone(),
+        source.clone(),
         Arc::clone(&simulation_cache),
     );
 
     let setup_duration = setup_start.elapsed();
 
-    let source = StateProviderSource::new(
-        Arc::new(input.provider.clone()),
-        input.ctx.attributes.parent,
-    );
-
     // Group processing
     let processing_start = Instant::now();
     let groups = conflict_finder.get_order_groups();
-    let results = conflict_resolving_pool.process_groups_default_backtest(
-        groups,
-        &input.ctx,
-        source.clone(),
-        Arc::clone(&simulation_cache),
-    );
+    let results = conflict_resolving_pool.process_groups_default_backtest(groups);
     let processing_duration = processing_start.elapsed();
 
     // Block building result assembler creation
@@ -496,6 +494,11 @@ where
     )?;
     let building_duration = building_start.elapsed();
     let total_duration = start_time.elapsed();
+
+    if crate::provider::benchmark_metrics_enabled() {
+        let (full_hits, partial_hits, ..) = simulation_cache.stats();
+        println!("[boost-perf] cache_full_hits={full_hits} cache_partial_hits={partial_hits}");
+    }
 
     trace!("Initialization time: {:?}", init_duration);
     trace!("Setup time: {:?}", setup_duration);

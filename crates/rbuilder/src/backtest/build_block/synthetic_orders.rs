@@ -141,13 +141,23 @@ impl<ConfigType: LiveBuilderConfig>
         ))
     }
 
-    fn create_block_building_context(&self) -> eyre::Result<BlockBuildingContext> {
+    fn parent_hash(&self) -> B256 {
+        self.test_chain_state
+            .block_building_context()
+            .attributes
+            .parent
+    }
+
+    fn create_block_building_context(
+        &self,
+        _provider: Arc<dyn crate::provider::StateProviderFactory>,
+    ) -> eyre::Result<BlockBuildingContext> {
         Ok(self.test_chain_state.block_building_context().clone())
     }
 
     fn print_custom_stats(
         &self,
-        _provider: StateProviderFactoryFromProviderFactory<MockNodeTypesWithDB>,
+        _provider: Arc<dyn crate::provider::StateProviderFactory>,
     ) -> eyre::Result<()> {
         Ok(())
     }

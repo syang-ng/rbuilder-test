@@ -6,7 +6,7 @@
 //! backtest-build-block --config /home/happy_programmer/config.toml --builders mgp-ordering --builders mp-ordering 19380913 --show-orders --show-missing
 
 use ahash::HashMap;
-use alloy_primitives::{utils::format_ether, TxHash};
+use alloy_primitives::{utils::format_ether, BlockHash, TxHash};
 
 use crate::{
     backtest::{
@@ -24,7 +24,10 @@ use crate::{
         BlockBuildingContext, ExecutionResult, NullPartialBlockExecutionTracer,
     },
     live_builder::cli::LiveBuilderConfig,
-    provider::StateProviderFactory,
+    provider::{
+        benchmark_metrics_enabled, provider_access_stats, reset_provider_access_stats,
+        StateProviderFactory,
+    },
     utils::elapsed_ms,
 };
 use clap::Parser;
@@ -87,10 +90,15 @@ where
     /// ugly: it takes BaseConfig but not all implementations need it.....
     fn create_provider_factory(&self) -> eyre::Result<ProviderType>;
 
-    fn create_block_building_context(&self) -> eyre::Result<BlockBuildingContext>;
+    fn parent_hash(&self) -> BlockHash;
+
+    fn create_block_building_context(
+        &self,
+        provider: Arc<dyn StateProviderFactory>,
+    ) -> eyre::Result<BlockBuildingContext>;
 
     /// Prints any stats specific to the particular OrdersSource implementation (eg: parameters, block simulation)
-    fn print_custom_stats(&self, provider: ProviderType) -> eyre::Result<()>;
+    fn print_custom_stats(&self, provider: Arc<dyn StateProviderFactory>) -> eyre::Result<()>;
 }
 
 pub async fn run_backtest_build_block<ConfigType, OrdersSourceType, ProviderType>(
@@ -104,7 +112,22 @@ where
 {
     let total_start = Instant::now();
     let mut step_start = Instant::now();
-    let ctx = orders_source.create_block_building_context()?;
+    if benchmark_metrics_enabled() {
+        reset_provider_access_stats();
+    }
+
+    let unprepared_provider: Arc<dyn StateProviderFactory> =
+        Arc::new(orders_source.create_provider_factory()?);
+    let parent_hash = orders_source.parent_hash();
+    let provider_factory = match unprepared_provider.prepare_for_parent(parent_hash)? {
+        Some(prepared) => prepared,
+        None => unprepared_provider,
+    };
+    orders_source.print_custom_stats(provider_factory.clone())?;
+    print_backtest_timing("create_provider_and_stats", step_start, total_start);
+
+    step_start = Instant::now();
+    let ctx = orders_source.create_block_building_context(provider_factory.clone())?;
     print_backtest_timing("create_block_building_context", step_start, total_start);
 
     step_start = Instant::now();
@@ -132,11 +155,6 @@ where
     println!("Available orders: {}", available_orders.len());
     println!("Order statistics: {order_statistics:?}");
     print_backtest_timing("load_available_orders", step_start, total_start);
-
-    step_start = Instant::now();
-    let provider_factory = orders_source.create_provider_factory()?;
-    orders_source.print_custom_stats(provider_factory.clone())?;
-    print_backtest_timing("create_provider_and_stats", step_start, total_start);
 
     step_start = Instant::now();
     let BacktestBlockInput { sim_orders, .. } = backtest_prepare_orders_from_building_context(
@@ -186,6 +204,9 @@ where
                     builder_name,
                     elapsed_ms(total_start)
                 );
+                if benchmark_metrics_enabled() {
+                    let _ = io::stdout().flush();
+                }
                 let input = BacktestSimulateBlockInput {
                     ctx: ctx.clone(),
                     builder_name: builder_name.clone(),
@@ -236,12 +257,32 @@ where
                 );
                 println!("Builder profit: {}", format_ether(block.trace.bid_value));
                 println!("Builder time:   {} ms", build_time_ms);
+                if benchmark_metrics_enabled() {
+                    let provider_stats = provider_access_stats();
+                    println!(
+                        "[boost-perf] block_hash={:?} profit={} provider_opens={} consistency_checks={} health_scans={}",
+                        block.sealed_block.hash(),
+                        format_ether(block.trace.bid_value),
+                        provider_stats.provider_opens,
+                        provider_stats.consistency_checks,
+                        provider_stats.health_scans,
+                    );
+                    println!(
+                        "[boost-perf] provider_opens={} consistency_checks={} health_scans={}",
+                        provider_stats.provider_opens,
+                        provider_stats.consistency_checks,
+                        provider_stats.health_scans,
+                    );
+                }
                 println!(
                     "[backtest-build-block] finish_builder builder={} build_time_ms={} total_elapsed_ms={:.2}",
                     builder_name,
                     build_time_ms,
                     elapsed_ms(total_start)
                 );
+                if benchmark_metrics_enabled() {
+                    let _ = io::stdout().flush();
+                }
                 println!(
                     "Number of used orders: {}",
                     block.trace.included_orders.len()

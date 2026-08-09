@@ -5,7 +5,6 @@ use eyre::Result;
 use itertools::Itertools;
 use rand::{seq::SliceRandom, SeedableRng};
 use rayon::prelude::*;
-use reth_errors::ProviderResult;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
@@ -38,6 +37,72 @@ const RECURSIVE_DEFAULT_SAMPLE_SEED: u64 = 0x06511;
 #[derive(Debug, Clone)]
 struct InteractionGraph {
     neighbors: Vec<Vec<usize>>,
+}
+
+struct CandidateWorker {
+    resolver_ctx: ResolverContext,
+    cached_db: CachedDB,
+}
+
+struct IndexedResolutionResult {
+    candidate_index: usize,
+    resolution_result: ResolutionResult,
+}
+
+fn select_better_resolution(
+    left: IndexedResolutionResult,
+    right: IndexedResolutionResult,
+) -> IndexedResolutionResult {
+    if left.resolution_result.total_profit > right.resolution_result.total_profit
+        || (left.resolution_result.total_profit == right.resolution_result.total_profit
+            && left.candidate_index < right.candidate_index)
+    {
+        left
+    } else {
+        right
+    }
+}
+
+fn try_evaluate_candidates_in_fixed_chunks<T, Worker, Output, InitWorker, Evaluate, Select>(
+    candidates: &[T],
+    init_worker: InitWorker,
+    evaluate: Evaluate,
+    select: Select,
+) -> Result<Option<Output>>
+where
+    T: Sync,
+    Worker: Send,
+    Output: Send,
+    InitWorker: Fn() -> Result<Worker> + Sync + Send,
+    Evaluate: Fn(&mut Worker, usize, &T) -> Result<Output> + Sync + Send,
+    Select: Fn(Output, Output) -> Output + Sync + Send,
+{
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let worker_count = rayon::current_num_threads().max(1).min(candidates.len());
+    let chunk_size = candidates.len().div_ceil(worker_count);
+
+    candidates
+        .par_chunks(chunk_size)
+        .enumerate()
+        .map(|(chunk_index, chunk)| {
+            let mut worker = init_worker()?;
+            let mut chunk_results = chunk.iter().enumerate().map(|(offset, candidate)| {
+                let candidate_index = chunk_index * chunk_size + offset;
+                evaluate(&mut worker, candidate_index, candidate)
+            });
+            let mut best = chunk_results
+                .next()
+                .expect("fixed candidate chunks are never empty")?;
+            for result in chunk_results {
+                best = select(best, result?);
+            }
+            Ok(best)
+        })
+        .try_reduce_with(|left, right| Ok(select(left, right)))
+        .transpose()
 }
 
 pub(crate) fn analyze_conflict_graph(orders: &[Arc<SimulatedOrder>]) -> ConflictGraphStats {
@@ -184,9 +249,9 @@ impl ResolverContext {
         };
 
         if sequence_to_try.len() <= 1 {
-            for sequence_of_orders in sequence_to_try {
-                let (resolution_result, _state) =
-                    self.process_sequence_of_orders(sequence_of_orders, task, self.source.clone())?;
+            for sequence_of_orders in &sequence_to_try {
+                let resolution_result =
+                    self.process_sequence_with_fresh_provider(sequence_of_orders, task)?;
                 self.update_best_result(resolution_result, &mut best_resolution_result);
             }
         } else {
@@ -195,35 +260,45 @@ impl ResolverContext {
             let cancellation_token = self.cancellation_token.clone();
             let simulation_cache = Arc::clone(&self.simulation_cache);
 
-            let best_parallel_result = sequence_to_try
-                .into_par_iter()
-                .map(|sequence_of_orders| {
-                    let mut resolver_ctx = ResolverContext::new(
-                        source.clone(),
-                        ctx.clone(),
-                        cancellation_token.clone(),
-                        Arc::clone(&simulation_cache),
-                        None,
-                    );
-                    resolver_ctx
-                        .process_sequence_of_orders(
-                            sequence_of_orders,
-                            task,
-                            resolver_ctx.source.clone(),
-                        )
-                        .map(|(resolution_result, _state)| resolution_result)
-                })
-                .try_reduce_with(|left, right| {
-                    Ok(if left.total_profit >= right.total_profit {
-                        left
-                    } else {
-                        right
+            let best_parallel_result = try_evaluate_candidates_in_fixed_chunks(
+                &sequence_to_try,
+                || {
+                    let cached_db =
+                        CachedDB::new(source.state_provider()?, ctx.shared_cached_reads.clone());
+                    Ok(CandidateWorker {
+                        resolver_ctx: ResolverContext::new(
+                            source.clone(),
+                            ctx.clone(),
+                            cancellation_token.clone(),
+                            Arc::clone(&simulation_cache),
+                            None,
+                        ),
+                        cached_db,
                     })
-                })
-                .transpose()?;
+                },
+                |worker, candidate_index, sequence_of_orders| {
+                    let CandidateWorker {
+                        resolver_ctx,
+                        cached_db,
+                    } = worker;
+                    let resolution_result = resolver_ctx.process_sequence_of_orders_with_db(
+                        sequence_of_orders,
+                        task,
+                        cached_db,
+                    )?;
+                    Ok(IndexedResolutionResult {
+                        candidate_index,
+                        resolution_result,
+                    })
+                },
+                select_better_resolution,
+            )?;
 
             if let Some(best_parallel_result) = best_parallel_result {
-                self.update_best_result(best_parallel_result, &mut best_resolution_result);
+                self.update_best_result(
+                    best_parallel_result.resolution_result,
+                    &mut best_resolution_result,
+                );
             }
         }
 
@@ -251,8 +326,8 @@ impl ResolverContext {
                 &mut solve_small,
             )?;
 
-        let (resolution_result, _state) =
-            self.process_sequence_of_orders(sequence_of_orders, task, self.source.clone())?;
+        let resolution_result =
+            self.process_sequence_with_fresh_provider(&sequence_of_orders, task)?;
         candidate_sequence_count += 1;
         Ok((resolution_result, candidate_sequence_count))
     }
@@ -293,24 +368,36 @@ impl ResolverContext {
         }
     }
 
-    /// Processes a single sequence of orders, utilizing the simulation cache.
+    fn process_sequence_with_fresh_provider(
+        &mut self,
+        sequence_of_orders: &[usize],
+        task: &ConflictTask,
+    ) -> Result<ResolutionResult> {
+        let mut cached_db = CachedDB::new(
+            self.source.state_provider()?,
+            self.ctx.shared_cached_reads.clone(),
+        );
+        self.process_sequence_of_orders_with_db(sequence_of_orders, task, &mut cached_db)
+    }
+
+    /// Processes a single sequence of orders using a worker-owned provider/read database.
     ///
     /// # Arguments
     ///
     /// * `sequence_of_orders` - The order of transaction indices to process.
     /// * `task` - The current conflict task.
-    /// * `state_provider` - The state provider for the current block.
+    /// * `cached_db` - The worker-local database, reused sequentially across candidates.
     ///
     /// # Returns
     ///
-    /// A tuple containing the resolution result and the final block state.
-    fn process_sequence_of_orders(
+    /// The resolution result for this candidate. All mutable execution state is discarded before
+    /// the worker evaluates the next candidate; only the provider/read database is reused.
+    fn process_sequence_of_orders_with_db(
         &mut self,
-        sequence_of_orders: Vec<usize>,
+        sequence_of_orders: &[usize],
         task: &ConflictTask,
-        source: StateProviderSource,
-    ) -> Result<(ResolutionResult, BlockState<CachedDB>)> {
-        // @todo actually reuse it for the duration of the block
+        cached_db: &mut CachedDB,
+    ) -> Result<ResolutionResult> {
         let mut local_ctx = ThreadBlockBuildingContext::default();
 
         let order_id_to_index = self.initialize_order_id_to_index_map(task);
@@ -323,7 +410,7 @@ impl ResolverContext {
 
         // Initialize state and partial block
         let mut partial_block = PartialBlock::new(true);
-        let mut state = self.initialize_block_state(source)?;
+        let mut state = BlockState::new(&mut *cached_db);
         partial_block.pre_block_call(&self.ctx, &mut state)?;
 
         // Initialize sequenced_order_result
@@ -384,7 +471,7 @@ impl ResolverContext {
             total_profit,
             sequence_of_orders: sequenced_order_result,
         };
-        Ok((resolution_result, state))
+        Ok(resolution_result)
     }
 
     /// Helper function to handle a successful commit of an order.
@@ -465,23 +552,11 @@ impl ResolverContext {
         }
     }
 
-    /// Initializes the block state, using a cached state if available.
-    fn initialize_block_state(
-        &mut self,
-        source: StateProviderSource,
-    ) -> ProviderResult<BlockState<CachedDB>> {
-        let cached = CachedDB::new(
-            source.state_provider()?,
-            self.ctx.shared_cached_reads.clone(),
-        );
-        Ok(BlockState::new(cached))
-    }
-
     /// Stores the simulation state in the cache.
-    fn store_simulation_state(
+    fn store_simulation_state<DB>(
         &self,
         full_order_ids: &[OrderId],
-        state: &BlockState<CachedDB>,
+        state: &BlockState<DB>,
         total_profit: U256,
         per_order_profits: &[(OrderId, U256)],
     ) {
@@ -1035,7 +1110,10 @@ fn code_write_contains(trace: &UsedStateTrace, address: Address) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Instant,
+    };
 
     use ahash::HashSet;
     use alloy_consensus::TxLegacy;
@@ -1052,6 +1130,54 @@ mod tests {
         Bundle, Metadata, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
         LAST_BUNDLE_VERSION,
     };
+
+    #[test]
+    fn fixed_chunks_open_once_per_candidate_worker_and_keep_stable_ties() {
+        let candidates = (0..5_040).collect::<Vec<_>>();
+
+        for thread_count in [1, 8, 32, 60] {
+            let provider_opens = Arc::new(AtomicUsize::new(0));
+            let evaluated_candidates = Arc::new(AtomicUsize::new(0));
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(thread_count)
+                .build()
+                .unwrap();
+
+            let best = pool
+                .install(|| {
+                    try_evaluate_candidates_in_fixed_chunks(
+                        &candidates,
+                        || {
+                            provider_opens.fetch_add(1, Ordering::Relaxed);
+                            Ok(())
+                        },
+                        |_, candidate_index, candidate| {
+                            evaluated_candidates.fetch_add(1, Ordering::Relaxed);
+                            let total_profit = if (4_242..=4_243).contains(candidate) {
+                                U256::from(9)
+                            } else {
+                                U256::from(1)
+                            };
+                            Ok(IndexedResolutionResult {
+                                candidate_index,
+                                resolution_result: ResolutionResult {
+                                    total_profit,
+                                    sequence_of_orders: vec![(*candidate, U256::ZERO)],
+                                },
+                            })
+                        },
+                        select_better_resolution,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(evaluated_candidates.load(Ordering::Relaxed), 5_040);
+            assert_eq!(provider_opens.load(Ordering::Relaxed), thread_count);
+            assert_eq!(best.candidate_index, 4_242);
+            assert_eq!(best.resolution_result.sequence_of_orders[0].0, 4_242);
+        }
+    }
 
     struct DataGenerator {
         last_used_id: u64,
