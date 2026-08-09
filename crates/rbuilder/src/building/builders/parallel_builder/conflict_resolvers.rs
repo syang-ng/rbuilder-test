@@ -265,8 +265,11 @@ impl ResolverContext {
             let best_parallel_result = try_evaluate_candidates_in_fixed_chunks(
                 &sequence_to_try,
                 || {
-                    let cached_db =
-                        CachedDB::new(source.state_provider()?, ctx.shared_cached_reads.clone());
+                    let cached_db = CachedDB::new_for_parent(
+                        source.state_provider()?,
+                        ctx.shared_cached_reads.clone(),
+                        source.parent_hash(),
+                    );
                     Ok(CandidateWorker {
                         resolver_ctx: ResolverContext::new(
                             source.clone(),
@@ -375,9 +378,10 @@ impl ResolverContext {
         sequence_of_orders: &[usize],
         task: &ConflictTask,
     ) -> Result<ResolutionResult> {
-        let mut cached_db = CachedDB::new(
+        let mut cached_db = CachedDB::new_for_parent(
             self.source.state_provider()?,
             self.ctx.shared_cached_reads.clone(),
+            self.source.parent_hash(),
         );
         self.process_sequence_of_orders_with_db(sequence_of_orders, task, &mut cached_db)
     }
