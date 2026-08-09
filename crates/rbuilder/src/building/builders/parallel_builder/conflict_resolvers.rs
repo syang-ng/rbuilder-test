@@ -11,7 +11,7 @@ use tracing::trace;
 
 use super::{
     conflict_task_generator::{update_default_graph_study_record, DefaultGraphStudyRecord},
-    simulation_cache::{CachedSimulationState, SharedSimulationCache},
+    simulation_cache::SharedSimulationCache,
     Algorithm, ConflictTask, ResolutionResult,
 };
 
@@ -20,7 +20,7 @@ use crate::building::{
     PartialBlock, ThreadBlockBuildingContext,
 };
 use crate::provider::StateProviderSource;
-use rbuilder_primitives::{evm_inspector::UsedStateTrace, OrderId, SimulatedOrder};
+use rbuilder_primitives::{evm_inspector::UsedStateTrace, SimulatedOrder};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ConflictGraphStats {
@@ -154,6 +154,8 @@ pub struct ResolverContext {
     pub source: StateProviderSource,
     pub ctx: BlockBuildingContext,
     pub cancellation_token: CancellationToken,
+    /// Retained for plumbing and diagnostics only. Candidate execution must not consult this
+    /// cache: its entries are not complete execution snapshots and cannot safely resume a prefix.
     pub simulation_cache: Arc<SharedSimulationCache>,
     pub graph_study_collector: Option<Arc<parking_lot::Mutex<Vec<DefaultGraphStudyRecord>>>>,
 }
@@ -400,33 +402,14 @@ impl ResolverContext {
     ) -> Result<ResolutionResult> {
         let mut local_ctx = ThreadBlockBuildingContext::default();
 
-        let order_id_to_index = self.initialize_order_id_to_index_map(task);
-        let full_sequence_of_orders = self.initialize_full_order_ids_vec(&sequence_of_orders, task);
-
-        // Check for cached simulation state
-        let (cached_state_option, cached_up_to_index) = self
-            .simulation_cache
-            .get_cached_state(&full_sequence_of_orders);
-
         // Initialize state and partial block
         let mut partial_block = PartialBlock::new(true);
         let mut state = BlockState::new(&mut *cached_db);
         partial_block.pre_block_call(&self.ctx, &mut state)?;
 
-        // Initialize sequenced_order_result
-        let mut sequenced_order_result =
-            self.initialize_result_order_sequence(&cached_state_option, &order_id_to_index);
-
-        let mut total_profit = cached_state_option
-            .as_ref()
-            .map_or(U256::ZERO, |cached| cached.total_profit);
-
-        let mut per_order_profits = cached_state_option
-            .as_ref()
-            .map_or(Vec::new(), |cached| cached.per_order_profits.clone());
-
-        // Prepare the sequence of orders to try, skipping already cached orders
-        let mut remaining_orders = sequence_of_orders[cached_up_to_index..].to_vec();
+        let mut sequenced_order_result = Vec::new();
+        let mut total_profit = U256::ZERO;
+        let mut remaining_orders = sequence_of_orders.to_vec();
         remaining_orders.reverse(); // Use as a stack: pop from the end
 
         let mut pending_orders: HashMap<(Address, u64), usize> = HashMap::default();
@@ -448,24 +431,15 @@ impl ResolverContext {
             )? {
                 Ok(res) => self.handle_successful_commit(
                     res,
-                    sim_order,
                     order_idx,
                     &mut pending_orders,
                     &mut remaining_orders,
                     &mut sequenced_order_result,
                     &mut total_profit,
-                    &mut per_order_profits,
                 ),
                 Err(err) => self.handle_err(&err, sim_order, &mut pending_orders, order_idx),
             }
         }
-
-        self.store_simulation_state(
-            &full_sequence_of_orders,
-            &state,
-            total_profit,
-            &per_order_profits,
-        );
 
         let resolution_result = ResolutionResult {
             total_profit,
@@ -475,26 +449,21 @@ impl ResolverContext {
     }
 
     /// Helper function to handle a successful commit of an order.
-    #[allow(clippy::too_many_arguments)]
     fn handle_successful_commit(
         &mut self,
         res: ExecutionResult,
-        sim_order: &SimulatedOrder,
         order_idx: usize,
         pending_orders: &mut HashMap<(Address, u64), usize>,
         remaining_orders: &mut Vec<usize>,
         sequenced_order_result: &mut Vec<(usize, U256)>,
         total_profit: &mut U256,
-        per_order_profits: &mut Vec<(OrderId, U256)>,
     ) {
         for (address, nonce) in res.nonces_updated {
             if let Some(pending_order) = pending_orders.remove(&(address, nonce)) {
                 remaining_orders.push(pending_order);
             }
         }
-        let order_id = sim_order.order.id();
         *total_profit += res.coinbase_profit;
-        per_order_profits.push((order_id, res.coinbase_profit));
         sequenced_order_result.push((order_idx, res.coinbase_profit));
     }
 
@@ -509,64 +478,6 @@ impl ResolverContext {
         if let Some((address, nonce)) = err.try_get_tx_too_high_error(&sim_order.order) {
             pending_orders.insert((address, nonce), order_idx);
         };
-    }
-
-    /// Initializes a HashMap of order id to index.
-    fn initialize_order_id_to_index_map(&self, task: &ConflictTask) -> HashMap<OrderId, usize> {
-        task.group
-            .orders
-            .iter()
-            .enumerate()
-            .map(|(idx, sim_order)| (sim_order.order.id(), idx))
-            .collect()
-    }
-
-    /// Initializes a vector of full order ids corresponding to the sequence of orders.
-    fn initialize_full_order_ids_vec(
-        &self,
-        sequence_of_orders: &[usize],
-        task: &ConflictTask,
-    ) -> Vec<OrderId> {
-        sequence_of_orders
-            .iter()
-            .map(|&idx| task.group.orders[idx].order.id())
-            .collect()
-    }
-
-    /// Initializes the tuple of (order_idx, profit) for the resolution result using the cached state if available.
-    fn initialize_result_order_sequence(
-        &self,
-        cached_state_option: &Option<Arc<CachedSimulationState>>,
-        order_id_to_index: &HashMap<OrderId, usize>,
-    ) -> Vec<(usize, U256)> {
-        if let Some(cached_state) = &cached_state_option {
-            cached_state
-                .per_order_profits
-                .iter()
-                .filter_map(|(order_id, profit)| {
-                    order_id_to_index.get(order_id).map(|&idx| (idx, *profit))
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Stores the simulation state in the cache.
-    fn store_simulation_state<DB>(
-        &self,
-        full_order_ids: &[OrderId],
-        state: &BlockState<DB>,
-        total_profit: U256,
-        per_order_profits: &[(OrderId, U256)],
-    ) {
-        let cached_simulation_state = CachedSimulationState {
-            bundle_state: state.clone_bundle(),
-            total_profit,
-            per_order_profits: per_order_profits.to_owned(),
-        };
-        self.simulation_cache
-            .store_cached_state(full_order_ids, cached_simulation_state);
     }
 }
 
@@ -1124,11 +1035,19 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::building::builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority};
+    use crate::{
+        building::{
+            builders::parallel_builder::{
+                simulation_cache::CachedSimulationState, ConflictGroup, GroupId, TaskPriority,
+            },
+            testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
+        },
+        provider::state_provider_factory_from_provider_factory::StateProviderFactoryFromProviderFactory,
+    };
     use rbuilder_primitives::{
         evm_inspector::{SlotKey, UsedStateTrace},
-        Bundle, Metadata, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
-        LAST_BUNDLE_VERSION,
+        Bundle, MempoolTx, Metadata, Order, SimValue, SimulatedOrder,
+        TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
     };
 
     #[test]
@@ -1334,6 +1253,145 @@ mod tests {
             priority,
             created_at,
         }
+    }
+
+    fn nonce_order(chain: &TestChainState, nonce: u64) -> Arc<SimulatedOrder> {
+        let tx = chain
+            .sign_tx(TxArgs::new(NamedAddr::User(0), nonce).to(NamedAddr::Dummy))
+            .unwrap();
+        let tx = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx).unwrap();
+        Arc::new(SimulatedOrder::new(
+            Arc::new(Order::Tx(MempoolTx::new(tx))),
+            SimValue::default(),
+            None,
+        ))
+    }
+
+    fn nonce_task(chain: &TestChainState, nonces: &[u64]) -> ConflictTask {
+        let orders = nonces
+            .iter()
+            .map(|nonce| nonce_order(chain, *nonce))
+            .collect();
+        create_mock_task(
+            0,
+            create_mock_order_group(1, orders, HashSet::default()),
+            Algorithm::PermutationsWithNonces,
+            TaskPriority::Low,
+            Instant::now(),
+        )
+    }
+
+    fn execute_for_test(
+        chain: &TestChainState,
+        cache: Arc<SharedSimulationCache>,
+        task: &ConflictTask,
+        sequence: &[usize],
+    ) -> Result<ResolutionResult> {
+        let ctx = chain.block_building_context().clone();
+        let factory =
+            StateProviderFactoryFromProviderFactory::new(chain.provider_factory().clone(), None);
+        let source = StateProviderSource::new(Arc::new(factory), ctx.attributes.parent);
+        let mut resolver = ResolverContext::new(source, ctx, CancellationToken::new(), cache, None);
+        resolver.process_sequence_with_fresh_provider(sequence, task)
+    }
+
+    #[test]
+    fn partial_cache_snapshot_cannot_resume_pending_nonce_state() -> Result<()> {
+        let chain = TestChainState::new(BlockArgs::default().with_timestamp(1))?;
+        // Index 0 starts one nonce too high and must be retried after index 1 lands.
+        let task = nonce_task(&chain, &[1, 0]);
+
+        let prefix_result =
+            execute_for_test(&chain, Arc::new(SharedSimulationCache::new()), &task, &[0])?;
+        assert!(prefix_result.sequence_of_orders.is_empty());
+
+        let cache = Arc::new(SharedSimulationCache::new());
+        cache.store_cached_state(
+            &[task.group.orders[0].order.id()],
+            CachedSimulationState {
+                bundle_state: Default::default(),
+                total_profit: prefix_result.total_profit,
+                per_order_profits: Vec::new(),
+            },
+        );
+        let full_key = [
+            task.group.orders[0].order.id(),
+            task.group.orders[1].order.id(),
+        ];
+        let (hit, cached_up_to) = cache.get_cached_state(&full_key);
+        assert!(hit.is_some());
+        assert_eq!(cached_up_to, 1);
+
+        // This is what resuming from that snapshot can do without the missing pending-nonce map:
+        // execute the suffix, but never retry the skipped prefix order.
+        let resumed_result =
+            execute_for_test(&chain, Arc::new(SharedSimulationCache::new()), &task, &[1])?;
+        let full_result = execute_for_test(
+            &chain,
+            Arc::new(SharedSimulationCache::new()),
+            &task,
+            &[0, 1],
+        )?;
+
+        assert_eq!(
+            resumed_result
+                .sequence_of_orders
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![1],
+        );
+        assert_eq!(
+            full_result
+                .sequence_of_orders
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![1, 0],
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cache_off_matches_full_execution_with_poisoned_partial_entry() -> Result<()> {
+        let chain = TestChainState::new(BlockArgs::default().with_timestamp(1))?;
+        let task = nonce_task(&chain, &[0, 1]);
+
+        let poisoned_cache = Arc::new(SharedSimulationCache::new());
+        poisoned_cache.store_cached_state(
+            &[task.group.orders[0].order.id()],
+            CachedSimulationState {
+                bundle_state: Default::default(),
+                total_profit: U256::MAX,
+                per_order_profits: vec![(task.group.orders[0].order.id(), U256::MAX)],
+            },
+        );
+
+        let cache_off_result =
+            execute_for_test(&chain, Arc::clone(&poisoned_cache), &task, &[0, 1])?;
+        let reference_result = execute_for_test(
+            &chain,
+            Arc::new(SharedSimulationCache::new()),
+            &task,
+            &[0, 1],
+        )?;
+
+        assert_eq!(cache_off_result.total_profit, reference_result.total_profit);
+        assert_eq!(
+            cache_off_result.sequence_of_orders,
+            reference_result.sequence_of_orders
+        );
+        assert_eq!(
+            cache_off_result
+                .sequence_of_orders
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+        );
+        let (full_hits, partial_hits, ..) = poisoned_cache.stats();
+        assert_eq!((full_hits, partial_hits), (0, 0));
+        Ok(())
     }
 
     #[test]

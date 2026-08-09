@@ -1,3 +1,10 @@
+//! Legacy simulation-prefix cache container.
+//!
+//! This cache is deliberately disconnected from candidate execution. CachedSimulationState is
+//! not a resumable execution snapshot: it omits PartialBlock accounting, receipts, gas and blob
+//! usage, refunds, tracer state, and the pending-nonce retry queue. Candidate execution must not
+//! call get_cached_state or store_cached_state until a complete snapshot can be restored safely.
+
 use ahash::HashMap;
 use alloy_primitives::U256;
 use parking_lot::RwLock as PLRwLock;
@@ -8,7 +15,7 @@ use std::sync::{
     Arc,
 };
 
-/// An instance of a simulation result that has been cached.
+/// Incomplete legacy simulation data. This must not be used to resume candidate execution.
 #[derive(Debug, Clone)]
 pub struct CachedSimulationState {
     pub bundle_state: BundleState,
