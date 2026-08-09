@@ -19,6 +19,7 @@ use crate::{
                 set_default_graph_study_capture_enabled, start_default_graph_study_capture,
                 take_default_graph_study_records, DefaultGraphStudyRecord,
             },
+            parallel_builder::{available_physical_cores, CandidateExecutor},
             BacktestSimulateBlockInput,
         },
         BlockBuildingContext, ExecutionResult, NullPartialBlockExecutionTracer,
@@ -71,6 +72,11 @@ pub struct BuildBlockCfg {
         help = "Path to csv file to write default builder graph-study output to"
     )]
     pub graph_stats_csv: Option<PathBuf>,
+    #[clap(
+        long,
+        help = "Candidate Rayon threads (defaults to available physical cores)"
+    )]
+    pub candidate_threads: Option<usize>,
 }
 
 /// Provides all the orders needed to simulate the construction of a block.
@@ -144,6 +150,19 @@ where
     };
     set_default_graph_study_capture_enabled(graph_stats_csv_output.is_some());
 
+    let candidate_executor = if build_block_cfg.no_block_building {
+        None
+    } else {
+        let candidate_threads = build_block_cfg
+            .candidate_threads
+            .unwrap_or_else(available_physical_cores);
+        println!(
+            "[backtest-build-block] candidate_threads={candidate_threads} physical_core_limit={}",
+            available_physical_cores()
+        );
+        Some(CandidateExecutor::new(candidate_threads)?)
+    };
+
     step_start = Instant::now();
     let available_orders = orders_source.available_orders();
     let mut order_statistics = OrderStatistics::new();
@@ -204,41 +223,53 @@ where
                     builder_name: builder_name.clone(),
                     sim_orders: &sim_orders,
                     provider: provider_factory.clone(),
+                    candidate_executor: candidate_executor.clone(),
                 };
-                start_default_graph_study_capture();
-                println!(
-                    "[backtest-build-block] start_builder builder={} total_elapsed_ms={:.2}",
-                    builder_name,
-                    elapsed_ms(total_start)
-                );
-                if benchmark_metrics_enabled() {
-                    let _ = io::stdout().flush();
-                }
-                let build_start = Instant::now();
-                let build_res = if build_block_cfg.trace_block_building {
-                    config.build_backtest_block(
+                let run_builder = || {
+                    // Graph-study capture is thread-local, so its complete lifetime must remain
+                    // on the worker that invokes the default resolver.
+                    start_default_graph_study_capture();
+                    println!(
+                        "[backtest-build-block] start_builder builder={} total_elapsed_ms={:.2}",
                         builder_name,
-                        input,
-                        crate::backtest::build_block::full_partial_block_execution_tracer::FullPartialBlockExecutionTracer::new(),
-                    )
-                } else {
-                    config.build_backtest_block(
+                        elapsed_ms(total_start)
+                    );
+                    if benchmark_metrics_enabled() {
+                        let _ = io::stdout().flush();
+                    }
+                    let build_start = Instant::now();
+                    let build_res = if build_block_cfg.trace_block_building {
+                        config.build_backtest_block(
+                            builder_name,
+                            input,
+                            crate::backtest::build_block::full_partial_block_execution_tracer::FullPartialBlockExecutionTracer::new(),
+                        )
+                    } else {
+                        config.build_backtest_block(
+                            builder_name,
+                            input,
+                            NullPartialBlockExecutionTracer {},
+                        )
+                    };
+                    let build_time_ms = build_start.elapsed().as_millis() as u64;
+                    println!(
+                        "[backtest-build-block] finish_builder builder={} build_time_ms={} total_elapsed_ms={:.2}",
                         builder_name,
-                        input,
-                        NullPartialBlockExecutionTracer {},
-                    )
+                        build_time_ms,
+                        elapsed_ms(total_start)
+                    );
+                    if benchmark_metrics_enabled() {
+                        let _ = io::stdout().flush();
+                    }
+                    let graph_study_records = take_default_graph_study_records();
+                    (build_res, build_time_ms, graph_study_records)
                 };
-                let build_time_ms = build_start.elapsed().as_millis() as u64;
-                println!(
-                    "[backtest-build-block] finish_builder builder={} build_time_ms={} total_elapsed_ms={:.2}",
-                    builder_name,
-                    build_time_ms,
-                    elapsed_ms(total_start)
-                );
-                if benchmark_metrics_enabled() {
-                    let _ = io::stdout().flush();
-                }
-                let graph_study_records = take_default_graph_study_records();
+                let (build_res, build_time_ms, graph_study_records) =
+                    if let Some(executor) = candidate_executor.as_ref() {
+                        executor.install(run_builder)
+                    } else {
+                        run_builder()
+                    };
                 if let Some(graph_stats_csv_output) = &mut graph_stats_csv_output {
                     if let Err(err) = graph_stats_csv_output.write_builder_records(
                         ctx.block(),

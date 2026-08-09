@@ -6,6 +6,7 @@ use crate::{
                 start_default_graph_study_capture, take_default_graph_study_records,
                 DefaultGraphStudyRecord,
             },
+            parallel_builder::CandidateExecutor,
             BacktestSimulateBlockInput,
         },
         sim::simulate_all_orders_with_sim_tree,
@@ -135,6 +136,7 @@ pub fn backtest_simulate_block<P, ConfigType>(
     builders_names: Vec<String>,
     config: &ConfigType,
     blocklist: BlockList,
+    candidate_executor: Option<CandidateExecutor>,
 ) -> eyre::Result<BlockBacktestValue>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -149,7 +151,14 @@ where
         config.base_config().evm_caching_enable,
     )?;
 
-    backtest_simulate_block_with_context(ctx, block_data, provider, builders_names, config)
+    backtest_simulate_block_with_context(
+        ctx,
+        block_data,
+        provider,
+        builders_names,
+        config,
+        candidate_executor,
+    )
 }
 
 pub fn backtest_simulate_block_with_context<P, ConfigType>(
@@ -158,6 +167,7 @@ pub fn backtest_simulate_block_with_context<P, ConfigType>(
     provider: P,
     builders_names: Vec<String>,
     config: &ConfigType,
+    candidate_executor: Option<CandidateExecutor>,
 ) -> eyre::Result<BlockBacktestValue>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -210,17 +220,30 @@ where
             builder_name: building_algorithm_name.clone(),
             sim_orders: &sim_orders,
             provider: provider.clone(),
+            candidate_executor: candidate_executor.clone(),
         };
 
-        start_default_graph_study_capture();
-        let build_start = Instant::now();
-        let block = config.build_backtest_block(
-            &building_algorithm_name,
-            input,
-            NullPartialBlockExecutionTracer {},
-        )?;
-        let build_time_ms = build_start.elapsed().as_millis() as u64;
-        let graph_study_records = take_default_graph_study_records();
+        let run_builder = || -> eyre::Result<_> {
+            // Capture is thread-local; keep its complete lifetime in the same explicit pool
+            // context that executes the default resolver.
+            start_default_graph_study_capture();
+            let build_start = Instant::now();
+            let block_result = config.build_backtest_block(
+                &building_algorithm_name,
+                input,
+                NullPartialBlockExecutionTracer {},
+            );
+            let build_time_ms = build_start.elapsed().as_millis() as u64;
+            let graph_study_records = take_default_graph_study_records();
+            let block = block_result?;
+            Ok((block, build_time_ms, graph_study_records))
+        };
+        let (block, build_time_ms, graph_study_records) =
+            if let Some(executor) = candidate_executor.as_ref() {
+                executor.install(run_builder)
+            } else {
+                run_builder()
+            }?;
         builder_outputs.push(BacktestBuilderOutput {
             orders_included: block.trace.included_orders.len(),
             builder_name: building_algorithm_name,

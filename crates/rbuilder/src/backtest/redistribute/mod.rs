@@ -13,7 +13,10 @@ use crate::{
         },
         BlockData, BuiltBlockData, OrdersWithTimestamp,
     },
-    building::BlockBuildingContext,
+    building::{
+        builders::parallel_builder::{available_physical_cores, CandidateExecutor},
+        BlockBuildingContext,
+    },
     live_builder::{block_list_provider::BlockList, cli::LiveBuilderConfig},
     provider::StateProviderFactory,
     utils::{elapsed_s, signed_uint_delta, u256decimal_serde_helper},
@@ -174,16 +177,22 @@ where
         config.base_config().coinbase_signer()?,
         config.base_config().evm_caching_enable,
     )?;
+    // Redistribution runs many nested default-builder backtests. Keep both the outer exclusion
+    // parallelism and inner candidate parallelism on one reusable, physically bounded pool.
+    let candidate_executor = CandidateExecutor::new(available_physical_cores())?;
 
     let time_preparation_s = elapsed_s(start);
     let start = Instant::now();
 
-    let results_without_exclusion = calculate_backtest_without_exclusion(
-        ctx.clone(),
-        provider.clone(),
-        config,
-        block_data.clone(),
-    )?;
+    let results_without_exclusion = candidate_executor.install(|| {
+        calculate_backtest_without_exclusion(
+            ctx.clone(),
+            provider.clone(),
+            config,
+            block_data.clone(),
+            &candidate_executor,
+        )
+    })?;
 
     let time_no_exclusion_s = elapsed_s(start);
     let start = Instant::now();
@@ -195,6 +204,7 @@ where
         block_data.clone(),
         &available_orders,
         &results_without_exclusion,
+        &candidate_executor,
     )?;
 
     let time_single_exclusion_s = elapsed_s(start);
@@ -209,6 +219,7 @@ where
         &results_without_exclusion,
         exclusion_results,
         distribute_to_mempool_txs,
+        &candidate_executor,
     )?;
 
     let time_joint_exclusion_s = elapsed_s(start);
@@ -633,6 +644,7 @@ fn calculate_backtest_without_exclusion<P, ConfigType>(
     provider: P,
     config: &ConfigType,
     block_data: BlockData,
+    candidate_executor: &CandidateExecutor,
 ) -> eyre::Result<ResultsWithoutExclusion>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -654,6 +666,7 @@ where
             orders_excluded_before: vec![],
             profit_before: U256::ZERO,
         },
+        candidate_executor,
     )?;
     Ok(ResultsWithoutExclusion {
         profit,
@@ -700,6 +713,7 @@ fn calculate_backtest_identity_and_order_exclusion<P, ConfigType>(
     block_data: BlockData,
     available_orders: &AvailableOrders,
     results_without_exclusion: &ResultsWithoutExclusion,
+    candidate_executor: &CandidateExecutor,
 ) -> eyre::Result<ExclusionResults>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -720,7 +734,8 @@ where
     };
 
     let result_after_landed_orders_exclusion: HashMap<OrderId, ExclusionResult> =
-        included_orders_exclusion
+        candidate_executor.install(|| {
+            included_orders_exclusion
             .into_par_iter()
             .map(|(id, exclusions)| {
                 trace!(order = ?id, excluding = ?exclusions, "Excluding orders for landed order");
@@ -730,32 +745,38 @@ where
                     config,
                     &block_data,
                     results_without_exclusion.exclusion_input(exclusions),
+                    candidate_executor,
                 )
                 .map(|ok| (id, ok))
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, _>>()
+        })?;
 
-    let result_after_identity_exclusion: HashMap<Address, ExclusionResult> = available_orders
-        .included_orders_by_address
-        .to_vec()
-        .into_par_iter()
-        .map(|(address, _)| {
-            let orders = available_orders
-                .all_orders_by_address
-                .get(&address)
-                .expect("all orders by address not found")
-                .clone();
-            trace!(identity = ?address, excluding = ?orders, "Excluding orders for identity");
-            calc_profit_after_exclusion(
-                ctx.clone(),
-                provider.clone(),
-                config,
-                &block_data,
-                results_without_exclusion.exclusion_input(orders),
-            )
-            .map(|ok| (address, ok))
-        })
-        .collect::<Result<_, _>>()?;
+    let result_after_identity_exclusion: HashMap<Address, ExclusionResult> =
+        candidate_executor.install(|| {
+            available_orders
+                .included_orders_by_address
+                .to_vec()
+                .into_par_iter()
+                .map(|(address, _)| {
+                    let orders = available_orders
+                        .all_orders_by_address
+                        .get(&address)
+                        .expect("all orders by address not found")
+                        .clone();
+                    trace!(identity = ?address, excluding = ?orders, "Excluding orders for identity");
+                    calc_profit_after_exclusion(
+                        ctx.clone(),
+                        provider.clone(),
+                        config,
+                        &block_data,
+                        results_without_exclusion.exclusion_input(orders),
+                        candidate_executor,
+                    )
+                    .map(|ok| (address, ok))
+                })
+                .collect::<Result<_, _>>()
+        })?;
 
     Ok(ExclusionResults {
         landed_orders: result_after_landed_orders_exclusion,
@@ -774,6 +795,7 @@ fn calc_joint_exclusion_results<P, ConfigType>(
     results_without_exclusion: &ResultsWithoutExclusion,
     mut exclusion_results: ExclusionResults,
     distribute_to_mempool_txs: bool,
+    candidate_executor: &CandidateExecutor,
 ) -> eyre::Result<ExclusionResults>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -820,31 +842,34 @@ where
     joint_contribution_todo.sort();
     joint_contribution_todo.dedup();
 
-    exclusion_results.joint_exclusion_result = joint_contribution_todo
-        .into_par_iter()
-        .map(|(address1, address2)| {
-            let orders1 = available_orders
-                .all_orders_by_address
-                .get(&address1)
-                .expect("orders by address not found")
-                .clone();
-            let orders2 = available_orders
-                .all_orders_by_address
-                .get(&address2)
-                .expect("orders by address not found")
-                .clone();
-            let orders = orders1.iter().chain(orders2.iter()).cloned().collect();
-            trace!(?address1, ?address2, excluding = ?orders, "Calculating joint contribution");
-            calc_profit_after_exclusion(
-                ctx.clone(),
-                provider.clone(),
-                config,
-                &block_data,
-                results_without_exclusion.exclusion_input(orders),
-            )
-            .map(|ok| ((address1, address2), ok))
-        })
-        .collect::<Result<_, _>>()?;
+    exclusion_results.joint_exclusion_result = candidate_executor.install(|| {
+        joint_contribution_todo
+            .into_par_iter()
+            .map(|(address1, address2)| {
+                let orders1 = available_orders
+                    .all_orders_by_address
+                    .get(&address1)
+                    .expect("orders by address not found")
+                    .clone();
+                let orders2 = available_orders
+                    .all_orders_by_address
+                    .get(&address2)
+                    .expect("orders by address not found")
+                    .clone();
+                let orders = orders1.iter().chain(orders2.iter()).cloned().collect();
+                trace!(?address1, ?address2, excluding = ?orders, "Calculating joint contribution");
+                calc_profit_after_exclusion(
+                    ctx.clone(),
+                    provider.clone(),
+                    config,
+                    &block_data,
+                    results_without_exclusion.exclusion_input(orders),
+                    candidate_executor,
+                )
+                .map(|ok| ((address1, address2), ok))
+            })
+            .collect::<Result<_, _>>()
+    })?;
 
     for ((address1, address2), result) in &exclusion_results.joint_exclusion_result {
         let block_value_delta = result.block_value_delta;
@@ -1109,6 +1134,7 @@ fn calc_profit_after_exclusion<P, ConfigType>(
     config: &ConfigType,
     block_data: &BlockData,
     exclusion_input: ExclusionInput,
+    candidate_executor: &CandidateExecutor,
 ) -> eyre::Result<ExclusionResult>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -1139,6 +1165,7 @@ where
         provider.clone(),
         base_config.backtest_builders.clone(),
         config,
+        Some(candidate_executor.clone()),
     )?
     .builder_outputs
     .into_iter()

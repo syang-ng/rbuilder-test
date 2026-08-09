@@ -1,4 +1,5 @@
 pub mod block_building_result_assembler;
+mod compute_budget;
 pub mod conflict_resolvers;
 pub mod conflict_resolving_pool;
 pub mod conflict_task_generator;
@@ -9,6 +10,7 @@ pub mod results_aggregator;
 pub mod simulation_cache;
 pub mod task;
 use alloy_primitives::I256;
+pub use compute_budget::{available_physical_cores, BacktestComputeBudget, CandidateExecutor};
 pub use groups::*;
 
 use ahash::HashMap;
@@ -49,7 +51,8 @@ pub type GroupId = usize;
 pub type ConflictResolutionResultPerGroup = (GroupId, (ResolutionResult, ConflictGroup));
 
 /// ParallelBuilderConfig configures parallel builder.
-/// * `num_threads` - number of threads to use for merging.
+/// * `num_threads` - number of live conflict-task workers. Backtest candidate parallelism is
+///   configured independently through a [`CandidateExecutor`].
 /// * `merge_wait_time_ms` - time to wait for merging to finish before consuming new orders.
 /// * `safe_sorting_only` - Will only use sort modes that don't risk breaking much the "best refund for user"
 ///   since random sorting might put the worst kickback first and let a blind backrun win.
@@ -295,6 +298,7 @@ where
     P: StateProviderFactory + Clone + 'static,
 {
     let start_time = Instant::now();
+    let candidate_executor = input.candidate_executor.clone();
 
     // Initialization stage
     let init_start = Instant::now();
@@ -339,7 +343,11 @@ where
     // Group processing
     let processing_start = Instant::now();
     let groups = conflict_finder.get_order_groups();
-    let results = conflict_resolving_pool.process_groups_backtest(groups);
+    let results = if let Some(executor) = candidate_executor {
+        executor.install(|| conflict_resolving_pool.process_groups_backtest(groups))
+    } else {
+        conflict_resolving_pool.process_groups_backtest(groups)
+    };
     let processing_duration = processing_start.elapsed();
 
     // Block building result assembler creation
@@ -407,6 +415,7 @@ where
     P: StateProviderFactory + Clone + 'static,
 {
     let start_time = Instant::now();
+    let candidate_executor = input.candidate_executor.clone();
 
     // Initialization stage
     let init_start = Instant::now();
@@ -451,7 +460,11 @@ where
     // Group processing
     let processing_start = Instant::now();
     let groups = conflict_finder.get_order_groups();
-    let results = conflict_resolving_pool.process_groups_default_backtest(groups);
+    let results = if let Some(executor) = candidate_executor {
+        executor.install(|| conflict_resolving_pool.process_groups_default_backtest(groups))
+    } else {
+        conflict_resolving_pool.process_groups_default_backtest(groups)
+    };
     let processing_duration = processing_start.elapsed();
 
     // Block building result assembler creation

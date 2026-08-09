@@ -9993,6 +9993,7 @@ dependencies = [
  "mev-share-sse",
  "mockall",
  "notify",
+ "num_cpus",
  "parking_lot",
  "priority-queue",
  "prometheus",

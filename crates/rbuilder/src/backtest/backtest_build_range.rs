@@ -17,13 +17,15 @@ use crate::{
         execute::{backtest_simulate_block, BlockBacktestValue},
         BacktestResultsStorage, BlockData, HistoricalDataStorage, StoredBacktestResult,
     },
-    building::builders::parallel_builder::conflict_task_generator::set_default_graph_study_capture_enabled,
+    building::builders::parallel_builder::{
+        available_physical_cores, conflict_task_generator::set_default_graph_study_capture_enabled,
+        BacktestComputeBudget,
+    },
     live_builder::cli::LiveBuilderConfig,
     utils::timestamp_ms_to_offset_datetime,
 };
 use alloy_primitives::{utils::format_ether, U256};
 use clap::Parser;
-use rayon::prelude::*;
 use rbuilder_config::load_toml_config;
 use std::{
     fs::File,
@@ -64,6 +66,17 @@ struct Cli {
         help = "Path to csv file to write default builder graph-study output to"
     )]
     graph_stats_csv: Option<PathBuf>,
+    #[clap(
+        long,
+        default_value_t = 1,
+        help = "Maximum number of blocks computed concurrently"
+    )]
+    block_concurrency: usize,
+    #[clap(
+        long,
+        help = "Candidate Rayon threads per block lane (defaults to physical cores / block concurrency)"
+    )]
+    candidate_threads: Option<usize>,
     #[clap(help = "Blocks")]
     blocks: Vec<u64>,
 }
@@ -81,6 +94,20 @@ where
     }
     let config: ConfigType = load_toml_config(cli.config.clone())?;
     config.base_config().setup_tracing_subscriber()?;
+
+    let physical_core_limit = available_physical_cores();
+    let default_candidate_threads = physical_core_limit
+        .checked_div(cli.block_concurrency.max(1))
+        .unwrap_or(0)
+        .max(1);
+    let candidate_threads = cli.candidate_threads.unwrap_or(default_candidate_threads);
+    let compute_budget = BacktestComputeBudget::new(cli.block_concurrency, candidate_threads)?;
+    println!(
+        "Backtest compute budget: block_concurrency={} candidate_threads={} physical_core_limit={}",
+        compute_budget.block_concurrency(),
+        compute_budget.candidate_threads(),
+        compute_budget.physical_core_limit(),
+    );
 
     let builders_names = config.base_config().backtest_builders.clone();
 
@@ -157,6 +184,7 @@ where
         historical_data_storage,
         blocks.clone(),
         cli.build_block_lag_ms as i64,
+        compute_budget.block_concurrency(),
         cancel_token.clone(),
     );
 
@@ -182,30 +210,31 @@ where
                 )
             })
             .collect::<Vec<_>>();
-        let output = input
-            .into_par_iter()
-            .filter_map(
-                |(block_data, provider_factory, chain_spec, builders_names, blocklist)| {
-                    let block_number = block_data.block_number;
-                    match backtest_simulate_block(
-                        block_data,
-                        provider_factory,
-                        chain_spec,
-                        builders_names,
-                        &config,
-                        blocklist,
-                    ) {
-                        Ok(ok) => Some(ok),
-                        Err(err) => {
-                            warn!(
-                                "Failed to backtest block, block: {}, err: {:?}",
-                                block_number, err
-                            );
-                            None
-                        }
+        let output = compute_budget
+            .run_batch(input, |_, candidate_executor, input| {
+                let (block_data, provider_factory, chain_spec, builders_names, blocklist) = input;
+                let block_number = block_data.block_number;
+                match backtest_simulate_block(
+                    block_data,
+                    provider_factory,
+                    chain_spec,
+                    builders_names,
+                    &config,
+                    blocklist,
+                    Some(candidate_executor),
+                ) {
+                    Ok(ok) => Some(ok),
+                    Err(err) => {
+                        warn!(
+                            "Failed to backtest block, block: {}, err: {:?}",
+                            block_number, err
+                        );
+                        None
                     }
-                },
-            )
+                }
+            })?
+            .into_iter()
+            .flatten()
             .collect::<Vec<_>>();
 
         // Compare the BlockBacktestValues with the landed block and optionally compare or store
@@ -490,19 +519,20 @@ impl GraphStatsCSVWriter {
     }
 }
 
-/// Spawns a task that reads BlockData from the HistoricalDataStorage in blocks of current_num_threads.
+/// Spawns a task that reads BlockData from storage in batches matching block concurrency.
 /// The results can then be polled from the returned mpsc::Receiver
 /// This allows us to process a batch while the next is being fetched.
 fn spawn_block_fetcher(
     mut historical_data_storage: HistoricalDataStorage,
     blocks: Vec<u64>,
     build_block_lag_ms: i64,
+    block_batch_size: usize,
     cancellation_token: CancellationToken,
 ) -> mpsc::Receiver<Vec<BlockData>> {
     let (sender, receiver) = mpsc::channel(10);
 
     tokio::spawn(async move {
-        for blocks in blocks.chunks(rayon::current_num_threads()) {
+        for blocks in blocks.chunks(block_batch_size) {
             if cancellation_token.is_cancelled() {
                 return;
             }
@@ -543,4 +573,35 @@ fn spawn_block_fetcher(
     });
 
     receiver
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn cli_parses_split_parallelism_budget() {
+        let cli = Cli::try_parse_from([
+            "backtest-build-range",
+            "--config",
+            "config.toml",
+            "--block-concurrency",
+            "2",
+            "--candidate-threads",
+            "30",
+            "123",
+        ])
+        .unwrap();
+        assert_eq!(cli.block_concurrency, 2);
+        assert_eq!(cli.candidate_threads, Some(30));
+    }
+
+    #[test]
+    fn cli_defaults_to_one_block_lane_and_dynamic_candidate_budget() {
+        let cli = Cli::try_parse_from(["backtest-build-range", "--config", "config.toml", "123"])
+            .unwrap();
+        assert_eq!(cli.block_concurrency, 1);
+        assert_eq!(cli.candidate_threads, None);
+    }
 }

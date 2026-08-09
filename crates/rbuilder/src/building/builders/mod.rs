@@ -296,6 +296,9 @@ pub struct BacktestSimulateBlockInput<'a, P> {
     pub builder_name: String,
     pub sim_orders: &'a Vec<Arc<SimulatedOrder>>,
     pub provider: P,
+    /// Explicit candidate executor for backtests. Live builders leave this unset and retain their
+    /// existing scheduling behavior.
+    pub candidate_executor: Option<parallel_builder::CandidateExecutor>,
 }
 
 /// Handles error from block filling stage.
