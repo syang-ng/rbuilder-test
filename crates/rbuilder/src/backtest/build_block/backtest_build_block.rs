@@ -199,6 +199,13 @@ where
             .builders
             .iter()
             .filter_map(|builder_name: &String| {
+                let input = BacktestSimulateBlockInput {
+                    ctx: ctx.clone(),
+                    builder_name: builder_name.clone(),
+                    sim_orders: &sim_orders,
+                    provider: provider_factory.clone(),
+                };
+                start_default_graph_study_capture();
                 println!(
                     "[backtest-build-block] start_builder builder={} total_elapsed_ms={:.2}",
                     builder_name,
@@ -207,33 +214,30 @@ where
                 if benchmark_metrics_enabled() {
                     let _ = io::stdout().flush();
                 }
-                let input = BacktestSimulateBlockInput {
-                    ctx: ctx.clone(),
-                    builder_name: builder_name.clone(),
-                    sim_orders: &sim_orders,
-                    provider: provider_factory.clone(),
-                };
-                start_default_graph_study_capture();
+                let build_start = Instant::now();
                 let build_res = if build_block_cfg.trace_block_building {
-                    let build_start = Instant::now();
-                    let build_res = config.build_backtest_block(
+                    config.build_backtest_block(
                         builder_name,
                         input,
                         crate::backtest::build_block::full_partial_block_execution_tracer::FullPartialBlockExecutionTracer::new(),
-                    );
-                    let build_time_ms = build_start.elapsed().as_millis() as u64;
-                    (build_res, build_time_ms)
+                    )
                 } else {
-                    let build_start = Instant::now();
-                    let build_res = config.build_backtest_block(
+                    config.build_backtest_block(
                         builder_name,
                         input,
                         NullPartialBlockExecutionTracer {},
-                    );
-                    let build_time_ms = build_start.elapsed().as_millis() as u64;
-                    (build_res, build_time_ms)
+                    )
                 };
-                let (build_res, build_time_ms) = build_res;
+                let build_time_ms = build_start.elapsed().as_millis() as u64;
+                println!(
+                    "[backtest-build-block] finish_builder builder={} build_time_ms={} total_elapsed_ms={:.2}",
+                    builder_name,
+                    build_time_ms,
+                    elapsed_ms(total_start)
+                );
+                if benchmark_metrics_enabled() {
+                    let _ = io::stdout().flush();
+                }
                 let graph_study_records = take_default_graph_study_records();
                 if let Some(graph_stats_csv_output) = &mut graph_stats_csv_output {
                     if let Err(err) = graph_stats_csv_output.write_builder_records(
@@ -273,15 +277,6 @@ where
                         provider_stats.consistency_checks,
                         provider_stats.health_scans,
                     );
-                }
-                println!(
-                    "[backtest-build-block] finish_builder builder={} build_time_ms={} total_elapsed_ms={:.2}",
-                    builder_name,
-                    build_time_ms,
-                    elapsed_ms(total_start)
-                );
-                if benchmark_metrics_enabled() {
-                    let _ = io::stdout().flush();
                 }
                 println!(
                     "Number of used orders: {}",
